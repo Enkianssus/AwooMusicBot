@@ -1,0 +1,62 @@
+{
+  "name": "bilincm-ts",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "B站点歌机 TypeScript 客户端",
+  "author": "Enkianssus",
+  "productName": "直播点歌机",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build && electron-builder",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "bufferutil": "^4.1.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "utf-8-validate": "^6.0.6",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.64",
+    "@types/react-dom": "^18.2.21",
+    "@types/ws": "^8.18.1",
+    "@typescript-eslint/eslint-plugin": "^7.1.1",
+    "@typescript-eslint/parser": "^7.1.1",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.5.0",
+    "electron": "^42.0.1",
+    "electron-builder": "^24.13.3",
+    "eslint": "^8.57.0",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "postcss": "^8.5.14",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.2.2",
+    "vite": "^5.1.6",
+    "vite-plugin-electron": "^0.28.6",
+    "vite-plugin-electron-renderer": "^0.14.5"
+  },
+  "build": {
+    "appId": "com.enkianssus.bilincmbot",
+    "productName": "直播点歌机",
+    "directories": {
+      "output": "dist_electron"
+    },
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        {
+          "target": "dir"
+        }
+      ]
+    },
+    "files": [
+      "dist",
+      "dist-electron"
+    ]
+  }
+}

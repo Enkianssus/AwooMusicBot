@@ -2,7 +2,7 @@
 
 BiliNCM-TS 是一款专为 Bilibili 主播打造的现代化网易云音乐全自动弹幕点歌机。  
 本项目使用 Electron + React + TypeScript 进行了底层重构，开创性地利用 CDP (Chrome DevTools Protocol) 底层 JS 注入技术，直接接管网易云内核，为您带来丝滑、精准且完全静默的完美点歌体验。
-<img width="1378" height="685" alt="image" src="https://github.com/user-attachments/assets/582aea40-4dcf-41ed-a1de-31ae818c4c05" />
+
 
 
 ## ✨ 核心特性 (Core Features)
@@ -16,7 +16,7 @@ BiliNCM-TS 是一款专为 Bilibili 主播打造的现代化网易云音乐全�
 - 🔄 **全球边缘加速一键热更**: 内置 Velopack 更新框架，整合 Cloudflare Worker 边缘节点代理，国内用户无需魔法即可享受极速全自动版本覆盖与重启。
 
 ## 📸 界面预览
-
+<img width="1378" height="685" alt="image" src="https://github.com/user-attachments/assets/582aea40-4dcf-41ed-a1de-31ae818c4c05" />
 高度自由的外观定制：支持主控端动态调整字体颜色、背景不透明度、标题栏风格，拖拽排歌，并实时同步给 OBS 端。
 
 ## 🚀 快速开始

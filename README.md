@@ -1,30 +1,59 @@
-# React + TypeScript + Vite
+# 🎵 BiliNCM-TS (B站网易云全自动点歌机 TS重构版)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+BiliNCM-TS 是一款专为 Bilibili 主播打造的现代化网易云音乐全自动弹幕点歌机。  
+本项目使用 Electron + React + TypeScript 进行了底层重构，开创性地利用 CDP (Chrome DevTools Protocol) 底层 JS 注入技术，直接接管网易云内核，为您带来丝滑、精准且完全静默的完美点歌体验。
+<img width="1378" height="685" alt="image" src="https://github.com/user-attachments/assets/582aea40-4dcf-41ed-a1de-31ae818c4c05" />
 
-Currently, two official plugins are available:
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react/README.md) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## ✨ 核心特性 (Core Features)
 
-## Expanding the ESLint configuration
+- 🚀 **CDP 底层注入控制**: 通过浏览器调试协议直接操纵网易云内部 Redux Store，非键盘鼠标模拟，实现毫秒级响应、后台完全静默切歌，再也不用担心打游戏时被打断。
+- 📡 **高精度切歌雷达**: 实时监听网易云底层 TRACK_CHANGED 事件，精准监听切歌信息。
+- 💎 **超高颜值 & OBS 纯净模式**: 亚克力玻璃态透明 UI，可完美嵌入 OBS / 直播姬。端隔离机制保证 OBS 画面纯净无控制按钮，本地主控端拥有完整后台管理和外观配置。
+- 👑 **大航海专属视觉特权**: 系统自动抓取点歌用户的大航海级别，总督/提督/舰长 点歌后拥有专属渐变铭牌及炫酷呼吸灯头像效果。
+- ⏱️ **细粒度与分级冷却控制**: 按粉丝牌等级、航海舰队设置防刷屏屏障，多级独立冷却系统，普通用户、舰长、提督可分别设置不同冷却时间。
+- 🚫 **智能拦截与优雅反馈**: 弹幕点歌失败时，悬浮窗会自动滑出红色警示反馈卡片，让观众明确知道失败原因。
+- 🔄 **全球边缘加速一键热更**: 内置 Velopack 更新框架，整合 Cloudflare Worker 边缘节点代理，国内用户无需魔法即可享受极速全自动版本覆盖与重启。
 
-If you are developing a production application, we recommend updating the configuration to enable type aware lint rules:
+## 📸 界面预览
 
-- Configure the top-level `parserOptions` property like this:
+高度自由的外观定制：支持主控端动态调整字体颜色、背景不透明度、标题栏风格，拖拽排歌，并实时同步给 OBS 端。
 
-```js
-export default {
-  // other rules...
-  parserOptions: {
-    ecmaVersion: 'latest',
-    sourceType: 'module',
-    project: ['./tsconfig.json', './tsconfig.node.json'],
-    tsconfigRootDir: __dirname,
-  },
-}
-```
+## 🚀 快速开始
 
-- Replace `plugin:@typescript-eslint/recommended` to `plugin:@typescript-eslint/recommended-type-checked` or `plugin:@typescript-eslint/strict-type-checked`
-- Optionally add `plugin:@typescript-eslint/stylistic-type-checked`
-- Install [eslint-plugin-react](https://github.com/jsx-eslint/eslint-plugin-react) and add `plugin:react/recommended` & `plugin:react/jsx-runtime` to the `extends` list
+1. **下载安装**
+   - ⚡ 国内极速下载推荐: [前往专属分发节点](https://app.enkianss.us/) 点击下载最新版 (Windows)。
+   - 🐙 GitHub Releases: 下载 `bilincm-win-Portable.zip` 或 `Setup.exe`。
+
+2. **使用步骤**
+   1. 确保电脑上已正常运行网易云音乐客户端（需登录并能播放歌曲）。
+   2. 启动 `直播点歌机.exe`，程序会自动启动前端控制台。
+   3. 在直播姬或 OBS 中添加浏览器源，输入 `http://localhost:5555/`，宽 320 高 480 即可得到纯净透明弹窗。
+   4. 在本地主程序悬浮窗上，点击右上角 🎛️ 打开管理后台。
+   5. 在「扫码登录」页面，用手机 B站 APP 扫码获取本地弹幕连接凭证。
+   6. 在「运行状态」页面输入要监控的 B站直播间房间号，点击连接。
+   7. 发送弹幕进行点歌，即可享受全自动音乐直播。（首次启动可能自动挂载调试端口并重启网易云，这是 CDP 注入接管必需步骤）
+
+## 💬 观众弹幕指令
+
+| 指令格式 | 功能说明 | 默认权限要求 |
+|----------|----------|--------------|
+| 点歌 [歌名] | 搜索并添加歌曲到待播队列 | 需满足冷却时间与粉丝牌要求 |
+| 置顶点歌 [歌名] | 优先播放，插入队列最前方 | 推荐「舰长」及以上 |
+| 插队点歌 [歌名] | 直接中断当前歌曲，强制插播 | 推荐 房管及超级用户 |
+| 立即点歌 [歌名] | 忽略当前播放状态，搜到后强制切歌播放 | 推荐 房管及超级用户 |
+| 撤回 | 从排队队列中删除自己最近点的一首歌 | 无特殊限制 |
+| 切歌 / 跳过 | 直接跳过当前播放歌曲 | 推荐 房管及超级用户 |
+
+💡 系统内置超级用户白名单机制，白名单用户可无视一切点歌冷却与权限限制。
+
+## 🛠️ 技术栈
+
+- 核心框架: Electron / Node.js
+- 前端界面: React / Vite / Tailwind CSS
+- 内核交互: Chrome DevTools Protocol (CDP) WebSocket / Bilibili Native WebSocket Protocol
+- 部署与更新: Velopack / Cloudflare Workers (Edge Computing)
+
+## 📄 许可协议
+
+本项目基于 MIT License 开源，可自由修改与分发，但禁止用于违反 Bilibili 与网易云音乐平台规定的商业盈利行为。

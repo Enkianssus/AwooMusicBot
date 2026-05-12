@@ -1,7 +1,7 @@
 {
   "name": "bilincm-ts",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.2",
   "type": "module",
   "description": "B站点歌机 TypeScript 客户端",
   "author": "Enkianssus",
@@ -18,6 +18,7 @@
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "utf-8-validate": "^6.0.6",
+    "velopack": "^0.0.1589-ga2c5a97",
     "ws": "^8.20.0"
   },
   "devDependencies": {

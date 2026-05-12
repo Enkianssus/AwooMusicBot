@@ -6,6 +6,11 @@ import fs from 'fs';
 import zlib from 'zlib';
 import { exec, execSync, spawn } from 'child_process';
 import { promisify } from 'util';
+import { createRequire } from 'module';
+
+// ⭐ 动态引入 Velopack 规避静态打包分析
+const customRequire = createRequire(import.meta.url);
+const { UpdateManager } = customRequire('velopack');
 
 // 强制修复 Windows 终端的 UTF-8 中文乱码问题
 try {
@@ -157,7 +162,16 @@ ipcMain.on('close-window', (event) => {
 });
 ipcMain.on('overlay-resize', (event, w, h) => {
   const win = BrowserWindow.fromWebContents(event.sender);
-  if (win) win.setBounds({ width: w, height: h });
+  if (win) {
+    win.setBounds({ width: w, height: h });
+    if (!appConfig.widgetStyle) {
+      appConfig.widgetStyle = { theme: null, pos: { x: 50, y: 50 }, size: { w, h }, timestamp: Date.now() };
+    } else {
+      appConfig.widgetStyle.size = { w, h };
+      appConfig.widgetStyle.timestamp = Date.now();
+    }
+    saveConfig();
+  }
 });
 
 // ==========================================
@@ -173,11 +187,11 @@ let appConfig: any = {
   sysConfig: {
     EnableCDP: true,
     CdpPort: 9222,
-    CooldownMinutes: 0,
+    Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 },
     IdleWaitNext: true,
     ShowAllDanmaku: false,
     SuperUsers: [],
-    NcmExePath: "" // ⭐ 新增：网易云路径缓存
+    NcmExePath: ""
   }
 };
 
@@ -186,9 +200,17 @@ function loadConfig() {
     if (fs.existsSync(CONFIG_PATH)) {
       const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
       appConfig = { ...appConfig, ...saved };
+
       if (!appConfig.sysConfig) {
-        appConfig.sysConfig = { EnableCDP: true, CdpPort: 9222, CooldownMinutes: 0, IdleWaitNext: true, ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], NcmExePath: "" };
+        appConfig.sysConfig = { EnableCDP: true, CdpPort: 9222, Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], NcmExePath: "" };
       }
+
+      if (appConfig.sysConfig.CooldownMinutes !== undefined && !appConfig.sysConfig.Cooldowns) {
+        const oldSecs = appConfig.sysConfig.CooldownMinutes * 60;
+        appConfig.sysConfig.Cooldowns = { Normal: oldSecs, Captain: oldSecs, Admiral: oldSecs, Governor: oldSecs };
+        delete appConfig.sysConfig.CooldownMinutes;
+      }
+
       biliCookie = appConfig.biliCookie || '';
       biliUid = appConfig.biliUid || 0;
       writeLog(`✅ 已加载本地配置，当前缓存的直播间为: ${appConfig.roomId}`, 'Green');
@@ -216,6 +238,22 @@ let qrPollTimer: NodeJS.Timeout | null = null;
 let targetQueue: any[] = [];
 let currentPlayingSong: any = null;
 let lastTrackId: string | null = null;
+
+const userCooldowns = new Map<string, number>();
+let recentRejects: { id: number, user: any, reason: string }[] = [];
+
+async function addReject(user: any, reason: string) {
+  const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
+  const rejectItem = { id: Date.now() + Math.random(), user: { ...user, avatar: avatarUrl }, reason };
+  recentRejects.push(rejectItem);
+
+  if (recentRejects.length > 5) recentRejects.shift();
+
+  setTimeout(() => {
+    recentRejects = recentRejects.filter(r => r.id !== rejectItem.id);
+  }, 5000);
+}
+
 
 // ==========================================
 // B站原生 WebSocket 解析
@@ -422,11 +460,12 @@ function parseBiliPacket(buffer: Buffer) {
 function checkPermission(user: any, permKey: string): { allowed: boolean, reason?: string } {
   if (appConfig.sysConfig?.SuperUsers?.includes(user.uname) || appConfig.sysConfig?.SuperUsers?.includes(user.uid)) return { allowed: true };
 
-  const perm = appConfig.sysConfig?.[permKey] || { AllowManager: true, MinGuardType: 0, MinMedalLevel: 0 };
+  const defaultGuardType = permKey === 'ForceControlPermission' ? -1 : 0;
+  const perm = appConfig.sysConfig?.[permKey] || { AllowManager: true, MinGuardType: defaultGuardType, MinMedalLevel: 0 };
 
   if (perm.MinGuardType === -1) {
     if (perm.AllowManager && user.isManager) return { allowed: true };
-    return { allowed: false, reason: "仅限房管及以上专属" };
+    return { allowed: false, reason: "仅限房管及以上操作" };
   }
 
   if (perm.AllowManager && user.isManager) return { allowed: true };
@@ -434,7 +473,7 @@ function checkPermission(user: any, permKey: string): { allowed: boolean, reason
   if (perm.MinGuardType > 0) {
     if (user.guardLevel === 0 || user.guardLevel > perm.MinGuardType) {
       const guardNames = ['无', '总督', '提督', '舰长'];
-      return { allowed: false, reason: `需要${guardNames[perm.MinGuardType]}及以上舰队` };
+      return { allowed: false, reason: `需要 ${guardNames[perm.MinGuardType]} 及以上舰队` };
     }
   }
 
@@ -450,6 +489,11 @@ function checkPermission(user: any, permKey: string): { allowed: boolean, reason
 function handleRawDanmaku(doc: any) {
   const cmd = doc.cmd || "";
   if (cmd.startsWith("DANMU_MSG")) {
+
+    if (appConfig.sysConfig?.ShowAllDanmaku) {
+      writeLog(`[RAW原始数据] ${JSON.stringify(doc)}`, 'DarkGray');
+    }
+
     const info = doc.info;
     const msg = info[1].trim();
     const userBase = info[2];
@@ -459,7 +503,8 @@ function handleRawDanmaku(doc: any) {
     const isManager = userBase[2] === 1;
     const medalInfo = info[3] || [];
     const medalLevel = medalInfo.length > 0 ? medalInfo[0] : 0;
-    const guardLevel = info[7] || 0;
+
+    const guardLevel = info[7] ? parseInt(info[7]) : 0;
 
     let avatarUrl = '';
     try {
@@ -480,11 +525,10 @@ async function restartNCMWithDebugPort() {
   writeLog('>>> [系统] 正在准备重启网易云音乐...', 'DarkGray');
   let exePath = appConfig.sysConfig?.NcmExePath || '';
 
-  // ⭐ 如果已经有缓存的路径且存在，直接跳过耗时的检索环节
   if (exePath && fs.existsSync(exePath)) {
     writeLog('>>> [系统] 使用缓存的网易云音乐路径启动...', 'DarkGray');
   } else {
-    exePath = ''; // 确保清空脏数据
+    exePath = '';
     try {
       const psCmd = `powershell -NoProfile -Command "$p=(Get-Process cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1).Path; if($p){[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($p))}"`;
       const { stdout } = await execAsync(psCmd);
@@ -523,7 +567,6 @@ async function restartNCMWithDebugPort() {
   const cdpPort = appConfig.sysConfig?.CdpPort || 9222;
 
   if (exePath && fs.existsSync(exePath)) {
-    // ⭐ 将找到的正确路径写回缓存，以后秒开
     if (appConfig.sysConfig?.NcmExePath !== exePath) {
       if (!appConfig.sysConfig) appConfig.sysConfig = {};
       appConfig.sysConfig.NcmExePath = exePath;
@@ -854,7 +897,6 @@ async function startCDPRadar() {
               lastTrackId = currId;
               let stateChanged = false;
 
-              // ⭐ 暂停播放时的防队列消耗逻辑
               if (!isPlaying) {
                 if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
                   writeLog(`[状态同步] 处于暂停状态，自动跳过代播曲目以防消耗: ${targetQueue[0].SongName}`, 'Yellow');
@@ -866,7 +908,6 @@ async function startCDPRadar() {
                   }
                 }
               }
-              // 正常播放逻辑
               else {
                 if (currentPlayingSong && currId !== currentPlayingSong.Id) {
                   if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
@@ -951,6 +992,12 @@ async function getBiliAvatar(uid: string): Promise<string> {
 // ==========================================
 async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top' | 'interrupt' | 'play_now' = 'normal') {
   try {
+    const normalizedKeyword = keyword.replace(/\s+/g, '');
+    if (normalizedKeyword === '贞理的小曲' || normalizedKeyword === '真理的小曲') {
+      keyword = 'Firefly in a Fairytale Okan Sahin';
+      writeLog(`[彩蛋] 触发真理的小曲，替换搜索关键词为: ${keyword}`, 'Magenta');
+    }
+
     const res = await fetch(`https://music.163.com/api/search/get/web?s=${encodeURIComponent(keyword)}&type=1&limit=1`);
     const data: any = await res.json();
     const songs = data.result?.songs;
@@ -966,7 +1013,8 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
         ArtistName: s.artists?.map((a: any) => a.name).join('/'),
         OrderedBy: user.name || user.uname,
         OrderedByUid: user.uid,
-        OrderedByAvatar: avatarUrl
+        OrderedByAvatar: avatarUrl,
+        GuardLevel: user.guardLevel
       };
 
       if (mode === 'interrupt') {
@@ -1012,17 +1060,16 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
     } else {
       setGlobalStatus(`❌ 未搜到: ${keyword}`);
       writeLog(`[点歌] 搜索失败: 未找到歌曲 "${keyword}"`, 'Yellow');
+      addReject(user, `未搜到歌曲: ${keyword}`);
     }
   } catch (e) {
     writeLog('点歌搜索网络异常', 'Red');
     setGlobalStatus('❌ 搜索网络异常');
+    addReject(user, '搜索网络异常');
   }
 }
 
 function handleDanmaku(user: any, msg: string) {
-  if (appConfig.sysConfig?.ShowAllDanmaku) {
-    writeLog(`[弹幕] ${user.uname}: ${msg}`, 'DarkGray');
-  }
   if (msg.toLowerCase().includes('test') || msg.includes('测试')) {
     writeLog(`[弹幕] 收到了来自 ${user.uname} 的测试通信! 内容: ${msg}`, 'Cyan');
   }
@@ -1044,6 +1091,7 @@ function handleDanmaku(user: any, msg: string) {
       if (!perm.allowed) {
         setGlobalStatus(`⚠️ 拦截: 无特定撤回权限`);
         writeLog(`[权限拦截] ${user.uname} 撤回指定歌曲被拒: 需要强控权限`, 'Yellow');
+        addReject(user, "权限不足: 需要强控权限");
         return;
       }
       const idx = targetQueue.findIndex(s => s.SongName.includes(keyword) || s.ArtistName.includes(keyword));
@@ -1053,12 +1101,14 @@ function handleDanmaku(user: any, msg: string) {
         writeLog(`[点歌] ${user.uname} 强行撤回了歌曲: ${removed.SongName}`, 'Green');
       } else {
         setGlobalStatus(`❌ 撤回失败: 队列未找到`);
+        addReject(user, "撤回失败: 未在队列中找到");
       }
     } else {
       const perm = checkPermission(user, 'CancelPermission');
       if (!perm.allowed) {
         setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
         writeLog(`[权限拦截] ${user.uname} 撤回被拒: ${perm.reason}`, 'Yellow');
+        addReject(user, perm.reason!);
         return;
       }
       let foundIdx = -1;
@@ -1074,6 +1124,7 @@ function handleDanmaku(user: any, msg: string) {
         writeLog(`[点歌] ${user.uname} 撤回了自己点的: ${removed.SongName}`, 'Green');
       } else {
         setGlobalStatus(`❌ 撤回失败: 队列无你的歌`);
+        addReject(user, "队列中没有你点的歌");
       }
     }
     return;
@@ -1084,6 +1135,7 @@ function handleDanmaku(user: any, msg: string) {
     if (!perm.allowed) {
       setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
       writeLog(`[权限拦截] ${user.uname} 切歌被拒: ${perm.reason}`, 'Yellow');
+      addReject(user, perm.reason!);
       return;
     }
     currentPlayingSong = null;
@@ -1109,11 +1161,34 @@ function handleDanmaku(user: any, msg: string) {
       keyword = msg.substring(2).trim();
     }
 
+    const isSuperUser = appConfig.sysConfig?.SuperUsers?.includes(user.uname) || appConfig.sysConfig?.SuperUsers?.includes(user.uid);
+    if (!isSuperUser) {
+      const cds = appConfig.sysConfig?.Cooldowns || { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 };
+      let cdSeconds = cds.Normal;
+      if (user.guardLevel === 3) cdSeconds = cds.Captain;
+      if (user.guardLevel === 2) cdSeconds = cds.Admiral;
+      if (user.guardLevel === 1) cdSeconds = cds.Governor;
+
+      if (cdSeconds > 0) {
+        const lastReq = userCooldowns.get(user.uid) || 0;
+        const passed = (Date.now() - lastReq) / 1000;
+        if (passed < cdSeconds) {
+          const wait = Math.ceil(cdSeconds - passed);
+          const reason = `冷却中，需等待 ${wait} 秒`;
+          setGlobalStatus(`⚠️ 冷却拦截`);
+          writeLog(`[冷却拦截] ${user.uname} 触发冷却，需等待 ${wait}秒`, 'Yellow');
+          addReject(user, reason);
+          return;
+        }
+      }
+    }
+
     if (mode === 'top') {
       const perm = checkPermission(user, 'PriorityPermission');
       if (!perm.allowed) {
         setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
         writeLog(`[权限拦截] ${user.uname} 置顶点歌被拒: ${perm.reason}`, 'Yellow');
+        addReject(user, perm.reason!);
         return;
       }
     } else if (mode === 'interrupt' || mode === 'play_now') {
@@ -1121,6 +1196,7 @@ function handleDanmaku(user: any, msg: string) {
       if (!perm.allowed) {
         setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
         writeLog(`[权限拦截] ${user.uname} 强切/插队被拒: ${perm.reason}`, 'Yellow');
+        addReject(user, perm.reason!);
         return;
       }
     } else {
@@ -1128,11 +1204,15 @@ function handleDanmaku(user: any, msg: string) {
       if (!perm.allowed) {
         setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
         writeLog(`[权限拦截] ${user.uname} 点歌被拒: ${perm.reason}`, 'Yellow');
+        addReject(user, perm.reason!);
         return;
       }
     }
 
-    if (keyword) tryRequestSong(user, keyword, mode);
+    if (keyword) {
+      userCooldowns.set(user.uid, Date.now());
+      tryRequestSong(user, keyword, mode);
+    }
   }
 }
 
@@ -1241,7 +1321,8 @@ function startBackendServer() {
         status: currentStatusMessage,
         accepting: isAccepting,
         playing: isPlaying,
-        uiConfig: appConfig.widgetStyle
+        uiConfig: appConfig.widgetStyle,
+        rejects: recentRejects
       }));
       return;
     }
@@ -1263,11 +1344,11 @@ function startBackendServer() {
         roomId: appConfig.roomId,
         biliLogin: !!biliCookie,
         uid: biliUid,
-        version: '4.1.0 (Advanced Command System)',
+        version: app.getVersion(), // ⭐ 这里改成动态读取系统版本
         accepting: isAccepting,
         playing: isPlaying,
         widgetStyle: appConfig.widgetStyle,
-        config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, SuperUsers: [] }
+        config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 } }
       }));
       return;
     }
@@ -1348,6 +1429,59 @@ function startBackendServer() {
       restartNCMWithDebugPort();
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({ success: true }));
+      return;
+    }
+
+    // ⭐ 新增：Velopack 检查更新接口
+    if (url.pathname === '/api/update/check') {
+      try {
+        // 使用你自己的 Cloudflare 域名作为更新源
+        const um = new UpdateManager('https://app.enkianss.us/update/bilincm');
+        const updateInfo = await um.checkForUpdatesAsync();
+
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        if (updateInfo) {
+          writeLog(`[更新] 发现新版本: v${updateInfo.TargetFullRelease.Version}`, 'Green');
+          res.end(JSON.stringify({ hasUpdate: true, version: updateInfo.TargetFullRelease.Version }));
+        } else {
+          writeLog(`[更新] 检查完毕，线上版本不高于当前版本，暂无更新。`, 'Cyan');
+          res.end(JSON.stringify({ hasUpdate: false }));
+        }
+      } catch (e: any) {
+        writeLog(`[更新] 检查失败: ${e.message}`, 'Red');
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ error: `无法连接更新服务器` }));
+      }
+      return;
+    }
+
+    // ⭐ 新增：Velopack 下载并应用更新接口
+    if (url.pathname === '/api/update/apply' && req.method === 'POST') {
+      // 先回复前端，防止后台下载时间长导致请求超时
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ success: true }));
+
+      try {
+        const um = new UpdateManager('https://app.enkianss.us/update/bilincm');
+        const updateInfo = await um.checkForUpdatesAsync();
+
+        if (updateInfo) {
+          writeLog(`[更新] 开始通过 CF 节点下载新版本: v${updateInfo.TargetFullRelease.Version}...`, 'Cyan');
+          setGlobalStatus(`🚀 下载更新中...`);
+
+          await um.downloadUpdateAsync(updateInfo, (progress: number) => {
+            // 打印下载进度（按20%的区间打印，避免日志刷屏）
+            if (progress % 20 === 0) writeLog(`[更新] 下载进度: ${progress}%`, 'DarkGray');
+          });
+
+          writeLog(`[更新] 下载完成，正在重启应用更新!`, 'Green');
+          um.waitExitThenApplyUpdate(updateInfo, false, true); // 准备更新并指示重启
+          app.quit(); // 退出当前进程以触发 Velopack 更新替换
+        }
+      } catch (e: any) {
+        writeLog(`[更新] 下载或应用失败: ${e.message}`, 'Red');
+        setGlobalStatus(`❌ 更新失败`);
+      }
       return;
     }
 
@@ -1455,6 +1589,11 @@ app.whenReady().then(() => {
 
   if (appConfig.roomId) {
     connectToLiveRoom(appConfig.roomId);
+  }
+
+  if (!biliCookie) {
+    writeLog("⚠️ 未检测到 B站登录信息，自动打开设置面板引导扫码...", "Yellow");
+    setTimeout(createAdminWindow, 1500);
   }
 });
 

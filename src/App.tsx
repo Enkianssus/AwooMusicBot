@@ -36,6 +36,7 @@ interface SongInfo {
     OrderedByUid: string;
     OrderedByAvatar: string;
     OrderedBy: string;
+    GuardLevel?: number; // ⭐ 0=无, 1=总督, 2=提督, 3=舰长
 }
 
 interface ToastInfo {
@@ -131,6 +132,16 @@ const mapConsoleColor = (color: string): string => {
     return map[color] || '#e5e7eb';
 };
 
+// ⭐ 获取大航海专属样式的核心函数
+const getGuardStyle = (level?: number) => {
+    switch(level) {
+        case 1: return { border: 'border-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]', tag: 'bg-gradient-to-r from-red-600 to-red-400 text-white shadow-sm', label: '总督' };
+        case 2: return { border: 'border-purple-400 shadow-[0_0_8px_rgba(192,132,252,0.6)]', tag: 'bg-gradient-to-r from-purple-600 to-purple-400 text-white shadow-sm', label: '提督' };
+        case 3: return { border: 'border-blue-400 shadow-[0_0_8px_rgba(96,165,250,0.6)]', tag: 'bg-gradient-to-r from-blue-600 to-blue-400 text-white shadow-sm', label: '舰长' };
+        default: return { border: 'border-white/10', tag: '', label: '' };
+    }
+};
+
 const defaultTheme: Theme = {
     titleColor: '#ffffff', textColor: '#ffffff', subTextColor: '#a0aec0', bgColor: '#16181e', bgOpacity: 0.85,
     showTitleBar: true, syncTitleBarWithBg: false, titleBarBgColor: '#000000', titleBarOpacity: 0.2
@@ -149,6 +160,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [accepting, setAccepting] = useState<boolean>(true);
     const [playing, setPlaying] = useState<boolean>(true);
 
+    const [rejects, setRejects] = useState<any[]>([]);
+
     const [, setPrevQueue] = useState<SongInfo[]>([]);
     const [newItemsIds, setNewItemsIds] = useState<Set<string>>(new Set());
 
@@ -164,6 +177,12 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [toasts, setToasts] = useState<ToastInfo[]>([]);
     const lastToastTimeRef = useRef<number>(0);
     const lastSyncTimeRef = useRef<number>(0);
+
+    const triggerToast = (msg: string) => {
+        const id = Date.now() + Math.random();
+        setToasts(prev => [...prev, { id, msg }]);
+        setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3000);
+    };
 
     const [widgetStyle, setWidgetStyle] = useState<WidgetStyle>(() => {
         if (isElectron) return { w: 0, h: 0, x: 0, y: 0 };
@@ -204,10 +223,10 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
                 if (json.uiConfig && json.uiConfig.timestamp) {
                     if (json.uiConfig.timestamp > lastSyncTimeRef.current) {
-                        const { theme: bTheme, pos: bPos, size: bSize, timestamp } = json.uiConfig;
-
+                        const { theme: bTheme, timestamp, size: bSize, pos: bPos } = json.uiConfig;
                         if (bTheme) setTheme({ ...defaultTheme, ...bTheme });
 
+                        // ⭐ 全面恢复尺寸和位置的接收（网页端自动读取）
                         if (!isElectron) {
                             setWidgetStyle(prev => {
                                 const next = { ...prev };
@@ -233,10 +252,10 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
                 if (json.toast && json.toast.time > lastToastTimeRef.current) {
                     lastToastTimeRef.current = json.toast.time;
-                    const newToast = { id: json.toast.time, msg: json.toast.msg };
-                    setToasts(prev => [...prev, newToast]);
-                    setTimeout(() => { setToasts(prev => prev.filter(t => t.id !== newToast.id)); }, 3000);
+                    triggerToast(json.toast.msg);
                 }
+
+                setRejects(json.rejects || []);
 
                 const safeQueue: SongInfo[] = Array.isArray(json.queue) ? json.queue : [];
                 setPrevQueue(prev => {
@@ -260,6 +279,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     }, []);
 
     const handleQueueAction = async (action: string, payload: any) => {
+        if (!isElectron) return; // 彻底切断非主控端的后台交互能力
         try {
             await fetch('http://localhost:5555/api/queue/action', {
                 method: 'POST',
@@ -270,6 +290,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     };
 
     const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>, type: 'current' | 'queue', index: number, item: SongInfo) => {
+        if (!isElectron) return; // 阻止在 OBS 里拖拽列表
         e.preventDefault(); e.stopPropagation();
         setDragInfo({ type, index, item, x: e.clientX, y: e.clientY });
 
@@ -314,6 +335,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     };
 
     const toggleAccepting = async (e?: React.MouseEvent) => {
+        if (!isElectron) return;
         e?.stopPropagation?.();
         try {
             await fetch('http://localhost:5555/api/state/toggle', { method: 'POST' });
@@ -322,6 +344,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     };
 
     const togglePlaying = async (e?: React.MouseEvent) => {
+        if (!isElectron) return;
         e?.stopPropagation?.();
         try {
             await fetch('http://localhost:5555/api/state/toggle_play', { method: 'POST' });
@@ -332,6 +355,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const saveToGlobal = async () => {
         const timestamp = Date.now();
 
+        // ⭐ 恢复手动点击保存时的尺寸信息同步
         let currentW = widgetStyle.w;
         let currentH = widgetStyle.h;
         let currentX = widgetStyle.x;
@@ -340,8 +364,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         if (isElectron) {
             currentW = window.innerWidth;
             currentH = window.innerHeight;
-            currentX = 50;
-            currentY = 50;
+            currentX = window.screenX || 50;
+            currentY = window.screenY || 50;
         }
 
         const widgetStyleToSave = {
@@ -350,6 +374,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             size: { w: Math.max(240, currentW), h: Math.max(300, currentH) },
             timestamp
         };
+
         try {
             const res = await fetch('http://localhost:5555/api/config', {
                 method: 'POST',
@@ -358,12 +383,12 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             });
             if (res.ok) {
                 lastSyncTimeRef.current = timestamp;
-                alert("🎉 全局外观配置已保存并同步！所有打开的浏览器源也将即刻刷新。");
+                triggerToast("🎉 全局外观与尺寸配置已保存并同步！");
                 setShowSettings(false);
             } else {
-                alert(`❌ 保存失败！后端返回了错误代码：${res.status}。`);
+                triggerToast(`❌ 保存失败！后端返回了错误代码：${res.status}`);
             }
-        } catch (e: any) { alert(`❌ 请求失败：${e.message}`); }
+        } catch (e: any) { triggerToast(`❌ 请求失败：${e.message}`); }
     };
 
     const handleWindowClose = () => {
@@ -396,12 +421,13 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             setWidgetStyle(prev => ({ ...prev, x: newPos.x, y: newPos.y }));
             localStorage.setItem('bili-widget-pos', JSON.stringify(newPos));
 
+            // ⭐ 恢复网页端拖拽结束后的主动位置同步
             const timestamp = Date.now();
             lastSyncTimeRef.current = timestamp;
             fetch('http://localhost:5555/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ widgetStyle: { theme, pos: newPos, size: { w: widgetStyle.w, h: widgetStyle.h }, timestamp } })
+                body: JSON.stringify({ widgetStyle: { theme, pos: newPos, size: { w: target.offsetWidth, h: target.offsetHeight }, timestamp } })
             }).catch(()=>{});
         };
         document.addEventListener('mousemove', onMouseMove);
@@ -439,12 +465,13 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             setWidgetStyle(prev => ({ ...prev, w: newSize.w, h: newSize.h }));
             localStorage.setItem('bili-widget-size', JSON.stringify(newSize));
 
+            // ⭐ 恢复网页端缩放结束后的主动尺寸同步
             const timestamp = Date.now();
             lastSyncTimeRef.current = timestamp;
             fetch('http://localhost:5555/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ widgetStyle: { theme, pos: { x: widgetStyle.x, y: widgetStyle.y }, size: newSize, timestamp } })
+                body: JSON.stringify({ widgetStyle: { theme, pos: { x: target.offsetLeft, y: target.offsetTop }, size: newSize, timestamp } })
             }).catch(()=>{});
         };
         targetHandle.addEventListener('pointermove', onPointerMove as any);
@@ -464,14 +491,17 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         const initialW = window.outerWidth;
         const initialH = window.outerHeight;
 
+        let lastW = initialW;
+        let lastH = initialH;
+
         let animationFrameId: number;
 
         const onPointerMove = (ev: PointerEvent) => {
             if (animationFrameId) cancelAnimationFrame(animationFrameId);
             animationFrameId = requestAnimationFrame(() => {
-                const newW = Math.max(300, initialW + (ev.screenX - startX));
-                const newH = Math.max(400, initialH + (ev.screenY - startY));
-                ipcRenderer?.send('overlay-resize', newW, newH);
+                lastW = Math.max(300, initialW + (ev.screenX - startX));
+                lastH = Math.max(400, initialH + (ev.screenY - startY));
+                ipcRenderer?.send('overlay-resize', lastW, lastH);
             });
         };
 
@@ -480,6 +510,15 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             target.releasePointerCapture(ev.pointerId);
             target.removeEventListener('pointermove', onPointerMove as any);
             target.removeEventListener('pointerup', onPointerUp as any);
+
+            // ⭐ 恢复 Electron 端缩放结束后的主动尺寸同步
+            const timestamp = Date.now();
+            lastSyncTimeRef.current = timestamp;
+            fetch('http://localhost:5555/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ widgetStyle: { theme, pos: { x: widgetStyle.x, y: widgetStyle.y }, size: { w: lastW, h: lastH }, timestamp } })
+            }).catch(()=>{});
         };
 
         target.addEventListener('pointermove', onPointerMove as any);
@@ -552,13 +591,22 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 <div className="absolute -top-20 -left-20 w-48 h-48 bg-blue-500 rounded-full mix-blend-screen filter blur-[80px] opacity-20 pointer-events-none"></div>
                 <div className="absolute -bottom-20 -right-20 w-48 h-48 bg-purple-500 rounded-full mix-blend-screen filter blur-[80px] opacity-20 pointer-events-none"></div>
 
-                <div
-                    onPointerDown={isElectron ? handleElectronResizeStart : handleResizeStart}
-                    className="no-drag absolute bottom-0 right-0 w-6 h-6 cursor-se-resize z-[60] rounded-br-[20px] opacity-80 hover:opacity-100 transition-opacity pointer-events-auto"
-                    style={{ background: 'linear-gradient(135deg, transparent 40%, rgba(255,255,255,0.4) 100%)' }}
-                />
+                {isElectron && (
+                    <div
+                        onPointerDown={handleElectronResizeStart}
+                        className="no-drag absolute bottom-0 right-0 w-6 h-6 cursor-se-resize z-[60] rounded-br-[20px] opacity-80 hover:opacity-100 transition-opacity pointer-events-auto"
+                        style={{ background: 'linear-gradient(135deg, transparent 40%, rgba(255,255,255,0.4) 100%)' }}
+                    />
+                )}
+                {!isElectron && (
+                    <div
+                        onPointerDown={handleResizeStart}
+                        className="no-drag absolute bottom-0 right-0 w-6 h-6 cursor-se-resize z-[60] rounded-br-[20px] opacity-80 hover:opacity-100 transition-opacity pointer-events-auto"
+                        style={{ background: 'linear-gradient(135deg, transparent 40%, rgba(255,255,255,0.4) 100%)' }}
+                    />
+                )}
 
-                {!theme.showTitleBar && (
+                {!theme.showTitleBar && isElectron && (
                     <div className="no-drag absolute top-3 right-3 flex gap-2 z-50 drop-shadow-md opacity-0 group-hover:opacity-100 transition-opacity duration-300">
                         <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="后端控制面板">🎛️</button>
                         <button onMouseDown={e => e.stopPropagation()} onClick={() => setShowSettings(!showSettings)} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="外观设置">⚙️</button>
@@ -572,12 +620,11 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 {theme.showTitleBar && (
                     <div className={`px-5 py-3 flex justify-between items-center z-10 transition-colors ${theme.syncTitleBarWithBg ? '' : 'border-b border-white/10'}`} style={{ backgroundColor: theme.syncTitleBarWithBg ? 'transparent' : hexToRgba(theme.titleBarBgColor || '#000000', theme.titleBarOpacity !== undefined ? theme.titleBarOpacity : 0.2) }}>
                         <div className="flex items-center gap-2.5 shrink-0 pr-2">
-                            {/* ⭐ 左侧圆点变为控制播放的精致按钮，并添加 no-drag 让它能够被正常点击 */}
                             <button
-                                onMouseDown={e => e.stopPropagation()}
+                                onMouseDown={e => { if(isElectron) e.stopPropagation(); }}
                                 onClick={togglePlaying}
-                                className={`no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors pointer-events-auto cursor-pointer ${playing ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-red-500/20 text-red-400 hover:bg-red-500/40'}`}
-                                title={playing ? '点击暂停自动播放' : '点击开启自动播放'}
+                                className={`flex items-center justify-center w-5 h-5 rounded-full transition-colors ${isElectron ? 'pointer-events-auto cursor-pointer no-drag' : 'pointer-events-none'} ${playing ? (isElectron ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-green-500/20 text-green-400') : (isElectron ? 'bg-red-500/20 text-red-400 hover:bg-red-500/40' : 'bg-red-500/20 text-red-400')}`}
+                                title={isElectron ? (playing ? '点击暂停自动播放' : '点击开启自动播放') : undefined}
                             >
                                 <span className="text-[10px] leading-none">{playing ? '🟢' : '🔴'}</span>
                             </button>
@@ -586,33 +633,34 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
                         <div className="no-drag flex items-center relative h-6 flex-1 justify-end min-w-0">
                             <div
-                                className={`absolute right-0 text-xs font-medium max-w-[150px] truncate pointer-events-none transition-all duration-300 group-hover:-translate-x-[85px] group-hover:opacity-50 ${getStatusAnimation(data.status)}`}
+                                className={`absolute right-0 text-xs font-medium max-w-[150px] truncate pointer-events-none transition-all duration-300 ${isElectron ? 'group-hover:-translate-x-[85px] group-hover:opacity-50' : ''} ${getStatusAnimation(data.status)}`}
                                 style={{ color: !isConnected ? theme.subTextColor : getStatusColor(data.status) }}
                             >
                                 {!isConnected ? '等待后端...' : (data.status || '点歌就绪')}
                             </div>
 
-                            <div className="absolute right-0 flex gap-2 items-center opacity-0 transform translate-x-3 group-hover:translate-x-0 group-hover:opacity-100 transition-all duration-300 z-20">
-                                <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="后端控制面板">🎛️</button>
-                                <button onMouseDown={e => e.stopPropagation()} onClick={() => setShowSettings(!showSettings)} className="text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="外观设置">⚙️</button>
-                                <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-red-400 hover:bg-red-500/20 text-xs" title="关闭本窗口">
-                                    ✖
-                                </button>
-                            </div>
+                            {isElectron && (
+                                <div className="absolute right-0 flex gap-2 items-center opacity-0 transform translate-x-3 group-hover:translate-x-0 group-hover:opacity-100 transition-all duration-300 z-20">
+                                    <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="后端控制面板">🎛️</button>
+                                    <button onMouseDown={e => e.stopPropagation()} onClick={() => setShowSettings(!showSettings)} className="text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="外观设置">⚙️</button>
+                                    <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-red-400 hover:bg-red-500/20 text-xs" title="关闭本窗口">
+                                        ✖
+                                    </button>
+                                </div>
+                            )}
                         </div>
                     </div>
                 )}
 
-                {/* ⭐ 移除中间容器大范围的 no-drag 限制，使得所有缝隙和空白区域都可以直接拖动整个窗口 */}
                 <div className="flex-1 flex flex-col p-4 overflow-hidden z-10 gap-4 custom-scrollbar relative">
                     {data.current ? (
                         <div
-                            className={`no-drag current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 cursor-move transition-opacity ${dragInfo?.type === 'current' ? 'opacity-30' : ''}`}
+                            className={`${isElectron ? 'no-drag cursor-move' : ''} current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 transition-opacity ${dragInfo?.type === 'current' ? 'opacity-30' : ''}`}
                             style={{ touchAction: 'none' }}
-                            onPointerDown={(e) => handlePointerDown(e, 'current', -1, data.current as SongInfo)}
+                            onPointerDown={isElectron ? (e) => handlePointerDown(e, 'current', -1, data.current as SongInfo) : undefined}
                         >
                             <div className="absolute right-[-10px] top-[-10px] opacity-5 text-7xl select-none pointer-events-none">🎵</div>
-                            <div className={`w-12 h-12 rounded-full overflow-hidden border-2 ${playing ? 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.2)]' : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} shrink-0 relative pointer-events-none`}>
+                            <div className={`w-12 h-12 rounded-full overflow-hidden border-[3px] ${playing ? getGuardStyle(data.current.GuardLevel).border || 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.2)]' : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} shrink-0 relative pointer-events-none`}>
                                 <img src={data.current.OrderedByAvatar} alt="avatar" referrerPolicy="no-referrer" className={`w-full h-full object-cover ${!playing ? 'grayscale opacity-80' : ''}`} onError={(e)=>{(e.target as HTMLImageElement).src=`https://api.dicebear.com/7.x/identicon/svg?seed=${(data.current as SongInfo).OrderedByUid}`}} />
                             </div>
                             <div className="flex flex-col min-w-0 pointer-events-none">
@@ -623,7 +671,10 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                                 )}
                                 <div className="text-[15px] font-bold truncate drop-shadow-md" style={{ color: theme.textColor }}>{data.current.SongName}</div>
                                 <div className="text-xs truncate mt-0.5" style={{ color: theme.subTextColor }}>{data.current.ArtistName}</div>
-                                <div className="text-[11px] mt-1 truncate" style={{ color: theme.subTextColor }}>由 <span style={{ color: theme.titleColor, opacity: 0.9 }}>{data.current.OrderedBy}</span> 点播</div>
+                                <div className="text-[11px] mt-1 flex items-center gap-1.5" style={{ color: theme.subTextColor }}>
+                                    <span className="truncate">由 <span style={{ color: theme.titleColor, opacity: 0.9 }}>{data.current.OrderedBy}</span> 点播</span>
+                                    {getGuardStyle(data.current.GuardLevel).label && <span className={`text-[9px] px-1 rounded-sm font-bold tracking-wider leading-none py-0.5 shadow-sm ${getGuardStyle(data.current.GuardLevel).tag}`}>{getGuardStyle(data.current.GuardLevel).label}</span>}
+                                </div>
                             </div>
                         </div>
                     ) : (
@@ -645,13 +696,12 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                     )}
 
                     <div className="queue-zone flex-1 overflow-y-auto custom-scrollbar pr-1 flex flex-col gap-2.5 pb-4">
-                        <div className="flex items-center gap-2 mb-0.5 px-1">
-                            {/* ⭐ 精致的接单控制按钮：添加 no-drag 确保在整个空白处支持拖动的情况下仍可被点击 */}
+                        <div className="flex items-center gap-2 mb-0.5 px-1 shrink-0">
                             <button
-                                onMouseDown={e => e.stopPropagation()}
+                                onMouseDown={e => { if(isElectron) e.stopPropagation(); }}
                                 onClick={toggleAccepting}
-                                className={`no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors cursor-pointer ${accepting ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-red-500/20 text-red-400 hover:bg-red-500/40'}`}
-                                title={accepting ? '点击暂停接单' : '点击开启接单'}
+                                className={`flex items-center justify-center w-5 h-5 rounded-full transition-colors ${isElectron ? 'no-drag pointer-events-auto cursor-pointer' : 'pointer-events-none'} ${accepting ? (isElectron ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-green-500/20 text-green-400') : (isElectron ? 'bg-red-500/20 text-red-400 hover:bg-red-500/40' : 'bg-red-500/20 text-red-400')}`}
+                                title={isElectron ? (accepting ? '点击暂停接单' : '点击开启接单') : undefined}
                             >
                                 <span className="text-[10px] leading-none">{accepting ? '🟢' : '🔴'}</span>
                             </button>
@@ -673,6 +723,19 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             </div>
                         )}
 
+                        {rejects.map((rej) => (
+                            <div key={rej.id} className="animate-slide-in glass-card rounded-lg p-2 flex items-center gap-3 border border-red-500/30 bg-red-500/10 mb-1 relative overflow-hidden shrink-0">
+                                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-red-500/5 to-transparent -translate-x-full animate-[shimmer_2s_infinite]"></div>
+                                <div className="w-8 h-8 rounded-full overflow-hidden shrink-0 border border-red-500/50 shadow-[0_0_8px_rgba(239,68,68,0.3)]">
+                                    <img src={rej.user.avatar} className="w-full h-full object-cover" />
+                                </div>
+                                <div className="flex flex-col min-w-0 z-10">
+                                    <div className="text-[12px] font-bold text-red-400 truncate drop-shadow-md flex items-center gap-1.5"><span>⚠️</span> <span>{rej.user.name} 点歌失败</span></div>
+                                    <div className="text-[10px] text-white/80 truncate mt-0.5">{rej.reason}</div>
+                                </div>
+                            </div>
+                        ))}
+
                         {(!data.queue || data.queue.length === 0) && (
                             <div className="flex-1 flex flex-col items-center justify-center text-xs italic pointer-events-none" style={{ color: theme.subTextColor }}>
                                 <span className="mb-2 text-xl opacity-60">👻</span>
@@ -684,47 +747,57 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             const uniqueKey = `${song.Id}-${song.OrderedByUid}-${index}`;
                             const isNew = newItemsIds.has(`${song.Id}-${song.OrderedByUid}`);
 
+                            const itemGuardStyle = getGuardStyle(song.GuardLevel);
+
                             return (
                                 <div
                                     key={uniqueKey}
                                     style={{ touchAction: 'none' }}
-                                    onPointerDown={(e) => handlePointerDown(e, 'queue', index, song)}
-                                    // ⭐ 单独给交互卡片添加 no-drag，支持内部拖拽排序而不移动窗口
-                                    className={`no-drag queue-item glass-card rounded-lg p-2.5 flex items-center gap-3 transition-all hover:bg-white/10 relative group/item cursor-move ${isNew ? 'animate-slide-in' : ''} ${dragInfo?.type === 'queue' && dragInfo.index === index ? 'opacity-30' : ''}`}
+                                    onPointerDown={isElectron ? (e) => handlePointerDown(e, 'queue', index, song) : undefined}
+                                    className={`${isElectron ? 'no-drag cursor-move' : ''} queue-item glass-card rounded-lg p-2.5 flex items-center gap-3 transition-all hover:bg-white/10 relative group/item ${isNew ? 'animate-slide-in' : ''} ${dragInfo?.type === 'queue' && dragInfo.index === index ? 'opacity-30' : ''}`}
                                 >
                                     <div className="text-[11px] font-bold w-4 text-center shrink-0 pointer-events-none" style={{ color: theme.subTextColor }}>{index + 1}</div>
-                                    <div className="w-8 h-8 rounded-full overflow-hidden shrink-0 bg-black/30 border border-white/10 pointer-events-none">
+                                    <div className={`w-8 h-8 rounded-full overflow-hidden shrink-0 bg-black/30 border-2 ${itemGuardStyle.label ? itemGuardStyle.border : 'border-white/10'} pointer-events-none`}>
                                         <img src={song.OrderedByAvatar} alt="avatar" referrerPolicy="no-referrer" className="w-full h-full object-cover" onError={(e)=>{(e.target as HTMLImageElement).src=`https://api.dicebear.com/7.x/identicon/svg?seed=${song.OrderedByUid}`}} />
                                     </div>
                                     <div className="flex flex-col min-w-0 flex-1 pointer-events-none">
                                         <div className="text-[13px] font-bold truncate drop-shadow-sm pr-16" style={{ color: theme.textColor }}>{song.SongName}</div>
-                                        <div className="text-[11px] truncate flex items-center gap-1.5 mt-0.5" style={{ color: theme.subTextColor }}><span>{song.ArtistName}</span><span className="w-0.5 h-0.5 bg-white/30 rounded-full"></span><span className="truncate" style={{ color: theme.titleColor, opacity: 0.8 }}>{song.OrderedBy}</span></div>
+                                        <div className="text-[11px] truncate flex items-center gap-1.5 mt-0.5" style={{ color: theme.subTextColor }}>
+                                            <span>{song.ArtistName}</span>
+                                            <span className="w-0.5 h-0.5 bg-white/30 rounded-full"></span>
+                                            <span className="truncate flex items-center gap-1" style={{ color: theme.titleColor, opacity: 0.8 }}>
+                                                {song.OrderedBy}
+                                                {itemGuardStyle.label && <span className={`text-[8px] px-1 py-0.5 rounded-[2px] font-bold tracking-wider leading-none shadow-sm ${itemGuardStyle.tag}`}>{itemGuardStyle.label}</span>}
+                                            </span>
+                                        </div>
                                     </div>
 
-                                    <div className="absolute right-2 top-1/2 transform -translate-y-1/2 flex items-center gap-1 opacity-0 group-hover/item:opacity-100 transition-opacity bg-black/60 p-1 rounded-md backdrop-blur-md border border-white/10 z-20">
-                                        <button
-                                            onPointerDown={e => { e.stopPropagation(); handleQueueAction('top', { index }); }}
-                                            className="p-1 hover:bg-white/20 rounded text-xs transition-colors" title="置顶/优先播放">
-                                            ⬆️
-                                        </button>
-                                        <button
-                                            onPointerDown={e => { e.stopPropagation(); handleQueueAction('play_now', { index }); }}
-                                            className="p-1 hover:bg-white/20 rounded text-xs transition-colors" title="无视顺序，强行立即切歌播放">
-                                            ▶️
-                                        </button>
-                                        <button
-                                            onPointerDown={e => { e.stopPropagation(); handleQueueAction('delete', { index }); }}
-                                            className="p-1 hover:bg-red-500/40 rounded text-xs transition-colors text-red-400" title="移出点歌队列">
-                                            🗑️
-                                        </button>
-                                    </div>
+                                    {isElectron && (
+                                        <div className="absolute right-2 top-1/2 transform -translate-y-1/2 flex items-center gap-1 opacity-0 group-hover/item:opacity-100 transition-opacity bg-black/60 p-1 rounded-md backdrop-blur-md border border-white/10 z-20">
+                                            <button
+                                                onPointerDown={e => { e.stopPropagation(); handleQueueAction('top', { index }); }}
+                                                className="p-1 hover:bg-white/20 rounded text-xs transition-colors" title="置顶/优先播放">
+                                                ⬆️
+                                            </button>
+                                            <button
+                                                onPointerDown={e => { e.stopPropagation(); handleQueueAction('play_now', { index }); }}
+                                                className="p-1 hover:bg-white/20 rounded text-xs transition-colors" title="无视顺序，强行立即切歌播放">
+                                                ▶️
+                                            </button>
+                                            <button
+                                                onPointerDown={e => { e.stopPropagation(); handleQueueAction('delete', { index }); }}
+                                                className="p-1 hover:bg-red-500/40 rounded text-xs transition-colors text-red-400" title="移出点歌队列">
+                                                🗑️
+                                            </button>
+                                        </div>
+                                    )}
                                 </div>
                             );
                         })}
                     </div>
                 </div>
 
-                {showSettings && (
+                {isElectron && showSettings && (
                     <div
                         onMouseDown={e => e.stopPropagation()}
                         className="no-drag absolute top-0 right-0 bottom-0 w-[220px] bg-black/85 backdrop-blur-xl z-[70] border-l border-white/10 p-4 flex flex-col gap-4 animate-slide-in-right shadow-2xl custom-scrollbar overflow-y-auto"
@@ -804,6 +877,12 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const [superUserInput, setSuperUserInput] = useState<string>('');
     const [debugInput, setDebugInput] = useState<string>('');
 
+    const [adminToast, setAdminToast] = useState<string>('');
+    const showAdminToast = (msg: string) => {
+        setAdminToast(msg);
+        setTimeout(() => setAdminToast(''), 3000);
+    };
+
     const activeTabRef = useRef<string>(activeTab);
     useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
 
@@ -875,27 +954,27 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
             headers: {'Content-Type':'application/json'},
             body: JSON.stringify({ sysConfig: newCfg })
         });
-        alert("设置已保存并生效！");
+        showAdminToast("✅ 设置已保存并生效！");
     };
 
     const handleConnectRoom = async () => {
         const rid = parseInt(roomIdInput);
-        if (!rid) return alert("请输入正确的房间号");
+        if (!rid) return showAdminToast("❌ 请输入正确的房间号");
         try {
             const res = await fetch('http://localhost:5555/api/room', {
                 method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ roomId: rid })
             });
             const json = await res.json();
-            if(json.success) alert("连接成功！请查看运行日志确认。");
-            else alert("连接失败，请检查网络或确认扫码登录是否有效。");
-        } catch(e) { alert("请求后端失败"); }
+            if(json.success) showAdminToast("✅ 连接请求成功！请查看运行日志确认。");
+            else showAdminToast("❌ 连接失败，请检查网络或确认扫码登录是否有效。");
+        } catch(e) { showAdminToast("❌ 请求后端失败"); }
     };
 
     const handleRestartNCM = async () => {
         try {
             const res = await fetch('http://localhost:5555/api/sys/restart_ncm', { method: 'POST' });
-            if(res.ok) alert("已发送重启指令，请查看日志并确认网易云是否重新打开。");
-        } catch(e) { alert("发送重启指令失败"); }
+            if(res.ok) showAdminToast("✅ 已发送重启指令，请查看运行日志！");
+        } catch(e) { showAdminToast("❌ 发送重启指令失败"); }
     };
 
     const handleUpdateCheck = async () => {
@@ -904,24 +983,28 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
             const res = await fetch('http://localhost:5555/api/update/check');
             const json = await res.json();
             setUpdateInfo({ checking: false, info: json });
-        } catch { setUpdateInfo({ checking: false, info: { error: '检查失败，请重试' } }); }
+
+            // ⭐ 增加：如果是最新版本，给予明确的弹窗提示
+            if (!json.hasUpdate && !json.error) {
+                showAdminToast("✅ 当前已经是最新版本，无需更新！");
+            } else if (json.error) {
+                showAdminToast(`❌ 检查失败: ${json.error}`);
+            }
+        } catch {
+            setUpdateInfo({ checking: false, info: { error: '检查失败，请重试' } });
+            showAdminToast("❌ 网络请求失败，请检查网络！");
+        }
     };
 
     const handleApplyUpdate = async () => {
         if(!confirm("确定要开始更新吗？程序将会自动下载并重启。")) return;
         await fetch('http://localhost:5555/api/update/apply', { method: 'POST' });
-        alert("正在后台下载更新，请稍候，程序将自动重启...");
+        showAdminToast("正在后台下载更新，请稍候，程序将自动重启...");
     };
 
     const startQrLogin = async () => {
         setQrState(prev => ({ ...prev, loading: true, base64: '' }));
         await fetch('http://localhost:5555/api/bili/qrstart', { method: 'POST' });
-    };
-
-    const handleExitBackend = async () => {
-        if (!confirm("🛑 确定要彻底关闭点歌机服务吗？\n\n关闭后，所有弹幕捕捉将立即停止，必须重新启动软件才能恢复。")) return;
-        try { await fetch('http://localhost:5555/api/exit', { method: 'POST' }); } catch (e) { }
-        window.close();
     };
 
     const toggleAccepting = async () => {
@@ -939,7 +1022,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     };
 
     const handleDebugInsert = async () => {
-        if(!debugInput.trim()) return alert("请输入需要搜索并插入的歌曲名！");
+        if(!debugInput.trim()) return showAdminToast("❌ 请输入需要搜索并插入的歌曲名！");
         try {
             const res = await fetch('http://localhost:5555/api/debug/insert_next', {
                 method: 'POST',
@@ -948,19 +1031,19 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
             });
             const json = await res.json();
             if(json.success) {
-                alert("✅ 搜索并插入成功！请前往网易云播放列表查看是否出现在下一首。");
+                showAdminToast("✅ 搜索并插入成功！请前往网易云播放列表查看。");
             } else {
-                alert("❌ 操作失败。可能是没搜到歌曲，或者 CDP 调试未开启。请查看运行日志。");
+                showAdminToast("❌ 操作失败。可能是没搜到歌曲，请查看运行日志。");
             }
-        } catch(e: any) { alert("请求后端失败：" + e.message); }
+        } catch(e: any) { showAdminToast("❌ 请求后端失败：" + e.message); }
     };
 
     const handleDebugPlayNext = async () => {
         try {
             const res = await fetch('http://localhost:5555/api/debug/play_next', { method: 'POST' });
             const json = await res.json();
-            if(json.success) alert("✅ 切歌指令已发送！");
-        } catch(e: any) { alert("请求后端失败：" + e.message); }
+            if(json.success) showAdminToast("✅ 切歌指令已发送！");
+        } catch(e: any) { showAdminToast("❌ 请求后端失败：" + e.message); }
     };
 
     const updatePermission = (permKey: string, field: string, value: any) => {
@@ -971,6 +1054,20 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                 [permKey]: {
                     ...(prev.config[permKey] || { AllowManager: true, MinGuardType: (permKey === 'ForceControlPermission' ? -1 : 0), MinMedalLevel: 0 }),
                     [field]: value
+                }
+            }
+        }));
+    };
+
+    const updateCooldown = (tier: string, value: string) => {
+        const val = parseInt(value) || 0;
+        setConfig((prev: any) => ({
+            ...prev,
+            config: {
+                ...prev.config,
+                Cooldowns: {
+                    ...(prev.config.Cooldowns || { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }),
+                    [tier]: val
                 }
             }
         }));
@@ -1000,6 +1097,13 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
     return (
         <div className="admin-widget-root animate-fade-in text-gray-200 flex flex-col font-sans select-none w-full h-screen overflow-hidden" style={{ backgroundColor: '#0d1117' }}>
+
+            {adminToast && (
+                <div className="fixed top-8 left-1/2 transform -translate-x-1/2 z-[99999] bg-blue-600 text-white px-6 py-3 rounded-full shadow-2xl font-bold animate-slide-in flex items-center gap-2">
+                    {adminToast}
+                </div>
+            )}
+
             <div className="px-4 py-2 border-b border-white/10 flex justify-between items-center bg-white/5" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
                 <div className="font-bold text-white text-sm flex items-center gap-2">🔧 控制面板</div>
             </div>
@@ -1035,7 +1139,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                 <div className="text-sm text-gray-400 mb-1">OBS 捕捉地址 / 局域网访问</div>
                                                 <div className="text-lg font-mono text-cyan-400 select-all">http://localhost:5555/</div>
                                             </div>
-                                            <button onClick={() => { navigator.clipboard.writeText("http://localhost:5555/"); alert("✅ 链接复制成功！请在 OBS 添加【浏览器源】并粘贴此地址。"); }} className="px-5 py-2.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded-lg text-sm font-bold transition-colors border border-blue-500/30 flex items-center gap-2">
+                                            <button onClick={() => { navigator.clipboard.writeText("http://localhost:5555/"); showAdminToast("✅ 链接复制成功！"); }} className="px-5 py-2.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded-lg text-sm font-bold transition-colors border border-blue-500/30 flex items-center gap-2">
                                                 📋 复制链接
                                             </button>
                                         </div>
@@ -1082,12 +1186,6 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                 </button>
                                             </div>
                                         </div>
-                                    </div>
-
-                                    <div className="mt-8 flex justify-end">
-                                        <button onClick={handleExitBackend} className="px-5 py-2.5 bg-red-600/20 hover:bg-red-600/40 text-red-500 border border-red-500/30 text-sm rounded-lg font-bold transition-colors">
-                                            🛑 彻底关闭后端服务
-                                        </button>
                                     </div>
                                 </div>
                             )}
@@ -1175,13 +1273,30 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                     </div>
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
+                                        <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3">⏱️ 点歌冷却设置 (秒)</h3>
+                                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">普通用户</label>
+                                                <input type="number" className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none" value={config.config.Cooldowns?.Normal || 0} onChange={e => updateCooldown('Normal', e.target.value)} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs text-blue-400 mb-2 font-bold">舰长</label>
+                                                <input type="number" className="w-full bg-blue-900/30 border border-blue-500/30 rounded-lg p-2.5 text-md text-blue-200 focus:border-blue-500 outline-none" value={config.config.Cooldowns?.Captain || 0} onChange={e => updateCooldown('Captain', e.target.value)} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs text-purple-400 mb-2 font-bold">提督</label>
+                                                <input type="number" className="w-full bg-purple-900/30 border border-purple-500/30 rounded-lg p-2.5 text-md text-purple-200 focus:border-purple-500 outline-none" value={config.config.Cooldowns?.Admiral || 0} onChange={e => updateCooldown('Admiral', e.target.value)} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs text-red-400 mb-2 font-bold">总督</label>
+                                                <input type="number" className="w-full bg-red-900/30 border border-red-500/30 rounded-lg p-2.5 text-md text-red-200 focus:border-red-500 outline-none" value={config.config.Cooldowns?.Governor || 0} onChange={e => updateCooldown('Governor', e.target.value)} />
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
                                         <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3">⚙️ 常规参数</h3>
                                         <div className="grid grid-cols-2 gap-6">
-                                            <div>
-                                                <label className="block text-xs text-gray-400 mb-2">点歌冷却时间 (分钟)</label>
-                                                <input type="number" className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none" value={config.config.CooldownMinutes || 0} onChange={e => setConfig({...config, config: {...config.config, CooldownMinutes: parseInt(e.target.value)}})} />
-                                            </div>
-
                                             <div>
                                                 <label className="block text-xs text-gray-400 mb-2">空闲时点歌行为</label>
                                                 <select
@@ -1194,8 +1309,8 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                 </select>
                                             </div>
 
-                                            <div className="flex flex-col justify-center pt-3 col-span-2">
-                                                <div className="flex justify-between items-center bg-black/30 border border-white/10 rounded-lg p-3 w-1/2">
+                                            <div className="flex flex-col justify-center pt-3">
+                                                <div className="flex justify-between items-center bg-black/30 border border-white/10 rounded-lg p-3">
                                                     <div>
                                                         <label className="block text-sm text-white font-medium">记录所有弹幕日志</label>
                                                         <span className="text-xs text-gray-500 block mt-1">用于在日志排错抓取</span>

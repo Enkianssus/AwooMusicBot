@@ -47,17 +47,15 @@ jobs:
       - name: Pack with Velopack
         shell: powershell
         run: |
-          chcp 65001
-          Write-Host "--- 开始检查图标文件位置 ---"
-          # 递归列出所有文件，方便排查位置
-          Get-ChildItem -Recurse | Where-Object { $_.Name -like "*icon.ico*" } | Select-Object FullName
-          
-          if (!(Test-Path "assets/icon.ico")) {
-              Write-Error "在 assets/icon.ico 未找到图标文件！"
-              exit 1
-          }
-          
-          vpk pack -u bilincm -v "${{ env.VERSION }}" -p "dist_electron/win-unpacked" -e "直播点歌机.exe" -i "assets/icon.ico"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+            
+          # 先确认 exe 实际名称
+          Write-Host "--- dist_electron/win-unpacked 目录内容 ---"
+          Get-ChildItem "dist_electron/win-unpacked" -Filter "*.exe" | Select-Object Name
+            
+          $iconPath = Join-Path $env:GITHUB_WORKSPACE "assets\icon.ico"
+          vpk pack -u bilincm -v "${{ env.VERSION }}" -p "dist_electron/win-unpacked" -e "直播点歌机.exe" -i "$iconPath"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

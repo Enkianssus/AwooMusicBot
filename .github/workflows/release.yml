@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*' # 推送 v 开头的 tag 时触发
+  workflow_dispatch: # 新增此行：允许在 GitHub 网页上手动触发
 
 permissions:
   contents: write
@@ -38,7 +39,7 @@ jobs:
           echo "从 package.json 获取版本号: $version"
 
       - name: Build Electron Unpacked
-        run: npm run build 
+        run: npm run build
 
       - name: Install Velopack CLI (vpk)
         run: dotnet tool install -g vpk
@@ -54,7 +55,8 @@ jobs:
           # 使用拼接好的 v1.0.x 作为标题
           name: BiliNCM Release ${{ env.TAG_VERSION }}
           # 确保 tag_name 与推送触发的一致
-          tag_name: ${{ github.ref_name }}
+          # 如果是手动触发，这里会使用 package.json 的版本号作为 tag
+          tag_name: ${{ env.TAG_VERSION }}
           draft: false
           prerelease: false
           generate_release_notes: true

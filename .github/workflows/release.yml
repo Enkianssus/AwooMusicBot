@@ -45,18 +45,12 @@ jobs:
         run: dotnet tool install -g vpk
 
       - name: Pack with Velopack
-        shell: powershell
+        shell: cmd
         run: |
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-            
-          # 先确认 exe 实际名称
-          Write-Host "--- dist_electron/win-unpacked 目录内容 ---"
-          Get-ChildItem "dist_electron/win-unpacked" -Filter "*.exe" | Select-Object Name
-            
-          $iconPath = Join-Path $env:GITHUB_WORKSPACE "assets\icon.ico"
-          vpk pack -u bilincm -v "${{ env.VERSION }}" -p "dist_electron/win-unpacked" -e "直播点歌机.exe" -i "$iconPath"
-
+          chcp 65001
+          for %%f in (dist_electron\win-unpacked\*.exe) do set "EXE_NAME=%%~nxf"
+          echo Found exe: %EXE_NAME%
+          vpk pack -u bilincm -v %VERSION% -p dist_electron\win-unpacked --mainExe "%EXE_NAME%" -e "%EXE_NAME%" -i assets\icon.ico
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:

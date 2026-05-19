@@ -54,9 +54,9 @@ jobs:
           Get-ChildItem "dist_electron\win-unpacked\*.exe" | Select-Object Name
 
       - name: Pack with Velopack
-        shell: cmd
+        shell: powershell
         run: |
-          vpk pack -u bilincm -v %VERSION% -p dist_electron\win-unpacked --mainExe BiliNCM.exe -e BiliNCM.exe -i assets\icon.ico
+          vpk pack -u bilincm -v $env:VERSION -p dist_electron/win-unpacked -e BiliNCM.exe -i assets/icon.ico
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

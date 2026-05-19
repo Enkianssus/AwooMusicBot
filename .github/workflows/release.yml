@@ -3,8 +3,8 @@ name: Build and Release Velopack
 on:
   push:
     tags:
-      - 'v*' # 推送 v 开头的 tag 时触发
-  workflow_dispatch: # 新增此行：允许在 GitHub 网页上手动触发
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -26,37 +26,44 @@ jobs:
       - name: Install Dependencies
         run: npm install
 
-      # 自动提取 package.json 中的 version 并存入环境变量
-      - name: Get Version from package.json
+      - name: Get Version
         id: get_version
         shell: powershell
         run: |
           $package = Get-Content package.json | ConvertFrom-Json
-          $version = $package.version
-          echo "VERSION=$version" >> $env:GITHUB_ENV
-          # 拼接带 v 的版本号用于 Release 标题
-          echo "TAG_VERSION=v$version" >> $env:GITHUB_ENV
-          echo "从 package.json 获取版本号: $version"
+          echo "VERSION=$($package.version)" >> $env:GITHUB_ENV
+          if ("${{ github.event_name }}" -eq "push") {
+            echo "TAG_NAME=${{ github.ref_name }}" >> $env:GITHUB_ENV
+          } else {
+            echo "TAG_NAME=v$($package.version)" >> $env:GITHUB_ENV
+          }
 
       - name: Build Electron Unpacked
         run: npm run build
 
-      - name: Install Velopack CLI (vpk)
+      - name: Install Velopack CLI
         run: dotnet tool install -g vpk
 
       - name: Pack with Velopack
+        shell: powershell
         run: |
           chcp 65001
-          vpk pack -u bilincm -v ${{ env.VERSION }} -p dist_electron/win-unpacked -e 直播点歌机.exe -i assets/icon.ico
+          Write-Host "--- 开始检查图标文件位置 ---"
+          # 递归列出所有文件，方便排查位置
+          Get-ChildItem -Recurse | Where-Object { $_.Name -like "*icon.ico*" } | Select-Object FullName
+          
+          if (!(Test-Path "assets/icon.ico")) {
+              Write-Error "在 assets/icon.ico 未找到图标文件！"
+              exit 1
+          }
+          
+          vpk pack -u bilincm -v "${{ env.VERSION }}" -p "dist_electron/win-unpacked" -e "直播点歌机.exe" -i "assets/icon.ico"
 
-      - name: Create GitHub Release and Upload Assets
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          # 使用拼接好的 v1.0.x 作为标题
-          name: BiliNCM Release ${{ env.TAG_VERSION }}
-          # 确保 tag_name 与推送触发的一致
-          # 如果是手动触发，这里会使用 package.json 的版本号作为 tag
-          tag_name: ${{ env.TAG_VERSION }}
+          name: "BiliNCM Release ${{ env.TAG_NAME }}"
+          tag_name: "${{ env.TAG_NAME }}"
           draft: false
           prerelease: false
           generate_release_notes: true

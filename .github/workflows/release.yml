@@ -44,11 +44,18 @@ jobs:
       - name: Install Velopack CLI
         run: dotnet tool install -g vpk
 
+      - name: Rename exe to ASCII
+        shell: powershell
+        run: |
+          Get-ChildItem "dist_electron\win-unpacked\*.exe" | ForEach-Object {
+            Rename-Item $_.FullName "BiliNCM.exe"
+            Write-Host "Renamed $($_.Name) to BiliNCM.exe"
+          }
+          Get-ChildItem "dist_electron\win-unpacked\*.exe" | Select-Object Name
+
       - name: Pack with Velopack
         shell: cmd
         run: |
-          chcp 65001
-          ren "dist_electron\win-unpacked\直播点歌机.exe" BiliNCM.exe
           vpk pack -u bilincm -v %VERSION% -p dist_electron\win-unpacked --mainExe BiliNCM.exe -e BiliNCM.exe -i assets\icon.ico
 
       - name: Create Release

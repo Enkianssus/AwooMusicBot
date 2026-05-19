@@ -160,6 +160,10 @@ ipcMain.on('close-window', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (win) { if (win === overlayWindow) app.quit(); else win.close(); }
 });
+ipcMain.on('minimize-window', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) { win.minimize(); }
+});
 ipcMain.on('overlay-resize', (event, w, h) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (win) {

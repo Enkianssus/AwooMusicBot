@@ -400,6 +400,12 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         }
     };
 
+    const handleWindowMinimize = () => {
+        if (isElectron && ipcRenderer) {
+            ipcRenderer.send('minimize-window');
+        }
+    };
+
     const handleDragStart = (e: React.MouseEvent<HTMLDivElement>) => {
         if (isElectron) return;
         const targetElement = e.target as HTMLElement;
@@ -611,6 +617,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                         <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="后端控制面板">🎛️</button>
                         <button onMouseDown={e => e.stopPropagation()} onClick={() => setShowSettings(!showSettings)} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="外观设置">⚙️</button>
 
+                        <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="flex items-center justify-center w-6 h-6 rounded-full transition-colors text-white/50 hover:text-white hover:bg-white/20 text-md font-bold" title="最小化">
+                            —
+                        </button>
                         <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="flex items-center justify-center w-6 h-6 rounded-full transition-colors text-white/50 hover:text-red-400 hover:bg-red-500/20 text-md" title="关闭点歌机">
                             ✖
                         </button>
@@ -633,7 +642,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
                         <div className="no-drag flex items-center relative h-6 flex-1 justify-end min-w-0">
                             <div
-                                className={`absolute right-0 text-xs font-medium max-w-[150px] truncate pointer-events-none transition-all duration-300 ${isElectron ? 'group-hover:-translate-x-[85px] group-hover:opacity-50' : ''} ${getStatusAnimation(data.status)}`}
+                                className={`absolute right-0 text-xs font-medium max-w-[150px] truncate pointer-events-none transition-all duration-300 ${isElectron ? 'group-hover:-translate-x-[115px] group-hover:opacity-50' : ''} ${getStatusAnimation(data.status)}`}
                                 style={{ color: !isConnected ? theme.subTextColor : getStatusColor(data.status) }}
                             >
                                 {!isConnected ? '等待后端...' : (data.status || '点歌就绪')}
@@ -643,6 +652,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                                 <div className="absolute right-0 flex gap-2 items-center opacity-0 transform translate-x-3 group-hover:translate-x-0 group-hover:opacity-100 transition-all duration-300 z-20">
                                     <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="后端控制面板">🎛️</button>
                                     <button onMouseDown={e => e.stopPropagation()} onClick={() => setShowSettings(!showSettings)} className="text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="外观设置">⚙️</button>
+                                    <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-white hover:bg-white/20 text-xs font-bold" title="最小化">
+                                        —
+                                    </button>
                                     <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-red-400 hover:bg-red-500/20 text-xs" title="关闭本窗口">
                                         ✖
                                     </button>

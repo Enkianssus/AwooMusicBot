@@ -48,9 +48,9 @@ jobs:
         shell: cmd
         run: |
           chcp 65001
-          for %%f in (dist_electron\win-unpacked\*.exe) do set "EXE_NAME=%%~nxf"
-          echo Found exe: %EXE_NAME%
-          vpk pack -u bilincm -v %VERSION% -p dist_electron\win-unpacked --mainExe "%EXE_NAME%" -e "%EXE_NAME%" -i assets\icon.ico
+          ren "dist_electron\win-unpacked\直播点歌机.exe" BiliNCM.exe
+          vpk pack -u bilincm -v %VERSION% -p dist_electron\win-unpacked --mainExe BiliNCM.exe -e BiliNCM.exe -i assets\icon.ico
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:

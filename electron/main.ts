@@ -17,7 +17,7 @@ try {
   if (process.platform === 'win32') {
     execSync('chcp 65001');
   }
-} catch (e) { /* 忽略 */ }
+} catch { /* 忽略 */ }
 
 const execAsync = promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
@@ -35,6 +35,7 @@ interface SysLog {
 const sysLogs: SysLog[] = [];
 let currentStatusMessage: string = '点歌就绪';
 let statusClearTimer: NodeJS.Timeout | null = null;
+let isCdpConnected: boolean = false; // ⭐ 记录 CDP 注入状态，暴露给前端
 
 function setGlobalStatus(msg: string) {
   currentStatusMessage = msg;
@@ -219,7 +220,7 @@ function loadConfig() {
       biliUid = appConfig.biliUid || 0;
       writeLog(`✅ 已加载本地配置，当前缓存的直播间为: ${appConfig.roomId}`, 'Green');
     }
-  } catch (e) { writeLog('加载配置失败', 'Red'); }
+  } catch { writeLog('加载配置失败', 'Red'); }
 }
 
 function saveConfig() {
@@ -227,11 +228,12 @@ function saveConfig() {
     appConfig.biliCookie = biliCookie;
     appConfig.biliUid = biliUid;
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(appConfig, null, 2));
-  } catch (e) { writeLog('保存配置失败', 'Red'); }
+  } catch { writeLog('保存配置失败', 'Red'); }
 }
 
 let isAccepting = true;
 let isPlaying = true;
+let skipForcePlayOnce = false;
 let biliCookie = "";
 let biliUid = 0;
 let qrCodeBase64 = "";
@@ -336,7 +338,7 @@ async function connectToLiveRoom(shortRoomId: number): Promise<boolean> {
 
 function startBiliWebSocket(authObj: any) {
   if (currentBiliWs) {
-    try { currentBiliWs.close(); } catch (e) {}
+    try { currentBiliWs.close(); } catch {}
   }
   if (biliPingTimer) clearInterval(biliPingTimer);
 
@@ -439,14 +441,14 @@ function parseBiliPacket(buffer: Buffer) {
         try {
           const decompressed = zlib.brotliDecompressSync(payload);
           parseBiliPacket(decompressed);
-        } catch (e) {
+        } catch {
           writeLog("Brotli 解压失败", "Red");
         }
       } else if (protoVer === 2) {
         try {
           const decompressed = zlib.unzipSync(payload);
           parseBiliPacket(decompressed);
-        } catch (e) {
+        } catch {
           writeLog("Zlib 解压失败", "Red");
         }
       } else {
@@ -454,7 +456,7 @@ function parseBiliPacket(buffer: Buffer) {
           const msgStr = payload.toString('utf-8');
           const msg = JSON.parse(msgStr);
           handleRawDanmaku(msg);
-        } catch (e) {}
+        } catch {}
       }
     }
     offset += packetLen;
@@ -515,7 +517,7 @@ function handleRawDanmaku(doc: any) {
       if (info[0][15] && info[0][15].user && info[0][15].user.base && info[0][15].user.base.face) {
         avatarUrl = info[0][15].user.base.face;
       }
-    } catch(e) {}
+    } catch {}
 
     const user = { uid: rawUid, name: uname, uname: uname, avatar: avatarUrl, isManager, medalLevel, guardLevel };
     handleDanmaku(user, msg);
@@ -526,8 +528,9 @@ function handleRawDanmaku(doc: any) {
 // 网易云音乐 - 智能进程接管与重启
 // ==========================================
 async function restartNCMWithDebugPort() {
-  writeLog('>>> [系统] 正在准备重启网易云音乐...', 'DarkGray');
+  writeLog('>>> [系统] 正在准备重新注入网易云音乐...', 'DarkGray');
   let exePath = appConfig.sysConfig?.NcmExePath || '';
+  isCdpConnected = false;
 
   if (exePath && fs.existsSync(exePath)) {
     writeLog('>>> [系统] 使用缓存的网易云音乐路径启动...', 'DarkGray');
@@ -540,7 +543,7 @@ async function restartNCMWithDebugPort() {
       if (b64) {
         exePath = Buffer.from(b64, 'base64').toString('utf8');
       }
-    } catch (e) {}
+    } catch {}
 
     if (!exePath || !fs.existsSync(exePath)) {
       const possiblePaths = [
@@ -564,7 +567,7 @@ async function restartNCMWithDebugPort() {
   try {
     await execAsync('taskkill /f /im cloudmusic.exe');
     writeLog('>>> [系统] 已强制关闭当前网易云进程。', 'DarkGray');
-  } catch (e) {}
+  } catch {}
 
   await new Promise(resolve => setTimeout(resolve, 2000));
 
@@ -596,7 +599,8 @@ async function restartNCMWithDebugPort() {
     writeLog('⚠️ [提示] 找不到网易云音乐安装路径，请手动以调试模式启动！', 'Yellow');
   }
 
-  setTimeout(startCDPRadar, 6000);
+  // ⭐ 大幅压缩等待启动时间，从 6秒 减为 2.5秒
+  setTimeout(startCDPRadar, 2500);
 }
 
 // ==========================================
@@ -637,7 +641,7 @@ const FiberStoreExtractJs = `
 function getWebSocketClient() {
   try {
     return require('ws');
-  } catch (e) {
+  } catch {
     if ((global as any).WebSocket) return (global as any).WebSocket;
     return null;
   }
@@ -752,8 +756,9 @@ async function startCDPRadar() {
         || targets.find(t => t.type === 'page')?.webSocketDebuggerUrl;
 
     if (!wsUrl) {
-      writeLog('⏳ [挖树] 未找到网易云前端页面，两秒后重试...', 'DarkGray');
-      setTimeout(startCDPRadar, 2000);
+      writeLog('⏳ [挖树] 未找到网易云前端页面，1.5秒后重试...', 'DarkGray');
+      isCdpConnected = false;
+      setTimeout(startCDPRadar, 1500); // ⭐ 加快重试间隔
       return;
     }
 
@@ -787,7 +792,7 @@ async function startCDPRadar() {
                           reason: 'not_ready',
                           debugLog: window.__debug_store_log.join(' | ') 
                       }));
-                  } catch(e) {}
+                  } catch {}
                   setTimeout(initRadar, 1500); 
                   return; 
               }
@@ -857,10 +862,10 @@ async function startCDPRadar() {
 
                           try {
                               window.__ncmRadarCallback(JSON.stringify(payload));
-                          } catch(e) {}
+                          } catch {}
                           lastTrackId = currentTrackId;
                       }
-                  } catch(e) { }
+                  } catch { }
               });
           })();
         `;
@@ -886,9 +891,11 @@ async function startCDPRadar() {
           else if (payload.event === 'RADAR_INIT_OK') {
             writeLog(`✅ CDP 常驻雷达注入成功! (${payload.debugLog})`, 'Green');
             setGlobalStatus('点歌就绪');
+            isCdpConnected = true;
           }
           else if (payload.event === 'RADAR_ALREADY_DEPLOYED') {
             writeLog('✅ CDP 雷达已存在，无需重复注入', 'Green');
+            isCdpConnected = true;
           }
           else if (payload.event === 'TRACK_CHANGED') {
             const currId = payload.current?.id;
@@ -903,7 +910,7 @@ async function startCDPRadar() {
 
               if (!isPlaying) {
                 if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
-                  writeLog(`[状态同步] 处于暂停状态，自动跳过代播曲目以防消耗: ${targetQueue[0].SongName}`, 'Yellow');
+                  writeLog(`[状态同步] 处于暂停状态，自动跳过待播曲目以防消耗: ${targetQueue[0].SongName}`, 'Yellow');
                   sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
                 } else {
                   if (currentPlayingSong) {
@@ -914,15 +921,25 @@ async function startCDPRadar() {
               }
               else {
                 if (currentPlayingSong && currId !== currentPlayingSong.Id) {
+                  const checkSkipForce = skipForcePlayOnce;
+                  skipForcePlayOnce = false;
+
                   if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
                     writeLog(`[状态同步] 自然衔接到队首: ${targetQueue[0].SongName}`, 'Green');
                     currentPlayingSong = targetQueue.shift();
                     stateChanged = true;
                   } else if (targetQueue.length > 0) {
-                    writeLog(`[状态同步] 捕捉到切歌信号！强制拉起代播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
-                    forcePlaySongAsync(targetQueue[0]);
-                    currentPlayingSong = targetQueue.shift();
-                    stateChanged = true;
+                    if (checkSkipForce && targetQueue[0].Id === currentPlayingSong.Id) {
+                      writeLog(`[状态同步] 退回操作触发: 队列仅有此歌，放行网易云原生曲，原曲延后播放: ${targetQueue[0].SongName}`, 'DarkGray');
+                      insertNextSongViaCDP(targetQueue[0].Id);
+                      currentPlayingSong = null;
+                      stateChanged = true;
+                    } else {
+                      writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
+                      forcePlaySongAsync(targetQueue[0]);
+                      currentPlayingSong = targetQueue.shift();
+                      stateChanged = true;
+                    }
                   } else {
                     writeLog(`[状态同步] 点播列表已空，放行原歌单曲目`, 'DarkGray');
                     currentPlayingSong = null;
@@ -933,10 +950,15 @@ async function startCDPRadar() {
                     currentPlayingSong = targetQueue.shift();
                     stateChanged = true;
                   } else {
-                    writeLog(`[状态同步] 捕捉到切歌信号！强制拉起代播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
-                    forcePlaySongAsync(targetQueue[0]);
-                    currentPlayingSong = targetQueue.shift();
-                    stateChanged = true;
+                    if (appConfig.sysConfig?.IdleWaitNext === false) {
+                      writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
+                      forcePlaySongAsync(targetQueue[0]);
+                      currentPlayingSong = targetQueue.shift();
+                      stateChanged = true;
+                    } else {
+                      writeLog(`[状态同步] 当前空闲且未匹配，为队首曲目重注下一首: ${targetQueue[0].SongName}`, 'DarkGray');
+                      insertNextSongViaCDP(targetQueue[0].Id);
+                    }
                   }
                 }
 
@@ -956,17 +978,20 @@ async function startCDPRadar() {
         }
       },
       onClose: () => {
-        writeLog('⚠️ [雷达] CDP 连接断开，3秒后准备重连...', 'Yellow');
+        writeLog('⚠️ [雷达] CDP 连接断开，1.5秒后准备重连...', 'Yellow');
         setGlobalStatus('等待后端');
-        setTimeout(startCDPRadar, 3000);
+        isCdpConnected = false;
+        setTimeout(startCDPRadar, 1500); // ⭐ 加快重连间隔
       },
-      onError: (e: any) => {
-        writeLog(`❌ [雷达] CDP WebSocket 出错: ${e?.message}`, 'Red');
+      onError: (err: any) => {
+        writeLog(`❌ [雷达] CDP WebSocket 出错: ${err?.message}`, 'Red');
+        isCdpConnected = false;
       }
     });
-  } catch (e: any) {
-    writeLog(`⏳ [雷达] 等待网易云调试端口就绪... (${e.message})`, 'DarkGray');
-    setTimeout(startCDPRadar, 5000);
+  } catch (err: any) {
+    writeLog(`⏳ [雷达] 等待网易云调试端口就绪... (${err.message})`, 'DarkGray');
+    isCdpConnected = false;
+    setTimeout(startCDPRadar, 1500); // ⭐ 加快重连间隔
   }
 }
 
@@ -985,7 +1010,7 @@ async function getBiliAvatar(uid: string): Promise<string> {
     if (data.code === 0 && data.data?.card?.face) {
       return data.data.card.face;
     }
-  } catch (e) {
+  } catch {
     writeLog(`[警告] 获取用户 ${uid} 头像失败`, 'Yellow');
   }
   return `https://api.dicebear.com/7.x/identicon/svg?seed=${uid}`;
@@ -1002,7 +1027,18 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
       writeLog(`[彩蛋] 触发真理的小曲，替换搜索关键词为: ${keyword}`, 'Magenta');
     }
 
-    const res = await fetch(`https://music.163.com/api/search/get/web?s=${encodeURIComponent(keyword)}&type=1&limit=1`);
+    const res = await fetch(`https://music.163.com/api/search/get/web`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Cookie': 'os=pc; appver=2.9.8;'
+      },
+      body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
+    });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
     const data: any = await res.json();
     const songs = data.result?.songs;
 
@@ -1014,7 +1050,7 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
       const newSong = {
         Id: String(s.id),
         SongName: s.name,
-        ArtistName: s.artists?.map((a: any) => a.name).join('/'),
+        ArtistName: s.artists?.map((a: any) => a.name).join('/') || s.ar?.map((a: any) => a.name).join('/') || '未知歌手',
         OrderedBy: user.name || user.uname,
         OrderedByUid: user.uid,
         OrderedByAvatar: avatarUrl,
@@ -1066,7 +1102,7 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
       writeLog(`[点歌] 搜索失败: 未找到歌曲 "${keyword}"`, 'Yellow');
       addReject(user, `未搜到歌曲: ${keyword}`);
     }
-  } catch (e) {
+  } catch {
     writeLog('点歌搜索网络异常', 'Red');
     setGlobalStatus('❌ 搜索网络异常');
     addReject(user, '搜索网络异常');
@@ -1142,7 +1178,6 @@ function handleDanmaku(user: any, msg: string) {
       addReject(user, perm.reason!);
       return;
     }
-    currentPlayingSong = null;
     setGlobalStatus('⏭️ 已手动切歌');
     sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
     return;
@@ -1287,11 +1322,11 @@ async function startBiliQrLogin() {
           qrLoginStatus = "登录完成，请前往连接直播间！";
           isQrLoggingIn = false;
         }
-      } catch (e) { }
+      } catch { }
     }, 2000);
 
-  } catch (error: any) {
-    qrLoginStatus = `错误: ${error.message}`;
+  } catch (err: any) {
+    qrLoginStatus = `错误: ${err.message}`;
     isQrLoggingIn = false;
   }
 }
@@ -1326,7 +1361,8 @@ function startBackendServer() {
         accepting: isAccepting,
         playing: isPlaying,
         uiConfig: appConfig.widgetStyle,
-        rejects: recentRejects
+        rejects: recentRejects,
+        cdpConnected: isCdpConnected // ⭐ 加入动态 CDP 连接状态感知
       }));
       return;
     }
@@ -1348,10 +1384,11 @@ function startBackendServer() {
         roomId: appConfig.roomId,
         biliLogin: !!biliCookie,
         uid: biliUid,
-        version: app.getVersion(), // ⭐ 这里改成动态读取系统版本
+        version: app.getVersion(),
         accepting: isAccepting,
         playing: isPlaying,
         widgetStyle: appConfig.widgetStyle,
+        cdpConnected: isCdpConnected,
         config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 } }
       }));
       return;
@@ -1374,7 +1411,6 @@ function startBackendServer() {
         forcePlaySongAsync(item);
         setGlobalStatus(`▶️ 强制播放: ${item.SongName}`);
       } else if (action === 'skip_current') {
-        currentPlayingSong = null;
         sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
         setGlobalStatus('⏭️ 已切歌');
       } else if (action === 'reorder' && doc.from >= 0 && doc.from < targetQueue.length && doc.to >= 0 && doc.to < targetQueue.length) {
@@ -1384,7 +1420,7 @@ function startBackendServer() {
       } else if (action === 'push_current_to_queue') {
         if (currentPlayingSong) {
           targetQueue.push(currentPlayingSong);
-          currentPlayingSong = null;
+          skipForcePlayOnce = true;
           setGlobalStatus('🔙 已退回点歌列表末端');
           sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
         }
@@ -1436,10 +1472,8 @@ function startBackendServer() {
       return;
     }
 
-    // ⭐ 新增：Velopack 检查更新接口
     if (url.pathname === '/api/update/check') {
       try {
-        // 使用你自己的 Cloudflare 域名作为更新源
         const um = new UpdateManager('https://app.enkianss.us/update/bilincm');
         const updateInfo = await um.checkForUpdatesAsync();
 
@@ -1451,17 +1485,15 @@ function startBackendServer() {
           writeLog(`[更新] 检查完毕，线上版本不高于当前版本，暂无更新。`, 'Cyan');
           res.end(JSON.stringify({ hasUpdate: false }));
         }
-      } catch (e: any) {
-        writeLog(`[更新] 检查失败: ${e.message}`, 'Red');
+      } catch (err: any) {
+        writeLog(`[更新] 检查失败: ${err.message}`, 'Red');
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.end(JSON.stringify({ error: `无法连接更新服务器` }));
       }
       return;
     }
 
-    // ⭐ 新增：Velopack 下载并应用更新接口
     if (url.pathname === '/api/update/apply' && req.method === 'POST') {
-      // 先回复前端，防止后台下载时间长导致请求超时
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({ success: true }));
 
@@ -1474,16 +1506,15 @@ function startBackendServer() {
           setGlobalStatus(`🚀 下载更新中...`);
 
           await um.downloadUpdateAsync(updateInfo, (progress: number) => {
-            // 打印下载进度（按20%的区间打印，避免日志刷屏）
             if (progress % 20 === 0) writeLog(`[更新] 下载进度: ${progress}%`, 'DarkGray');
           });
 
           writeLog(`[更新] 下载完成，正在重启应用更新!`, 'Green');
-          um.waitExitThenApplyUpdate(updateInfo, false, true); // 准备更新并指示重启
-          app.quit(); // 退出当前进程以触发 Velopack 更新替换
+          um.waitExitThenApplyUpdate(updateInfo, false, true);
+          app.quit();
         }
-      } catch (e: any) {
-        writeLog(`[更新] 下载或应用失败: ${e.message}`, 'Red');
+      } catch (err: any) {
+        writeLog(`[更新] 下载或应用失败: ${err.message}`, 'Red');
         setGlobalStatus(`❌ 更新失败`);
       }
       return;
@@ -1492,7 +1523,17 @@ function startBackendServer() {
     if (url.pathname === '/api/debug/insert_next' && req.method === 'POST') {
       try {
         const { keyword } = JSON.parse(await readRequestBody(req));
-        const searchRes = await fetch(`https://music.163.com/api/search/get/web?s=${encodeURIComponent(keyword)}&type=1&limit=1`);
+
+        const searchRes = await fetch(`https://music.163.com/api/search/get/web`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Cookie': 'os=pc; appver=2.9.8;'
+          },
+          body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
+        });
+
         const searchData: any = await searchRes.json();
         const songs = searchData.result?.songs;
 
@@ -1504,7 +1545,7 @@ function startBackendServer() {
           res.setHeader('Content-Type', 'application/json; charset=utf-8');
           res.end(JSON.stringify({ success: false, message: '未找到相关歌曲' }));
         }
-      } catch (e) {
+      } catch {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.end(JSON.stringify({ success: false }));
       }
@@ -1557,8 +1598,8 @@ function startBackendServer() {
           res.end(fs.readFileSync(filePath));
           return;
         }
-      } catch (e) {
-        writeLog(`静态资源加载失败: ${e}`, 'Red');
+      } catch (err) {
+        writeLog(`静态资源加载失败: ${err}`, 'Red');
       }
     }
 
@@ -1593,11 +1634,6 @@ app.whenReady().then(() => {
 
   if (appConfig.roomId) {
     connectToLiveRoom(appConfig.roomId);
-  }
-
-  if (!biliCookie) {
-    writeLog("⚠️ 未检测到 B站登录信息，自动打开设置面板引导扫码...", "Yellow");
-    setTimeout(createAdminWindow, 1500);
   }
 });
 

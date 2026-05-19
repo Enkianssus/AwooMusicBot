@@ -1,0 +1,63 @@
+name: Build and Release Velopack
+
+on:
+  push:
+    tags:
+      - 'v*' # 推送 v 开头的 tag 时触发
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm install
+
+      # 自动提取 package.json 中的 version 并存入环境变量
+      - name: Get Version from package.json
+        id: get_version
+        shell: powershell
+        run: |
+          $package = Get-Content package.json | ConvertFrom-Json
+          $version = $package.version
+          echo "VERSION=$version" >> $env:GITHUB_ENV
+          # 拼接带 v 的版本号用于 Release 标题
+          echo "TAG_VERSION=v$version" >> $env:GITHUB_ENV
+          echo "从 package.json 获取版本号: $version"
+
+      - name: Build Electron Unpacked
+        run: npm run build 
+
+      - name: Install Velopack CLI (vpk)
+        run: dotnet tool install -g vpk
+
+      - name: Pack with Velopack
+        run: |
+          chcp 65001
+          vpk pack -u bilincm -v ${{ env.VERSION }} -p dist_electron/win-unpacked -e 直播点歌机.exe -i assets/icon.ico
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          # 使用拼接好的 v1.0.x 作为标题
+          name: BiliNCM Release ${{ env.TAG_VERSION }}
+          # 确保 tag_name 与推送触发的一致
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: Releases/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

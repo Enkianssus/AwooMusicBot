@@ -54,8 +54,10 @@ jobs:
           Get-ChildItem "dist_electron\win-unpacked\*.exe" | Select-Object Name
 
       - name: Pack with Velopack
-        shell: powershell
+        shell: pwsh
         run: |
+          chcp 65001 > $null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           vpk pack -u bilincm -v $env:VERSION -p dist_electron/win-unpacked -e BiliNCM.exe --packTitle "嗷呜点歌机" -i assets/icon.ico
 
       - name: Create Release

@@ -1,7 +1,7 @@
 {
   "name": "bilincm-ts",
   "private": true,
-  "version": "1.0.5",
+  "version": "1.0.4",
   "type": "module",
   "description": "B站点歌机 TypeScript 客户端",
   "author": "Enkianssus",
@@ -49,6 +49,7 @@
     },
     "win": {
       "icon": "assets/icon.ico",
+      "executableName": "BiliNCM",
       "target": [
         {
           "target": "dir"

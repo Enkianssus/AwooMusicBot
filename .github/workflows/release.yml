@@ -56,7 +56,7 @@ jobs:
       - name: Pack with Velopack
         shell: powershell
         run: |
-          vpk pack -u bilincm -v $env:VERSION -p dist_electron/win-unpacked -e BiliNCM.exe -i assets/icon.ico
+          vpk pack -u bilincm -v $env:VERSION -p dist_electron/win-unpacked -e BiliNCM.exe --packTitle "嗷呜点歌机" -i assets/icon.ico
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

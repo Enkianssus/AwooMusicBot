@@ -1306,6 +1306,45 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                 <div className="animate-slide-in-right pb-10">
                                     <h2 className="text-2xl font-bold text-white mb-6">基础设置</h2>
 
+                                    {/* ⭐ 登录账号信息卡 */}
+                                    {config.biliLogin && config.currentUser?.uid ? (
+                                        <div className="bg-white/5 p-5 rounded-xl border border-white/10 mb-6 shadow-inner flex items-center gap-5">
+                                            <img
+                                                src={config.currentUser.face ? `${config.currentUser.face}@160w_160h.webp` : `https://api.dicebear.com/7.x/identicon/svg?seed=${config.currentUser.uid}`}
+                                                referrerPolicy="no-referrer"
+                                                alt="avatar"
+                                                onError={(e) => { (e.target as HTMLImageElement).src = `https://api.dicebear.com/7.x/identicon/svg?seed=${config.currentUser.uid}`; }}
+                                                className="w-16 h-16 rounded-full border-2 border-pink-400/60 object-cover shrink-0 shadow-lg"
+                                            />
+                                            <div className="flex-1 min-w-0">
+                                                <div className="flex items-center gap-2 mb-1.5">
+                                                    <span className="text-lg font-bold text-white truncate">{config.currentUser.uname || '未知用户'}</span>
+                                                    {config.currentUser.level > 0 && (
+                                                        <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-pink-500/20 text-pink-300 border border-pink-400/30 shrink-0">Lv.{config.currentUser.level}</span>
+                                                    )}
+                                                </div>
+                                                <div className="flex flex-wrap gap-x-5 gap-y-1.5 text-xs text-gray-400">
+                                                    <span>🆔 UID: <span className="text-gray-200 font-mono select-all">{config.currentUser.uid}</span></span>
+                                                    <span>🏠 直播间: {config.currentUser.myRoomId > 0
+                                                        ? <span className="text-cyan-400 font-mono select-all">{config.currentUser.myRoomId}</span>
+                                                        : <span className="text-gray-500">未开通</span>}</span>
+                                                    <span>💖 粉丝: <span className="text-gray-200">{config.currentUser.followerCount ?? 0}</span></span>
+                                                    {config.currentUser.myRoomId > 0 && (
+                                                        <>
+                                                            <span>⛵ 大航海: <span className="text-gray-200">{config.currentUser.guardCount ?? 0}</span></span>
+                                                            <span>🛡️ 粉丝团: <span className="text-gray-200">{config.currentUser.fanClubCount ?? 0}</span></span>
+                                                        </>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div className="bg-white/5 p-4 rounded-xl border border-white/10 mb-6 text-sm text-gray-400 flex items-center gap-2">
+                                            <span>👤</span>
+                                            <span>当前未登录，请前往「扫码登录」获取账号信息。</span>
+                                        </div>
+                                    )}
+
                                     <div className="bg-white/5 p-6 rounded-xl border border-purple-500/40 space-y-5 mb-6 shadow-[0_0_15px_rgba(168,85,247,0.15)] relative overflow-hidden">
                                         <div className="absolute top-0 right-0 bg-purple-600 text-white text-xs px-3 py-1 rounded-bl-lg font-bold">新特性</div>
 

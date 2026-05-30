@@ -186,6 +186,7 @@ const CONFIG_PATH = path.join(app.getPath('userData'), 'bili_bot_config.json');
 
 let appConfig: any = {
   roomId: 0,
+  myRoomId: 0, // ⭐ 当前登录账号自己的直播间ID（未开通则为0，不写入）
   biliCookie: '',
   biliUid: 0,
   widgetStyle: null,
@@ -236,6 +237,19 @@ let isPlaying = true;
 let skipForcePlayOnce = false;
 let biliCookie = "";
 let biliUid = 0;
+
+// ⭐ 当前登录账号详情（运行时缓存，登录/启动时刷新）
+let currentUserInfo: {
+  uid: number;
+  uname: string;
+  face: string;
+  level: number;
+  myRoomId: number;      // 自己的直播间ID，未开通为 0
+  followerCount: number; // 主站粉丝数
+  guardCount: number;    // 大航海数量
+  fanClubCount: number;  // 直播粉丝团数量
+} = { uid: 0, uname: '', face: '', level: 0, myRoomId: 0, followerCount: 0, guardCount: 0, fanClubCount: 0 };
+
 let qrCodeBase64 = "";
 let qrLoginStatus = "等待获取二维码...";
 let isQrLoggingIn = false;
@@ -1017,13 +1031,107 @@ async function getBiliAvatar(uid: string): Promise<string> {
 }
 
 // ==========================================
+// ⭐ 获取当前登录账号详情（用户名 / UID / 头像 / 等级 / 自己的直播间 / 粉丝数据）
+//    对应 C# 版 UpdateUserInfoAsync，逻辑等价改写为 TS
+// ==========================================
+async function updateCurrentUserInfo(): Promise<void> {
+  if (!biliCookie) return;
+
+  const headers: any = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://www.bilibili.com/",
+    "Cookie": biliCookie
+  };
+
+  try {
+    // 1. 获取账号基础信息
+    const navRes = await fetch("https://api.bilibili.com/x/web-interface/nav", { headers });
+    const navData: any = await navRes.json();
+
+    if (navData.code !== 0) {
+      writeLog(">>> [系统] Cookies 可能已失效，请重新扫码登录。", 'Yellow');
+      return;
+    }
+
+    const d = navData.data;
+    currentUserInfo.uid = Number(d.mid) || 0;
+    currentUserInfo.uname = d.uname || '';
+    currentUserInfo.face = d.face || '';
+    currentUserInfo.level = d.level_info?.current_level ?? 0;
+
+    // 同步最新 UID
+    biliUid = currentUserInfo.uid;
+
+    // 2. 获取自己账号的直播间ID（判断是否开通）
+    currentUserInfo.myRoomId = 0;
+    try {
+      const roomRes = await fetch(`https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid=${currentUserInfo.uid}`, { headers });
+      const roomData: any = await roomRes.json();
+      if (roomData.code === 0 && Number(roomData.data?.roomid) > 0) {
+        currentUserInfo.myRoomId = Number(roomData.data.roomid);
+      }
+    } catch { /* 忽略获取直播间时的网络错误 */ }
+
+    // 3. 获取主站粉丝数
+    try {
+      const statRes = await fetch(`https://api.bilibili.com/x/relation/stat?vmid=${currentUserInfo.uid}`, { headers });
+      const statData: any = await statRes.json();
+      if (statData.code === 0 && statData.data?.follower !== undefined) {
+        currentUserInfo.followerCount = Number(statData.data.follower) || 0;
+      }
+    } catch { }
+
+    // 4. 大航海与粉丝团数量（仅开通直播间有效）
+    if (currentUserInfo.myRoomId > 0) {
+      // 大航海
+      try {
+        const guardRes = await fetch(`https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList?roomid=${currentUserInfo.myRoomId}&page=1&ruid=${currentUserInfo.uid}&page_size=1`, { headers });
+        const guardData: any = await guardRes.json();
+        if (guardData.code === 0 && guardData.data?.info?.num !== undefined) {
+          currentUserInfo.guardCount = Number(guardData.data.info.num) || 0;
+        }
+      } catch { }
+
+      // 直播粉丝团
+      try {
+        const clubRes = await fetch(`https://api.live.bilibili.com/live_user/v1/Club/get_club_info?uid=${currentUserInfo.uid}`, { headers });
+        const clubData: any = await clubRes.json();
+        // 没粉丝团时 data 可能是数组，需判断是对象
+        if (clubData.code === 0 && clubData.data && !Array.isArray(clubData.data) && clubData.data.fans_num !== undefined) {
+          currentUserInfo.fanClubCount = Number(clubData.data.fans_num) || 0;
+        }
+      } catch { }
+    }
+
+    // ⭐ 自动写入并保存账号自己的直播间ID（未开通则不写，保持为 0）
+    if (currentUserInfo.myRoomId > 0) {
+      appConfig.myRoomId = currentUserInfo.myRoomId;
+      // 若尚未设置过监控房间，自动填入自己的直播间，方便主播直接开播
+      if (!appConfig.roomId) {
+        appConfig.roomId = currentUserInfo.myRoomId;
+        writeLog(`>>> [账号] 检测到本账号直播间 ${currentUserInfo.myRoomId}，已自动设为监控房间。`, 'Cyan');
+      }
+    }
+    saveConfig();
+
+    writeLog(
+        `>>> [账号] 已刷新登录信息：${currentUserInfo.uname} (UID:${currentUserInfo.uid})` +
+        (currentUserInfo.myRoomId > 0 ? ` 直播间:${currentUserInfo.myRoomId}` : ' 未开通直播间'),
+        'Green'
+    );
+  } catch (err: any) {
+    writeLog(`[系统] 获取用户信息失败: ${err.message}`, 'Yellow');
+  }
+}
+
+// ==========================================
 // B站弹幕点歌逻辑处理
 // ==========================================
 async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top' | 'interrupt' | 'play_now' = 'normal') {
   try {
     const normalizedKeyword = keyword.replace(/\s+/g, '');
     if (normalizedKeyword === '贞理的小曲' || normalizedKeyword === '真理的小曲') {
-      keyword = 'Firefly in a Fairytale Okan Sahin';
+      keyword = 'missing you 具岛直子';
       writeLog(`[彩蛋] 触发真理的小曲，替换搜索关键词为: ${keyword}`, 'Magenta');
     }
 
@@ -1316,6 +1424,9 @@ async function startBiliQrLogin() {
             biliUid = uid;
             saveConfig();
 
+            // ⭐ 拉取账号详情：用户名/头像/等级 + 自动保存自己的直播间ID
+            await updateCurrentUserInfo();
+
             if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);
           }
 
@@ -1382,8 +1493,10 @@ function startBackendServer() {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
         roomId: appConfig.roomId,
+        myRoomId: appConfig.myRoomId || 0,
         biliLogin: !!biliCookie,
         uid: biliUid,
+        currentUser: currentUserInfo, // ⭐ 当前登录账号详情
         version: app.getVersion(),
         accepting: isAccepting,
         playing: isPlaying,
@@ -1631,6 +1744,11 @@ app.whenReady().then(() => {
 
   writeLog("🚀 点歌机启动流程...", 'DarkGray');
   startBackendServer();
+
+  // ⭐ 启动时若已登录，后台刷新一次账号信息（用户名/头像/自己的直播间等）
+  if (biliCookie) {
+    updateCurrentUserInfo();
+  }
 
   if (appConfig.roomId) {
     connectToLiveRoom(appConfig.roomId);

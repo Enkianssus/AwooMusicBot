@@ -1,11 +1,11 @@
 {
   "name": "bilincm-ts",
   "private": true,
-  "version": "1.0.4",
+  "version": "1.0.5",
   "type": "module",
   "description": "B站点歌机 TypeScript 客户端",
   "author": "Enkianssus",
-  "productName": "直播点歌机",
+  "productName": "嗷呜点歌机",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
@@ -43,7 +43,7 @@
   },
   "build": {
     "appId": "com.enkianssus.bilincmbot",
-    "productName": "直播点歌机",
+    "productName": "嗷呜点歌机",
     "directories": {
       "output": "dist_electron"
     },

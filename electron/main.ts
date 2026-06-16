@@ -1135,20 +1135,42 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
       writeLog(`[彩蛋] 触发真理的小曲，替换搜索关键词为: ${keyword}`, 'Magenta');
     }
 
-    const res = await fetch(`https://music.163.com/api/search/get/web`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Cookie': 'os=pc; appver=2.9.8;'
-      },
-      body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
-    });
+    let songs: any[] = [];
 
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    // ⭐ 新增逻辑：判断是否以小写的 id= 开头
+    if (keyword.startsWith('id=')) {
+      const songId = keyword.substring(3).trim();
+      writeLog(`[点歌] 触发精确 ID 点歌，直接拉取 ID: ${songId}`, 'Cyan');
 
-    const data: any = await res.json();
-    const songs = data.result?.songs;
+      // 注意 1：这里用的是 GET 方法和 song/detail 详情接口
+      const res = await fetch(`https://music.163.com/api/song/detail/?id=${songId}&ids=%5B${songId}%5D`, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Cookie': 'os=pc; appver=2.9.8;'
+        }
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: any = await res.json();
+      songs = data.songs || [];
+
+    } else {
+      // 注意 2：原有正常的搜索逻辑要放在 else 里面
+      const res = await fetch(`https://music.163.com/api/search/get/web`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Cookie': 'os=pc; appver=2.9.8;'
+        },
+        body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: any = await res.json();
+      songs = data.result?.songs || []; // 搜索接口的数据结构是 result.songs
+    }
 
     if (songs && songs.length > 0) {
       const s = songs[0];

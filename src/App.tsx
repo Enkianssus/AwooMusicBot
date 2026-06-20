@@ -159,7 +159,7 @@ interface OverlayWidgetProps {
 const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [data, setData] = useState<{ current: SongInfo | null; queue: SongInfo[]; status: string }>({ current: null, queue: [], status: '' });
     const [isConnected, setIsConnected] = useState<boolean>(true);
-    const [isCdpConnected, setIsCdpConnected] = useState<boolean>(true); // ⭐ 新增：挂件自身的 CDP 连接状态感知
+    const [isCdpConnected, setIsCdpConnected] = useState<boolean>(true);
     const [accepting, setAccepting] = useState<boolean>(true);
     const [playing, setPlaying] = useState<boolean>(true);
 
@@ -305,7 +305,6 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 setPlaying(json.playing ?? true);
                 setIsConnected(true);
 
-                // ⭐ 捕获最新注入状态
                 if (typeof json.cdpConnected === 'boolean') {
                     setIsCdpConnected(json.cdpConnected);
                 }
@@ -324,7 +323,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action, ...payload })
             });
-        } catch(err) { console.error("操作失败", err); } // ⭐ 修复 TS6133
+        } catch(err) { console.error("操作失败", err); }
     };
 
     const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>, type: 'current' | 'queue', index: number, item: SongInfo) => {
@@ -420,7 +419,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         try {
             await fetch('http://localhost:5555/api/state/toggle', { method: 'POST' });
             setAccepting(!accepting);
-        } catch(err) { console.error(err); } // ⭐ 修复 TS6133
+        } catch(err) { console.error(err); }
     };
 
     const togglePlaying = async (e?: React.MouseEvent) => {
@@ -429,7 +428,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         try {
             await fetch('http://localhost:5555/api/state/toggle_play', { method: 'POST' });
             setPlaying(!playing);
-        } catch(err) { console.error(err); } // ⭐ 修复 TS6133
+        } catch(err) { console.error(err); }
     };
 
     const handleWindowClose = () => {
@@ -722,7 +721,6 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                                 </>
                             ) : !isCdpConnected ? (
                                 <>
-                                    {/* ⭐ 未注入时的红色警告提示 */}
                                     <div className="absolute inset-0 bg-red-500/10 animate-[pulse_3s_infinite] pointer-events-none"></div>
                                     <div className="text-3xl mb-2 opacity-90 drop-shadow-[0_0_15px_rgba(239,68,68,0.6)] pointer-events-none z-10 animate-bounce">🔌</div>
                                     <div className="text-sm font-bold tracking-wide pointer-events-none z-10 text-red-400 drop-shadow-md">播放器未连接</div>
@@ -935,7 +933,6 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                 const json = await res.json();
 
                 setConfig((prev: any) => {
-                    // ⭐ 核心修复：即使用户停留在设置页面（避免重置输入内容），也能无缝实时提取并合并后端的 cdpConnected 最新状态！
                     if (!prev) return json;
                     return {
                         ...json,
@@ -953,7 +950,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                     return prev;
                 });
 
-            } catch { } // 修复 TS6133
+            } catch { }
         };
         fetchConfig();
         const timer = setInterval(fetchConfig, 2000);
@@ -981,9 +978,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                 body: JSON.stringify({ sysConfig: config.config })
             }).then(res => {
                 if (res.ok) showAdminToast("✅ 基础设置已自动保存！");
-            }).catch(() => {
-                // Ignore passively
-            });
+            }).catch(() => {});
         }, 800);
 
         return () => clearTimeout(timer);
@@ -1039,7 +1034,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const handleRestartNCM = async () => {
         try {
             const res = await fetch('http://localhost:5555/api/sys/restart_ncm', { method: 'POST' });
-            if(res.ok) showAdminToast("✅ 已发送注入指令，请查看运行日志！");
+            if(res.ok) showAdminToast("✅ 操作指令已发送，请查看运行日志！");
         } catch { showAdminToast("❌ 发送指令失败"); }
     };
 
@@ -1076,14 +1071,14 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         try {
             await fetch('http://localhost:5555/api/state/toggle', { method: 'POST' });
             setConfig((prev: any) => ({...prev, accepting: !prev.accepting}));
-        } catch(err) { console.error(err); } // 修复 TS6133
+        } catch(err) { console.error(err); }
     };
 
     const togglePlaying = async () => {
         try {
             await fetch('http://localhost:5555/api/state/toggle_play', { method: 'POST' });
             setConfig((prev: any) => ({...prev, playing: !prev.playing}));
-        } catch(err) { console.error(err); } // 修复 TS6133
+        } catch(err) { console.error(err); }
     };
 
     const handleDebugInsert = async () => {
@@ -1096,7 +1091,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
             });
             const json = await res.json();
             if(json.success) {
-                showAdminToast("✅ 搜索并插入成功！请前往网易云播放列表查看。");
+                showAdminToast("✅ 搜索并插入成功！请前往播放列表查看。");
             } else {
                 showAdminToast("❌ 操作失败。可能是没搜到歌曲，请查看运行日志。");
             }
@@ -1149,6 +1144,13 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const removeSuperUser = (name: string) => {
         const currentSu: string[] = config.config.SuperUsers || [];
         setConfig((prev: any) => ({...prev, config: {...prev.config, SuperUsers: currentSu.filter(n => n !== name)}}));
+    };
+
+    const handleSetPlayerType = (type: string) => {
+        setConfig((prev: any) => ({
+            ...prev,
+            config: { ...prev.config, PlayerType: type }
+        }));
     };
 
     const permTypes = [
@@ -1276,10 +1278,10 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
                             {activeTab === 'debug' && (
                                 <div className="space-y-6 animate-slide-in-right flex flex-col h-full">
-                                    <h2 className="text-2xl font-bold text-white mb-2">CDP 调试与测试</h2>
+                                    <h2 className="text-2xl font-bold text-white mb-2">调试与测试</h2>
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 shadow-inner">
-                                        <h3 className="text-sm font-bold text-purple-400 mb-4 uppercase tracking-wider">🛠️ 测试一：搜索并加入网易云下一首</h3>
+                                        <h3 className="text-sm font-bold text-purple-400 mb-4 uppercase tracking-wider">🛠️ 测试一：搜索并加入播放列表</h3>
                                         <div className="flex gap-3 mb-3">
                                             <input
                                                 type="text"
@@ -1289,15 +1291,15 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                 placeholder="输入要搜索的歌曲名称"
                                                 onKeyDown={e => e.key === 'Enter' && handleDebugInsert()}
                                             />
-                                            <button onClick={handleDebugInsert} className="px-6 py-3 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg font-bold transition-colors shadow-lg">发送到下一首</button>
+                                            <button onClick={handleDebugInsert} className="px-6 py-3 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg font-bold transition-colors shadow-lg">发送到播放器</button>
                                         </div>
-                                        <p className="text-xs text-gray-500 mb-8 leading-relaxed">此操作将调用后端的网易云接口搜索，提取歌曲ID后通过 JS `addToPlayList` 注入到网易云。你可以用它来测试底层注入是否正常工作。</p>
+                                        <p className="text-xs text-gray-500 mb-8 leading-relaxed">此操作将调用搜索接口提取歌曲ID，然后推送给网易云/Folia播放器。你可以用它来测试底层注入/API连接是否正常工作。</p>
 
-                                        <h3 className="text-sm font-bold text-blue-400 mb-4 uppercase tracking-wider">🛠️ 测试二：网易云原生切歌指令</h3>
+                                        <h3 className="text-sm font-bold text-blue-400 mb-4 uppercase tracking-wider">🛠️ 测试二：模拟切歌指令</h3>
                                         <button onClick={handleDebugPlayNext} className="w-full px-6 py-4 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg font-bold transition-colors shadow-lg flex justify-center items-center gap-2">
-                                            ⏭️ 立即触发播放下一首 (playNext)
+                                            ⏭️ 立即触发播放下一首
                                         </button>
-                                        <p className="text-xs text-gray-500 mt-3 text-center leading-relaxed">发送纯净的 `playNext` 指令给网易云，用于测试 CDP 注入环境与控制权是否有效连接。</p>
+                                        <p className="text-xs text-gray-500 mt-3 text-center leading-relaxed">向播放器发送播放下一首指令，用于测试控制权连接状态。</p>
                                     </div>
                                 </div>
                             )}
@@ -1306,7 +1308,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                 <div className="animate-slide-in-right pb-10">
                                     <h2 className="text-2xl font-bold text-white mb-6">基础设置</h2>
 
-                                    {/* ⭐ 登录账号信息卡 */}
+                                    {/* 登录账号信息卡 */}
                                     {config.biliLogin && config.currentUser?.uid ? (
                                         <div className="bg-white/5 p-5 rounded-xl border border-white/10 mb-6 shadow-inner flex items-center gap-5">
                                             <img
@@ -1345,94 +1347,102 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                         </div>
                                     )}
 
+                                    {/* 播放器注入控制区域 */}
                                     <div className="bg-white/5 p-6 rounded-xl border border-purple-500/40 space-y-5 mb-6 shadow-[0_0_15px_rgba(168,85,247,0.15)] relative overflow-hidden">
                                         <div className="absolute top-0 right-0 bg-purple-600 text-white text-xs px-3 py-1 rounded-bl-lg font-bold">新特性</div>
 
                                         <h3 className="text-sm font-bold text-purple-400 uppercase tracking-widest border-b border-white/10 pb-3">
-                                            <span>💻 播放器注入控制</span>
+                                            <span>💻 播放器设置</span>
                                         </h3>
 
                                         <div className="hidden md:grid grid-cols-12 gap-4 text-[11px] text-gray-500 font-bold uppercase tracking-wider pb-2 border-b border-white/5 mt-3">
                                             <div className="col-span-3">目标播放器</div>
                                             <div className="col-span-2">当前状态</div>
-                                            <div className="col-span-4">注入配置 (端口)</div>
+                                            <div className="col-span-4">环境配置</div>
                                             <div className="col-span-3 text-right">操作</div>
                                         </div>
 
                                         <div className="flex flex-col gap-3 mt-2">
-                                            <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border border-white/10 rounded-lg p-3 transition-colors hover:bg-white/5">
+                                            {/* 网易云原生 */}
+                                            <div className={`grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border ${config.config.PlayerType === 'NCM' ? 'border-purple-500/50 shadow-inner' : 'border-white/10'} rounded-lg p-3 transition-colors hover:bg-white/5`}>
                                                 <div className="col-span-3 flex items-center gap-3">
-                                                    <button onClick={() => setConfig({...config, config: {...config.config, EnableCDP: !config.config.EnableCDP}})} className={`w-10 h-5 rounded-full p-1 transition-colors shrink-0 ${config.config.EnableCDP ? 'bg-purple-600' : 'bg-gray-600'}`}>
-                                                        <div className={`w-3 h-3 rounded-full bg-white transition-transform ${config.config.EnableCDP ? 'translate-x-5' : 'translate-x-0'}`}></div>
+                                                    <button onClick={() => handleSetPlayerType('NCM')} className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${config.config.PlayerType === 'NCM' ? 'border-purple-500' : 'border-gray-500'}`}>
+                                                        {config.config.PlayerType === 'NCM' && <div className="w-2.5 h-2.5 bg-purple-500 rounded-full" />}
                                                     </button>
-                                                    <span className="text-sm text-white font-bold tracking-wide">网易云音乐</span>
+                                                    <span className={`text-sm font-bold tracking-wide ${config.config.PlayerType === 'NCM' ? 'text-white' : 'text-gray-400'}`}>网易云音乐</span>
                                                 </div>
                                                 <div className="col-span-2">
-                                                    <span className={`text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${config.cdpConnected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
-                                                        {config.cdpConnected ? '✅ 已注入' : '❌ 未连接'}
-                                                    </span>
+                                                    {config.config.PlayerType === 'NCM' ? (
+                                                        <span className={`text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${config.cdpConnected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
+                                                            {config.cdpConnected ? '✅ 雷达在线' : '❌ 未连接'}
+                                                        </span>
+                                                    ) : (
+                                                        <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">未启用</span>
+                                                    )}
                                                 </div>
                                                 <div className="col-span-4 flex items-center gap-2">
-                                                    <span className="text-xs text-gray-400">端口号:</span>
-                                                    <input type="number" className="w-20 bg-black/50 border border-white/10 rounded text-xs text-white p-1.5 focus:border-purple-500 outline-none text-center" value={config.config.CdpPort || 9222} onChange={e => setConfig({...config, config: {...config.config, CdpPort: parseInt(e.target.value)}})} />
+                                                    <span className={`text-xs ${config.config.PlayerType === 'NCM' ? 'text-gray-300' : 'text-gray-600'}`}>调试端口:</span>
+                                                    <input disabled={config.config.PlayerType !== 'NCM'} type="number" className="w-20 bg-black/50 border border-white/10 rounded text-xs text-white p-1.5 focus:border-purple-500 outline-none text-center disabled:opacity-50" value={config.config.CdpPort || 9222} onChange={e => setConfig({...config, config: {...config.config, CdpPort: parseInt(e.target.value)}})} />
                                                 </div>
                                                 <div className="col-span-3 flex justify-end">
-                                                    <button onClick={handleRestartNCM} className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-xs rounded-lg font-bold shadow transition-colors border border-purple-400/50">
-                                                        🔌 重新注入
+                                                    <button disabled={config.config.PlayerType !== 'NCM'} onClick={handleRestartNCM} className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-xs rounded-lg font-bold shadow transition-colors border border-purple-400/50 disabled:opacity-30 disabled:cursor-not-allowed">
+                                                        🔌 强制重载
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            {/* Folia */}
+                                            <div className={`grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border ${config.config.PlayerType === 'Folia' ? 'border-purple-500/50 shadow-inner' : 'border-white/10'} rounded-lg p-3 transition-colors hover:bg-white/5`}>
+                                                <div className="col-span-3 flex items-center gap-3">
+                                                    <button onClick={() => handleSetPlayerType('Folia')} className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${config.config.PlayerType === 'Folia' ? 'border-purple-500' : 'border-gray-500'}`}>
+                                                        {config.config.PlayerType === 'Folia' && <div className="w-2.5 h-2.5 bg-purple-500 rounded-full" />}
+                                                    </button>
+                                                    <span className={`text-sm font-bold tracking-wide flex items-center gap-1 ${config.config.PlayerType === 'Folia' ? 'text-white' : 'text-gray-400'}`}>Folia 播放器</span>
+                                                </div>
+                                                <div className="col-span-2">
+                                                    {config.config.PlayerType === 'Folia' ? (
+                                                        <span className={`text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${config.cdpConnected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
+                                                            {config.cdpConnected ? '✅ API 通畅' : '❌ 未连接'}
+                                                        </span>
+                                                    ) : (
+                                                        <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">未启用</span>
+                                                    )}
+                                                </div>
+                                                <div className="col-span-4 flex items-center gap-2">
+                                                    <span className={`text-xs ${config.config.PlayerType === 'Folia' ? 'text-pink-400' : 'text-gray-600'}`}>Stage Token:</span>
+                                                    <input
+                                                        disabled={config.config.PlayerType !== 'Folia'}
+                                                        type="text"
+                                                        className="flex-1 min-w-[80px] bg-black/50 border border-white/10 rounded-lg text-xs text-white p-1.5 outline-none focus:border-pink-500 placeholder-gray-600 disabled:opacity-50"
+                                                        placeholder="Bearer Token..."
+                                                        value={config.config.FoliaToken || ''}
+                                                        onChange={e => setConfig({...config, config: {...config.config, FoliaToken: e.target.value}})}
+                                                    />
+                                                </div>
+                                                <div className="col-span-3 flex justify-end">
+                                                    <button disabled={config.config.PlayerType !== 'Folia'} onClick={handleRestartNCM} className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-xs rounded-lg font-bold shadow transition-colors border border-purple-400/50 disabled:opacity-30 disabled:cursor-not-allowed">
+                                                        🔄 刷新连接
                                                     </button>
                                                 </div>
                                             </div>
 
                                             <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/20 border border-white/5 rounded-lg p-3 opacity-50 cursor-not-allowed grayscale">
                                                 <div className="col-span-3 flex items-center gap-3">
-                                                    <button disabled className="w-10 h-5 rounded-full p-1 bg-gray-700 shrink-0">
-                                                        <div className="w-3 h-3 rounded-full bg-gray-400"></div>
-                                                    </button>
-                                                    <span className="text-sm text-gray-400 font-bold tracking-wide">QQ 音乐</span>
+                                                    <div className="w-5 h-5 rounded-full border-2 border-gray-500 shrink-0"></div>
+                                                    <span className="text-sm text-gray-400 font-bold tracking-wide">关闭所有注入</span>
                                                 </div>
-                                                <div className="col-span-2">
-                                                    <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">
-                                                        即将支持
-                                                    </span>
-                                                </div>
-                                                <div className="col-span-4 flex items-center gap-2">
-                                                    <span className="text-xs text-gray-600">端口号:</span>
-                                                    <input disabled type="number" className="w-20 bg-black/20 border border-white/5 rounded text-xs text-gray-500 p-1.5 text-center" value={9223} />
-                                                </div>
-                                                <div className="col-span-3 flex justify-end">
-                                                    <button disabled className="px-4 py-1.5 bg-gray-700/50 text-gray-400 text-xs rounded-lg font-bold border border-gray-600/50">
-                                                        敬请期待
-                                                    </button>
-                                                </div>
-                                            </div>
-
-                                            <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/20 border border-white/5 rounded-lg p-3 opacity-50 cursor-not-allowed grayscale">
-                                                <div className="col-span-3 flex items-center gap-3">
-                                                    <button disabled className="w-10 h-5 rounded-full p-1 bg-gray-700 shrink-0">
-                                                        <div className="w-3 h-3 rounded-full bg-gray-400"></div>
-                                                    </button>
-                                                    <span className="text-sm text-gray-400 font-bold tracking-wide">酷狗音乐</span>
-                                                </div>
-                                                <div className="col-span-2">
-                                                    <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">
-                                                        即将支持
-                                                    </span>
-                                                </div>
-                                                <div className="col-span-4 flex items-center gap-2">
-                                                    <span className="text-xs text-gray-600">端口号:</span>
-                                                    <input disabled type="number" className="w-20 bg-black/20 border border-white/5 rounded text-xs text-gray-500 p-1.5 text-center" value={9224} />
-                                                </div>
-                                                <div className="col-span-3 flex justify-end">
-                                                    <button disabled className="px-4 py-1.5 bg-gray-700/50 text-gray-400 text-xs rounded-lg font-bold border border-gray-600/50">
-                                                        敬请期待
-                                                    </button>
+                                                <div className="col-span-9 flex justify-end">
+                                                    <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">纯净模式 / UI展示</span>
                                                 </div>
                                             </div>
                                         </div>
 
                                         <div className="text-xs text-gray-500 mt-2 italic flex gap-2 leading-relaxed">
                                             <span className="shrink-0">💡</span>
-                                            <span>开启对应播放器的注入后，点歌机将通过底层接口直接操控播放器，实现静默切歌、强行插入等高级功能。</span>
+                                            <span>
+                                                网易云使用 CDP 原生通信。<br/>
+                                                Folia 请在播放器设置开启 <strong>Stage Mode</strong>，将数据源设为 Stage API 并填入给出的 Bearer Token。
+                                            </span>
                                         </div>
                                     </div>
 
@@ -1468,7 +1478,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                     onChange={e => setConfig({...config, config: {...config.config, IdleWaitNext: e.target.value === 'true'}})}
                                                     className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none cursor-pointer"
                                                 >
-                                                    <option value="true">加入网易云下一首 (等当前播完)</option>
+                                                    <option value="true">加入网易云/Folia下一首 (等当前播完)</option>
                                                     <option value="false">立即强行切歌播放</option>
                                                 </select>
                                             </div>

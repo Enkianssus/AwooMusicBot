@@ -35,7 +35,7 @@ interface SysLog {
 const sysLogs: SysLog[] = [];
 let currentStatusMessage: string = '点歌就绪';
 let statusClearTimer: NodeJS.Timeout | null = null;
-let isCdpConnected: boolean = false; // ⭐ 记录 CDP 注入状态，暴露给前端
+let isCdpConnected: boolean = false;
 
 function setGlobalStatus(msg: string) {
   currentStatusMessage = msg;
@@ -46,7 +46,7 @@ function setGlobalStatus(msg: string) {
 }
 
 function writeLog(message: string, color: string = 'Gray') {
-  console.log(`[${color}] ${message}`); // 终端输出
+  console.log(`[${color}] ${message}`);
   sysLogs.push({
     Time: new Date().toLocaleTimeString(),
     Color: color,
@@ -186,11 +186,13 @@ const CONFIG_PATH = path.join(app.getPath('userData'), 'bili_bot_config.json');
 
 let appConfig: any = {
   roomId: 0,
-  myRoomId: 0, // ⭐ 当前登录账号自己的直播间ID（未开通则为0，不写入）
+  myRoomId: 0,
   biliCookie: '',
   biliUid: 0,
   widgetStyle: null,
   sysConfig: {
+    PlayerType: 'NCM', // 'NCM' | 'Folia'
+    FoliaToken: '',
     EnableCDP: true,
     CdpPort: 9222,
     Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 },
@@ -208,8 +210,10 @@ function loadConfig() {
       appConfig = { ...appConfig, ...saved };
 
       if (!appConfig.sysConfig) {
-        appConfig.sysConfig = { EnableCDP: true, CdpPort: 9222, Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], NcmExePath: "" };
+        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', EnableCDP: true, CdpPort: 9222, Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], NcmExePath: "" };
       }
+      if (!appConfig.sysConfig.PlayerType) appConfig.sysConfig.PlayerType = appConfig.sysConfig.EnableCDP === false ? 'None' : 'NCM';
+      if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
 
       if (appConfig.sysConfig.CooldownMinutes !== undefined && !appConfig.sysConfig.Cooldowns) {
         const oldSecs = appConfig.sysConfig.CooldownMinutes * 60;
@@ -238,17 +242,7 @@ let skipForcePlayOnce = false;
 let biliCookie = "";
 let biliUid = 0;
 
-// ⭐ 当前登录账号详情（运行时缓存，登录/启动时刷新）
-let currentUserInfo: {
-  uid: number;
-  uname: string;
-  face: string;
-  level: number;
-  myRoomId: number;      // 自己的直播间ID，未开通为 0
-  followerCount: number; // 主站粉丝数
-  guardCount: number;    // 大航海数量
-  fanClubCount: number;  // 直播粉丝团数量
-} = { uid: 0, uname: '', face: '', level: 0, myRoomId: 0, followerCount: 0, guardCount: 0, fanClubCount: 0 };
+let currentUserInfo: any = { uid: 0, uname: '', face: '', level: 0, myRoomId: 0, followerCount: 0, guardCount: 0, fanClubCount: 0 };
 
 let qrCodeBase64 = "";
 let qrLoginStatus = "等待获取二维码...";
@@ -266,14 +260,9 @@ async function addReject(user: any, reason: string) {
   const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
   const rejectItem = { id: Date.now() + Math.random(), user: { ...user, avatar: avatarUrl }, reason };
   recentRejects.push(rejectItem);
-
   if (recentRejects.length > 5) recentRejects.shift();
-
-  setTimeout(() => {
-    recentRejects = recentRejects.filter(r => r.id !== rejectItem.id);
-  }, 5000);
+  setTimeout(() => { recentRejects = recentRejects.filter(r => r.id !== rejectItem.id); }, 5000);
 }
-
 
 // ==========================================
 // B站原生 WebSocket 解析
@@ -309,59 +298,32 @@ async function connectToLiveRoom(shortRoomId: number): Promise<boolean> {
 
     if (JSON.stringify(danmuData).includes("-352") || danmuData.code !== 0) {
       writeLog(`>>> [拦截] 触发防拦截 Fallback，尝试使用 getConf 接口 (响应码: ${danmuData.code})...`, 'Yellow');
-      const fallbackRes = await fetch(`https://api.live.bilibili.com/room/v1/Danmu/getConf?room_id=${realRoomId}&platform=pc&player=web`, {
-        headers
-      });
+      const fallbackRes = await fetch(`https://api.live.bilibili.com/room/v1/Danmu/getConf?room_id=${realRoomId}&platform=pc&player=web`, { headers });
       danmuData = await fallbackRes.json();
     }
 
     const token = danmuData.data?.token || "";
-    if (!token) {
-      writeLog(`>>> [警告] 无法获取弹幕 Token，B站可能拒绝了连接请求。DanmuData: ${JSON.stringify(danmuData)}`, 'Yellow');
-    } else {
-      writeLog(`>>> [成功] 成功获取弹幕 Token。`, 'Green');
-    }
-
     let finalBuvid = "999E9060-EA3F-0F79-7BDC-A14879D11DCB95434infoc";
     const b3Match = biliCookie.match(/buvid3=([^;]+)/);
     if (b3Match) finalBuvid = b3Match[1];
 
-    const authObj = {
-      uid: biliUid || 0,
-      roomid: realRoomId,
-      protover: 3,
-      buvid: finalBuvid,
-      support_ack: true,
-      type: 2,
-      key: token
-    };
-
     appConfig.roomId = shortRoomId;
     saveConfig();
 
-    startBiliWebSocket(authObj);
+    startBiliWebSocket({ uid: biliUid || 0, roomid: realRoomId, protover: 3, buvid: finalBuvid, support_ack: true, type: 2, key: token });
     return true;
   } catch (err: any) {
     writeLog(`>>> [异常] 连接直播间出错: ${err.message}`, 'Red');
-    if (err.message.includes('fetch is not defined')) {
-      writeLog(`>>> [提示] Node.js 环境不支持原生 fetch，请尝试更新 Electron 版本。`, 'Red');
-    }
     return false;
   }
 }
 
 function startBiliWebSocket(authObj: any) {
-  if (currentBiliWs) {
-    try { currentBiliWs.close(); } catch {}
-  }
+  if (currentBiliWs) { try { currentBiliWs.close(); } catch {} }
   if (biliPingTimer) clearInterval(biliPingTimer);
 
-  writeLog(">>> [网络] 正在连接 B站弹幕 WebSocket 服务器...", 'DarkGray');
   const WebSocketClient = getWebSocketClient();
-  if (!WebSocketClient) {
-    writeLog(">>> [致命错误] 缺少 WebSocket 环境！请确保项目安装了 ws 模块 (终端执行: npm install ws)。", 'Red');
-    return;
-  }
+  if (!WebSocketClient) return;
 
   const isNodeWs = typeof WebSocketClient.prototype?.on === 'function';
   const wsOptions = isNodeWs ? { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } } : undefined;
@@ -375,66 +337,31 @@ function startBiliWebSocket(authObj: any) {
     const authPayload = Buffer.from(authStr, 'utf-8');
     const packet = Buffer.alloc(16 + authPayload.length);
 
-    packet.writeInt32BE(packet.length, 0);
-    packet.writeInt16BE(16, 4);
-    packet.writeInt16BE(1, 6);
-    packet.writeInt32BE(7, 8);
-    packet.writeInt32BE(1, 12);
-    authPayload.copy(packet, 16);
-
-    ws.send(packet);
+    packet.writeInt32BE(packet.length, 0); packet.writeInt16BE(16, 4); packet.writeInt16BE(1, 6); packet.writeInt32BE(7, 8); packet.writeInt32BE(1, 12);
+    authPayload.copy(packet, 16); ws.send(packet);
 
     biliPingTimer = setInterval(() => {
       if (ws.readyState === 1) {
-        const hb = Buffer.alloc(16 + 15);
-        hb.writeInt32BE(hb.length, 0);
-        hb.writeInt16BE(16, 4);
-        hb.writeInt16BE(1, 6);
-        hb.writeInt32BE(2, 8);
-        hb.writeInt32BE(1, 12);
-        Buffer.from("[object Object]", "utf-8").copy(hb, 16);
-        ws.send(hb);
+        const hb = Buffer.alloc(31);
+        hb.writeInt32BE(hb.length, 0); hb.writeInt16BE(16, 4); hb.writeInt16BE(1, 6); hb.writeInt32BE(2, 8); hb.writeInt32BE(1, 12);
+        Buffer.from("[object Object]", "utf-8").copy(hb, 16); ws.send(hb);
       }
     }, 30000);
   };
 
   const onMessage = async (data: any) => {
     let buffer: Buffer;
-    if (Buffer.isBuffer(data)) {
-      buffer = data;
-    } else if (data instanceof ArrayBuffer) {
-      buffer = Buffer.from(data);
-    } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
-      buffer = Buffer.from(await data.arrayBuffer());
-    } else {
-      buffer = Buffer.from(data);
-    }
+    if (Buffer.isBuffer(data)) buffer = data;
+    else if (data instanceof ArrayBuffer) buffer = Buffer.from(data);
+    else if (typeof Blob !== 'undefined' && data instanceof Blob) buffer = Buffer.from(await data.arrayBuffer());
+    else buffer = Buffer.from(data);
     parseBiliPacket(buffer);
   };
 
-  const onClose = () => {
-    writeLog(">>> [网络断开] 弹幕连接关闭，5秒后自动重连...", 'Yellow');
-    if (biliPingTimer) clearInterval(biliPingTimer);
-    setTimeout(() => {
-      if (currentBiliWs === ws) startBiliWebSocket(authObj);
-    }, 5000);
-  };
+  const onClose = () => { setTimeout(() => { if (currentBiliWs === ws) startBiliWebSocket(authObj); }, 5000); };
 
-  const onError = (err: any) => {
-    writeLog(`>>> [网络错误] B站弹幕服务器连接异常: ${err?.message || '未知错误'}`, 'Red');
-  };
-
-  if (typeof ws.on === 'function') {
-    ws.on('open', onOpen);
-    ws.on('message', onMessage);
-    ws.on('close', onClose);
-    ws.on('error', onError);
-  } else {
-    ws.onopen = onOpen;
-    ws.onmessage = (e: any) => onMessage(e.data);
-    ws.onclose = onClose;
-    ws.onerror = (e: any) => onError(e);
-  }
+  if (typeof ws.on === 'function') { ws.on('open', onOpen); ws.on('message', onMessage); ws.on('close', onClose); ws.on('error', () => {}); }
+  else { ws.onopen = onOpen; ws.onmessage = (e: any) => onMessage(e.data); ws.onclose = onClose; ws.onerror = () => {}; }
 }
 
 function parseBiliPacket(buffer: Buffer) {
@@ -445,33 +372,13 @@ function parseBiliPacket(buffer: Buffer) {
     const headerLen = buffer.readInt16BE(offset + 4);
     const protoVer = buffer.readInt16BE(offset + 6);
     const op = buffer.readInt32BE(offset + 8);
-
     if (packetLen < 16 || offset + packetLen > buffer.length) break;
-
     const payload = buffer.subarray(offset + headerLen, offset + packetLen);
 
     if (op === 5) {
-      if (protoVer === 3) {
-        try {
-          const decompressed = zlib.brotliDecompressSync(payload);
-          parseBiliPacket(decompressed);
-        } catch {
-          writeLog("Brotli 解压失败", "Red");
-        }
-      } else if (protoVer === 2) {
-        try {
-          const decompressed = zlib.unzipSync(payload);
-          parseBiliPacket(decompressed);
-        } catch {
-          writeLog("Zlib 解压失败", "Red");
-        }
-      } else {
-        try {
-          const msgStr = payload.toString('utf-8');
-          const msg = JSON.parse(msgStr);
-          handleRawDanmaku(msg);
-        } catch {}
-      }
+      if (protoVer === 3) { try { parseBiliPacket(zlib.brotliDecompressSync(payload)); } catch {} }
+      else if (protoVer === 2) { try { parseBiliPacket(zlib.unzipSync(payload)); } catch {} }
+      else { try { handleRawDanmaku(JSON.parse(payload.toString('utf-8'))); } catch {} }
     }
     offset += packetLen;
   }
@@ -479,147 +386,213 @@ function parseBiliPacket(buffer: Buffer) {
 
 function checkPermission(user: any, permKey: string): { allowed: boolean, reason?: string } {
   if (appConfig.sysConfig?.SuperUsers?.includes(user.uname) || appConfig.sysConfig?.SuperUsers?.includes(user.uid)) return { allowed: true };
-
-  const defaultGuardType = permKey === 'ForceControlPermission' ? -1 : 0;
-  const perm = appConfig.sysConfig?.[permKey] || { AllowManager: true, MinGuardType: defaultGuardType, MinMedalLevel: 0 };
-
+  const perm = appConfig.sysConfig?.[permKey] || { AllowManager: true, MinGuardType: permKey === 'ForceControlPermission' ? -1 : 0, MinMedalLevel: 0 };
   if (perm.MinGuardType === -1) {
     if (perm.AllowManager && user.isManager) return { allowed: true };
     return { allowed: false, reason: "仅限房管及以上操作" };
   }
-
   if (perm.AllowManager && user.isManager) return { allowed: true };
-
   if (perm.MinGuardType > 0) {
-    if (user.guardLevel === 0 || user.guardLevel > perm.MinGuardType) {
-      const guardNames = ['无', '总督', '提督', '舰长'];
-      return { allowed: false, reason: `需要 ${guardNames[perm.MinGuardType]} 及以上舰队` };
-    }
+    if (user.guardLevel === 0 || user.guardLevel > perm.MinGuardType) return { allowed: false, reason: `需要 ${['无', '总督', '提督', '舰长'][perm.MinGuardType]} 及以上舰队` };
   }
-
-  if (perm.MinMedalLevel > 0) {
-    if (user.medalLevel < perm.MinMedalLevel) {
-      return { allowed: false, reason: `需要粉丝牌 ${perm.MinMedalLevel} 级` };
-    }
-  }
-
+  if (perm.MinMedalLevel > 0 && user.medalLevel < perm.MinMedalLevel) return { allowed: false, reason: `需要粉丝牌 ${perm.MinMedalLevel} 级` };
   return { allowed: true };
 }
 
 function handleRawDanmaku(doc: any) {
   const cmd = doc.cmd || "";
   if (cmd.startsWith("DANMU_MSG")) {
-
-    if (appConfig.sysConfig?.ShowAllDanmaku) {
-      writeLog(`[RAW原始数据] ${JSON.stringify(doc)}`, 'DarkGray');
-    }
-
     const info = doc.info;
-    const msg = info[1].trim();
     const userBase = info[2];
-    const rawUid = typeof userBase[0] === 'number' ? userBase[0].toString() : String(userBase[0]).replace(/"/g, '');
-    const uname = userBase[1];
-
-    const isManager = userBase[2] === 1;
-    const medalInfo = info[3] || [];
-    const medalLevel = medalInfo.length > 0 ? medalInfo[0] : 0;
-
-    const guardLevel = info[7] ? parseInt(info[7]) : 0;
-
-    let avatarUrl = '';
-    try {
-      if (info[0][15] && info[0][15].user && info[0][15].user.base && info[0][15].user.base.face) {
-        avatarUrl = info[0][15].user.base.face;
-      }
-    } catch {}
-
-    const user = { uid: rawUid, name: uname, uname: uname, avatar: avatarUrl, isManager, medalLevel, guardLevel };
-    handleDanmaku(user, msg);
+    let avatarUrl = ''; try { if (info[0][15]?.user?.base?.face) avatarUrl = info[0][15].user.base.face; } catch {}
+    handleDanmaku({ uid: String(userBase[0]).replace(/"/g, ''), name: userBase[1], uname: userBase[1], avatar: avatarUrl, isManager: userBase[2] === 1, medalLevel: info[3]?.[0] || 0, guardLevel: info[7] ? parseInt(info[7]) : 0 }, info[1].trim());
   }
 }
 
 // ==========================================
-// 网易云音乐 - 智能进程接管与重启
+// 核心同步与业务分发逻辑
 // ==========================================
+
+// 将雷达捕捉到切歌后的本地队列维护逻辑提取为独立函数，供 NCM 和 Folia 共用
+function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string) {
+  writeLog(`[状态同步] 🎵 播放器切歌信号: ${currName} (${currId}) | 下一首预告: ${nextName}`, 'Magenta');
+  let stateChanged = false;
+
+  if (!isPlaying) {
+    if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
+      writeLog(`[状态同步] 处于暂停状态，自动跳过待播曲目以防消耗: ${targetQueue[0].SongName}`, 'Yellow');
+      if (appConfig.sysConfig?.PlayerType !== 'Folia') {
+        sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
+      }
+    } else {
+      if (currentPlayingSong) { currentPlayingSong = null; stateChanged = true; }
+    }
+  }
+  else {
+    if (currentPlayingSong && currId !== currentPlayingSong.Id) {
+      const checkSkipForce = skipForcePlayOnce;
+      skipForcePlayOnce = false;
+
+      if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
+        writeLog(`[状态同步] 自然衔接到队首: ${targetQueue[0].SongName}`, 'Green');
+        currentPlayingSong = targetQueue.shift();
+        stateChanged = true;
+      } else if (targetQueue.length > 0) {
+        if (checkSkipForce && targetQueue[0].Id === currentPlayingSong.Id) {
+          writeLog(`[状态同步] 退回操作触发: 原曲延后播放: ${targetQueue[0].SongName}`, 'DarkGray');
+          insertNextSongViaCDP(targetQueue[0].Id);
+          currentPlayingSong = null;
+          stateChanged = true;
+        } else {
+          writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
+          forcePlaySongAsync(targetQueue[0]);
+          currentPlayingSong = targetQueue.shift();
+          stateChanged = true;
+        }
+      } else {
+        writeLog(`[状态同步] 点播列表已空，放行原歌单曲目`, 'DarkGray');
+        currentPlayingSong = null;
+        stateChanged = true;
+      }
+    } else if (!currentPlayingSong && targetQueue.length > 0) {
+      if (currId === targetQueue[0].Id) {
+        currentPlayingSong = targetQueue.shift();
+        stateChanged = true;
+      } else {
+        if (appConfig.sysConfig?.IdleWaitNext === false) {
+          writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
+          forcePlaySongAsync(targetQueue[0]);
+          currentPlayingSong = targetQueue.shift();
+          stateChanged = true;
+        } else {
+          writeLog(`[状态同步] 当前空闲且未匹配，为队首曲目重注下一首: ${targetQueue[0].SongName}`, 'DarkGray');
+          insertNextSongViaCDP(targetQueue[0].Id);
+        }
+      }
+    }
+
+    if (stateChanged) setGlobalStatus(currentPlayingSong ? `[播放] ${currentPlayingSong.SongName}` : '点歌就绪');
+
+    // Folia 模式不校验 nextId，因为官方 Status API 不提供队列预告
+    if (appConfig.sysConfig?.PlayerType !== 'Folia' && isPlaying && targetQueue.length > 0 && currentPlayingSong && currId === currentPlayingSong.Id) {
+      if (String(nextId) !== String(targetQueue[0].Id)) {
+        writeLog(`[保底纠正] 网易云下一首与点歌队列不符，立刻重新插入!`, 'Yellow');
+        insertNextSongViaCDP(targetQueue[0].Id);
+      }
+    }
+  }
+}
+
+// ⭐ Folia API 纯净 HTTP 调用模块
+async function playFoliaSong(songId: string, appendToQueue: boolean): Promise<boolean> {
+  const token = appConfig.sysConfig?.FoliaToken?.trim();
+  if (!token) {
+    writeLog('⚠️ 无法控制 Folia: 未在设置中配置 Bearer Token', 'Yellow');
+    return false;
+  }
+  try {
+    const res = await fetch('http://127.0.0.1:32107/stage/play', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ songId: Number(songId), appendToQueue })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return true;
+  } catch (e: any) {
+    writeLog(`❌ Folia API 控制失败: ${e.message}`, 'Red');
+    return false;
+  }
+}
+
+let foliaPoller: NodeJS.Timeout | null = null;
+async function startFoliaRadar() {
+  if (foliaPoller) clearInterval(foliaPoller);
+  writeLog('>>> [系统] 已启动 Folia Stage API 状态轮询雷达...', 'Cyan');
+
+  // 立即验证一次连接并设定状态
+  isCdpConnected = true;
+
+  foliaPoller = setInterval(async () => {
+    if (appConfig.sysConfig?.PlayerType !== 'Folia') {
+      clearInterval(foliaPoller!);
+      return;
+    }
+
+    const token = appConfig.sysConfig?.FoliaToken?.trim();
+    if (!token) { isCdpConnected = false; return; }
+
+    try {
+      const res = await fetch('http://127.0.0.1:32107/stage/status', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+
+      if (res.ok) {
+        isCdpConnected = true;
+        const statusData = await res.json();
+
+        // 适配 Stage API /stage/status 的可能返回体
+        const currentSong = statusData.currentSong || statusData.song || statusData;
+        const currentId = currentSong ? String(currentSong.id || currentSong.songId) : null;
+
+        if (currentId && currentId !== 'undefined' && currentId !== lastTrackId) {
+          const songName = currentSong.name || currentSong.title || '未知曲目';
+          syncTrackChangeLogic(currentId, songName, null, '未知(Folia队列)');
+          lastTrackId = currentId;
+        }
+      } else {
+        isCdpConnected = false;
+      }
+    } catch {
+      isCdpConnected = false;
+    }
+  }, 1000);
+}
+
+// NCM CDP 代码注入与雷达逻辑
 async function restartNCMWithDebugPort() {
+  if (appConfig.sysConfig?.PlayerType === 'Folia') {
+    writeLog('>>> [系统] 当前模式为 Folia，无需重启应用进程，将切换为纯 HTTP API 接管...', 'Cyan');
+    isCdpConnected = false;
+    startFoliaRadar();
+    return;
+  }
+
   writeLog('>>> [系统] 正在准备重新注入网易云音乐...', 'DarkGray');
   let exePath = appConfig.sysConfig?.NcmExePath || '';
   isCdpConnected = false;
 
-  if (exePath && fs.existsSync(exePath)) {
-    writeLog('>>> [系统] 使用缓存的网易云音乐路径启动...', 'DarkGray');
-  } else {
-    exePath = '';
+  if (!exePath || !fs.existsSync(exePath)) {
     try {
       const psCmd = `powershell -NoProfile -Command "$p=(Get-Process cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1).Path; if($p){[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($p))}"`;
       const { stdout } = await execAsync(psCmd);
-      const b64 = stdout.trim();
-      if (b64) {
-        exePath = Buffer.from(b64, 'base64').toString('utf8');
-      }
+      if (stdout.trim()) exePath = Buffer.from(stdout.trim(), 'base64').toString('utf8');
     } catch {}
 
     if (!exePath || !fs.existsSync(exePath)) {
       const possiblePaths = [
         process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Netease', 'CloudMusic', 'cloudmusic.exe'),
         process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'Netease', 'CloudMusic', 'cloudmusic.exe'),
-        'C:\\Program Files (x86)\\Netease\\CloudMusic\\cloudmusic.exe',
-        'D:\\Program Files (x86)\\Netease\\CloudMusic\\cloudmusic.exe',
-        'D:\\软件\\网易云音乐\\cloudmusic.exe',
-        'E:\\Program Files (x86)\\Netease\\CloudMusic\\cloudmusic.exe'
+        'C:\\Program Files (x86)\\Netease\\CloudMusic\\cloudmusic.exe', 'D:\\Program Files (x86)\\Netease\\CloudMusic\\cloudmusic.exe', 'D:\\软件\\网易云音乐\\cloudmusic.exe'
       ].filter(Boolean) as string[];
-
-      for (const p of possiblePaths) {
-        if (fs.existsSync(p)) {
-          exePath = p;
-          break;
-        }
-      }
+      for (const p of possiblePaths) { if (fs.existsSync(p)) { exePath = p; break; } }
     }
   }
 
-  try {
-    await execAsync('taskkill /f /im cloudmusic.exe');
-    writeLog('>>> [系统] 已强制关闭当前网易云进程。', 'DarkGray');
-  } catch {}
-
+  try { await execAsync('taskkill /f /im cloudmusic.exe'); writeLog('>>> [系统] 已强制关闭当前网易云进程。', 'DarkGray'); } catch {}
   await new Promise(resolve => setTimeout(resolve, 2000));
 
   const cdpPort = appConfig.sysConfig?.CdpPort || 9222;
 
   if (exePath && fs.existsSync(exePath)) {
-    if (appConfig.sysConfig?.NcmExePath !== exePath) {
-      if (!appConfig.sysConfig) appConfig.sysConfig = {};
-      appConfig.sysConfig.NcmExePath = exePath;
-      saveConfig();
-      writeLog(`>>> [系统] 已自动缓存网易云安装路径`, 'Green');
-    }
-
-    writeLog(`>>> [系统] 成功锁定网易云执行文件: ${exePath}`, 'Cyan');
+    if (appConfig.sysConfig?.NcmExePath !== exePath) { appConfig.sysConfig.NcmExePath = exePath; saveConfig(); }
     try {
-      const cwd = path.dirname(exePath);
-      const ncmProcess = spawn(exePath, [`--remote-debugging-port=${cdpPort}`], {
-        cwd,
-        detached: true,
-        stdio: 'ignore'
-      });
+      const ncmProcess = spawn(exePath, [`--remote-debugging-port=${cdpPort}`], { cwd: path.dirname(exePath), detached: true, stdio: 'ignore' });
       ncmProcess.unref();
-
       writeLog(`>>> [系统] 🚀 已发令带调试端口 (${cdpPort}) 重新启动网易云音乐！等待其加载...`, 'Green');
-    } catch (err: any) {
-      writeLog(`❌ [错误] 启动网易云失败: ${err?.message || err}`, 'Red');
-    }
-  } else {
-    writeLog('⚠️ [提示] 找不到网易云音乐安装路径，请手动以调试模式启动！', 'Yellow');
+    } catch (err: any) { writeLog(`❌ [错误] 启动网易云失败: ${err?.message || err}`, 'Red'); }
   }
-
-  // ⭐ 大幅压缩等待启动时间，从 6秒 减为 2.5秒
   setTimeout(startCDPRadar, 2500);
 }
-
-// ==========================================
-// 核心 CDP 控制器封装 
-// ==========================================
 
 const FiberStoreExtractJs = `
   function _ensureStore() {
@@ -653,33 +626,15 @@ const FiberStoreExtractJs = `
 `;
 
 function getWebSocketClient() {
-  try {
-    return require('ws');
-  } catch {
-    if ((global as any).WebSocket) return (global as any).WebSocket;
-    return null;
-  }
+  try { return require('ws'); } catch { return (global as any).WebSocket || null; }
 }
 
 function setupWsListeners(ws: any, handlers: { onOpen?: () => void, onMessage?: (data: any) => void, onError?: (err?: any) => void, onClose?: () => void }) {
   const isNative = typeof ws.on !== 'function';
-
-  if (handlers.onOpen) {
-    if (isNative) ws.onopen = handlers.onOpen;
-    else ws.on('open', handlers.onOpen);
-  }
-  if (handlers.onMessage) {
-    if (isNative) ws.onmessage = (e: any) => handlers.onMessage!(e.data);
-    else ws.on('message', handlers.onMessage);
-  }
-  if (handlers.onError) {
-    if (isNative) ws.onerror = (e: any) => handlers.onError!(e);
-    else ws.on('error', handlers.onError);
-  }
-  if (handlers.onClose) {
-    if (isNative) ws.onclose = handlers.onClose;
-    else ws.on('close', handlers.onClose);
-  }
+  if (handlers.onOpen) { if (isNative) ws.onopen = handlers.onOpen; else ws.on('open', handlers.onOpen); }
+  if (handlers.onMessage) { if (isNative) ws.onmessage = (e: any) => handlers.onMessage!(e.data); else ws.on('message', handlers.onMessage); }
+  if (handlers.onError) { if (isNative) ws.onerror = (e: any) => handlers.onError!(e); else ws.on('error', handlers.onError); }
+  if (handlers.onClose) { if (isNative) ws.onclose = handlers.onClose; else ws.on('close', handlers.onClose); }
 }
 
 async function sendCDPCommand(script: string): Promise<boolean> {
@@ -688,80 +643,54 @@ async function sendCDPCommand(script: string): Promise<boolean> {
     const res = await fetch(`http://127.0.0.1:${cdpPort}/json`);
     if (!res.ok) return false;
     const targets: any[] = await res.json();
-
     let wsUrl = targets.find(t => t.type === 'page' && (t.url.includes('orpheus') || t.url.includes('music.163.com')))?.webSocketDebuggerUrl
         || targets.find(t => t.type === 'page')?.webSocketDebuggerUrl;
 
     if (!wsUrl) return false;
-
     return new Promise((resolve) => {
       const WebSocketClient = getWebSocketClient();
       if (!WebSocketClient) return resolve(false);
-
       const ws = new WebSocketClient(wsUrl);
       let isResolved = false;
 
       setupWsListeners(ws, {
-        onOpen: () => {
-          ws.send(JSON.stringify({
-            id: 1,
-            method: 'Runtime.evaluate',
-            params: { expression: script, returnByValue: true, awaitPromise: true }
-          }));
-        },
-        onMessage: (data: any) => {
-          const parsed = JSON.parse(typeof data === 'string' ? data : data.toString());
-          if (parsed.id === 1) {
-            isResolved = true;
-            ws.close();
-            resolve(true);
-          }
-        },
-        onError: () => {
-          if (!isResolved) resolve(false);
-        }
+        onOpen: () => { ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: script, returnByValue: true, awaitPromise: true } })); },
+        onMessage: (data: any) => { const parsed = JSON.parse(typeof data === 'string' ? data : data.toString()); if (parsed.id === 1) { isResolved = true; ws.close(); resolve(true); } },
+        onError: () => { if (!isResolved) resolve(false); }
       });
-
-      setTimeout(() => {
-        if (!isResolved) {
-          ws.close();
-          resolve(false);
-        }
-      }, 3000);
+      setTimeout(() => { if (!isResolved) { ws.close(); resolve(false); } }, 3000);
     });
   } catch { return false; }
 }
 
 async function insertNextSongViaCDP(songId: string) {
-  const script = FiberStoreExtractJs + `
-    ;if (_ensureStore()) {
-      window._reduxStore.dispatch({
-        type: 'async:action/doAction',
-        payload: { actionId: 'addToPlayList', data: { resource: { id: String(${songId}), duration: 0 }, resourceType: 'track', eventType: 'click' } }
-      });
-    }
-  `;
+  if (appConfig.sysConfig?.PlayerType === 'Folia') {
+    await playFoliaSong(songId, true);
+    return;
+  }
+  const script = FiberStoreExtractJs + `;if (_ensureStore()) { window._reduxStore.dispatch({ type: 'async:action/doAction', payload: { actionId: 'addToPlayList', data: { resource: { id: String(${songId}), duration: 0 }, resourceType: 'track', eventType: 'click' } } }); }`;
   await sendCDPCommand(script);
 }
 
 async function forcePlaySongAsync(songInfo: any) {
   currentPlayingSong = songInfo;
-  lastTrackId = songInfo.Id;
-  const script = FiberStoreExtractJs + `
-    ;if (_ensureStore()) {
-      window._reduxStore.dispatch({
-        type: 'async:action/doAction',
-        payload: { actionId: 'play', data: { resource: { id: String(${songInfo.Id}) }, resourceType: 'track', eventType: 'dblclick' } }
-      });
+  lastTrackId = String(songInfo.Id);
+
+  if (appConfig.sysConfig?.PlayerType === 'Folia') {
+    await playFoliaSong(songInfo.Id, false);
+    if (isPlaying && targetQueue.length > 0) {
+      setTimeout(() => insertNextSongViaCDP(targetQueue[0].Id), 1500);
     }
-  `;
-  await sendCDPCommand(script);
-  if (isPlaying && targetQueue.length > 0) {
-    setTimeout(() => insertNextSongViaCDP(targetQueue[0].Id), 1500);
+    return;
   }
+
+  const script = FiberStoreExtractJs + `;if (_ensureStore()) { window._reduxStore.dispatch({ type: 'async:action/doAction', payload: { actionId: 'play', data: { resource: { id: String(${songInfo.Id}) }, resourceType: 'track', eventType: 'dblclick' } } }); }`;
+  await sendCDPCommand(script);
+  if (isPlaying && targetQueue.length > 0) setTimeout(() => insertNextSongViaCDP(targetQueue[0].Id), 1500);
 }
 
 async function startCDPRadar() {
+  if (appConfig.sysConfig?.PlayerType === 'Folia') return; // 如果已切到 Folia 放弃 CDP 雷达
   try {
     const cdpPort = appConfig.sysConfig?.CdpPort || 9222;
     const res = await fetch(`http://127.0.0.1:${cdpPort}/json`);
@@ -770,9 +699,9 @@ async function startCDPRadar() {
         || targets.find(t => t.type === 'page')?.webSocketDebuggerUrl;
 
     if (!wsUrl) {
-      writeLog('⏳ [挖树] 未找到网易云前端页面，1.5秒后重试...', 'DarkGray');
+      writeLog(`⏳ [雷达] 未找到网易云前端页面，1.5秒后重试 (端口: ${cdpPort})...`, 'DarkGray');
       isCdpConnected = false;
-      setTimeout(startCDPRadar, 1500); // ⭐ 加快重试间隔
+      setTimeout(startCDPRadar, 1500);
       return;
     }
 
@@ -781,9 +710,7 @@ async function startCDPRadar() {
     const ws = new WebSocketClient(wsUrl);
 
     let cmdId = 1;
-    const send = (method: string, params: any) => {
-      if (ws.readyState === 1) ws.send(JSON.stringify({ id: cmdId++, method, params }));
-    };
+    const send = (method: string, params: any) => { if (ws.readyState === 1) ws.send(JSON.stringify({ id: cmdId++, method, params })); };
 
     setupWsListeners(ws, {
       onOpen: () => {
@@ -791,202 +718,72 @@ async function startCDPRadar() {
         send('Runtime.enable', {});
         send('Runtime.addBinding', { name: '__ncmRadarCallback' });
 
-        const radarScript = FiberStoreExtractJs + `
+        const ncmScript = FiberStoreExtractJs + `
           ;(function initRadar() {
-              if (typeof window.__ncmRadarCallback !== 'function') {
-                  setTimeout(initRadar, 500);
-                  return;
-              }
-
+              if (typeof window.__ncmRadarCallback !== 'function') { setTimeout(initRadar, 500); return; }
               window.__debug_store_log = []; 
               if (!_ensureStore()) { 
-                  try {
-                      window.__ncmRadarCallback(JSON.stringify({ 
-                          event: 'RADAR_INIT_RETRYING', 
-                          reason: 'not_ready',
-                          debugLog: window.__debug_store_log.join(' | ') 
-                      }));
-                  } catch {}
-                  setTimeout(initRadar, 1500); 
-                  return; 
+                  try { window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_INIT_RETRYING', reason: 'not_ready', debugLog: window.__debug_store_log.join(' | ') })); } catch {}
+                  setTimeout(initRadar, 1500); return; 
               }
-              
-              const deployVersion = Date.now();
-              
-              if (window.__radarDeployed && window.__radarSubscribeAlive) {
-                  window.__ncmRadarCallback(JSON.stringify({ 
-                      event: 'RADAR_ALREADY_DEPLOYED',
-                      debugLog: window.__debug_store_log.join(' | ')
-                  }));
-                  return;
-              }
-              
+              if (window.__radarDeployed) { window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_ALREADY_DEPLOYED' })); return; }
               window.__radarDeployed = true;
-              window.__radarSubscribeAlive = true;
 
               const extractSongInfo = (id, list) => {
                   if (!id) return null;
                   const song = list.find(item => String(item.id) === String(id));
                   if (!song) return null;
-                  return {
-                      id: String(song.id),
-                      name: song.track?.name || '未知歌曲',
-                      artist: song.track?.artists?.map(a => a.name).join('/') || '未知歌手',
-                      duration: song.track?.duration || 0
-                  };
+                  return { id: String(song.id), name: song.track?.name || '未知', artist: song.track?.artists?.map(a => a.name).join('/') || '未知', duration: song.track?.duration || 0 };
               };
 
               let state = window._reduxStore.getState();
-              let lastTrackId = state.playing?.resourceTrackId || state.playing?.onlineResourceId;
+              let localLastId = state.playing?.resourceTrackId || state.playing?.onlineResourceId;
 
-              window.__ncmRadarCallback(JSON.stringify({ 
-                  event: 'RADAR_INIT_OK', 
-                  currentId: lastTrackId ? String(lastTrackId) : null,
-                  debugLog: window.__debug_store_log.join(' | ') 
-              }));
+              window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_INIT_OK', currentId: localLastId ? String(localLastId) : null }));
 
               window._reduxStore.subscribe(() => {
                   try {
                       state = window._reduxStore.getState();
                       const currentTrackId = state.playing?.resourceTrackId || state.playing?.onlineResourceId;
                       const curList = state.playingList?.curPlayingList || [];
-
-                      if (currentTrackId && currentTrackId !== lastTrackId) {
-                          const prevSong = extractSongInfo(lastTrackId, curList);
+                      if (currentTrackId && currentTrackId !== localLastId) {
+                          const prevSong = extractSongInfo(localLastId, curList);
                           const currentIndex = curList.findIndex(item => String(item.id) === String(currentTrackId));
-                          let currSong = null;
-                          let nextSong = null;
-
+                          let currSong = null; let nextSong = null;
                           if (currentIndex !== -1) {
                               currSong = extractSongInfo(currentTrackId, curList);
-                              if (currentIndex + 1 < curList.length) {
-                                  nextSong = extractSongInfo(curList[currentIndex + 1].id, curList);
-                              }
-                          } else {
-                              currSong = { id: String(currentTrackId), name: '(列表外)', artist: '', duration: 0 };
-                          }
+                              if (currentIndex + 1 < curList.length) nextSong = extractSongInfo(curList[currentIndex + 1].id, curList);
+                          } else { currSong = { id: String(currentTrackId), name: '(列表外)', artist: '', duration: 0 }; }
 
-                          const payload = {
-                              event: 'TRACK_CHANGED',
-                              timestamp: Date.now(),
-                              previous: prevSong,
-                              current: currSong,
-                              next: nextSong
-                          };
-
-                          try {
-                              window.__ncmRadarCallback(JSON.stringify(payload));
-                          } catch {}
-                          lastTrackId = currentTrackId;
+                          window.__ncmRadarCallback(JSON.stringify({ event: 'TRACK_CHANGED', timestamp: Date.now(), previous: prevSong, current: currSong, next: nextSong }));
+                          localLastId = currentTrackId;
                       }
                   } catch { }
               });
           })();
         `;
-        send('Runtime.evaluate', { expression: radarScript, returnByValue: true });
+        send('Runtime.evaluate', { expression: ncmScript, returnByValue: true });
       },
       onMessage: (data: any) => {
         const msg = JSON.parse(typeof data === 'string' ? data : data.toString());
-
-        if (msg.error) {
-          writeLog(`❌ [CDP 调用失败]: ${JSON.stringify(msg.error)}`, 'Red');
-        }
-        if (msg.result && msg.result.exceptionDetails) {
-          const ex = msg.result.exceptionDetails;
-          writeLog(`❌ [CDP 脚本报错]: ${ex.exception?.description || ex.text}`, 'Red');
-        }
+        if (msg.error) writeLog(`❌ [CDP 调用失败]: ${JSON.stringify(msg.error)}`, 'Red');
+        if (msg.result && msg.result.exceptionDetails) writeLog(`❌ [CDP 脚本报错]: ${msg.result.exceptionDetails.exception?.description || msg.result.exceptionDetails.text}`, 'Red');
 
         if (msg.method === 'Runtime.bindingCalled' && msg.params.name === '__ncmRadarCallback') {
           const payload = JSON.parse(msg.params.payload);
 
-          if (payload.event === 'RADAR_INIT_RETRYING') {
-            writeLog(`⏳ [挖树] 等待网易云 React 树加载... (${payload.debugLog})`, 'DarkGray');
-          }
+          if (payload.event === 'RADAR_INIT_RETRYING') writeLog(`⏳ [挖树] 等待网易云 React 树加载...`, 'DarkGray');
           else if (payload.event === 'RADAR_INIT_OK') {
-            writeLog(`✅ CDP 常驻雷达注入成功! (${payload.debugLog})`, 'Green');
+            writeLog(`✅ CDP 常驻雷达注入成功!`, 'Green');
             setGlobalStatus('点歌就绪');
             isCdpConnected = true;
           }
-          else if (payload.event === 'RADAR_ALREADY_DEPLOYED') {
-            writeLog('✅ CDP 雷达已存在，无需重复注入', 'Green');
-            isCdpConnected = true;
-          }
+          else if (payload.event === 'RADAR_ALREADY_DEPLOYED') isCdpConnected = true;
           else if (payload.event === 'TRACK_CHANGED') {
             const currId = payload.current?.id;
-            const currName = payload.current?.name;
-            const nextId = payload.next?.id;
-            const nextName = payload.next?.name || '无';
-
             if (currId && currId !== lastTrackId) {
-              writeLog(`[雷达] 🎵 网易云切歌信号: ${currName} (${currId}) | 下一首预告: ${nextName}`, 'Magenta');
+              syncTrackChangeLogic(currId, payload.current?.name, payload.next?.id, payload.next?.name || '无');
               lastTrackId = currId;
-              let stateChanged = false;
-
-              if (!isPlaying) {
-                if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
-                  writeLog(`[状态同步] 处于暂停状态，自动跳过待播曲目以防消耗: ${targetQueue[0].SongName}`, 'Yellow');
-                  sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
-                } else {
-                  if (currentPlayingSong) {
-                    currentPlayingSong = null;
-                    stateChanged = true;
-                  }
-                }
-              }
-              else {
-                if (currentPlayingSong && currId !== currentPlayingSong.Id) {
-                  const checkSkipForce = skipForcePlayOnce;
-                  skipForcePlayOnce = false;
-
-                  if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
-                    writeLog(`[状态同步] 自然衔接到队首: ${targetQueue[0].SongName}`, 'Green');
-                    currentPlayingSong = targetQueue.shift();
-                    stateChanged = true;
-                  } else if (targetQueue.length > 0) {
-                    if (checkSkipForce && targetQueue[0].Id === currentPlayingSong.Id) {
-                      writeLog(`[状态同步] 退回操作触发: 队列仅有此歌，放行网易云原生曲，原曲延后播放: ${targetQueue[0].SongName}`, 'DarkGray');
-                      insertNextSongViaCDP(targetQueue[0].Id);
-                      currentPlayingSong = null;
-                      stateChanged = true;
-                    } else {
-                      writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
-                      forcePlaySongAsync(targetQueue[0]);
-                      currentPlayingSong = targetQueue.shift();
-                      stateChanged = true;
-                    }
-                  } else {
-                    writeLog(`[状态同步] 点播列表已空，放行原歌单曲目`, 'DarkGray');
-                    currentPlayingSong = null;
-                    stateChanged = true;
-                  }
-                } else if (!currentPlayingSong && targetQueue.length > 0) {
-                  if (currId === targetQueue[0].Id) {
-                    currentPlayingSong = targetQueue.shift();
-                    stateChanged = true;
-                  } else {
-                    if (appConfig.sysConfig?.IdleWaitNext === false) {
-                      writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
-                      forcePlaySongAsync(targetQueue[0]);
-                      currentPlayingSong = targetQueue.shift();
-                      stateChanged = true;
-                    } else {
-                      writeLog(`[状态同步] 当前空闲且未匹配，为队首曲目重注下一首: ${targetQueue[0].SongName}`, 'DarkGray');
-                      insertNextSongViaCDP(targetQueue[0].Id);
-                    }
-                  }
-                }
-
-                if (stateChanged) {
-                  setGlobalStatus(currentPlayingSong ? `[播放] ${currentPlayingSong.SongName}` : '点歌就绪');
-                }
-
-                if (isPlaying && targetQueue.length > 0 && currentPlayingSong && currId === currentPlayingSong.Id) {
-                  if (String(nextId) !== String(targetQueue[0].Id)) {
-                    writeLog(`[保底纠正] 网易云下一首(${nextName})与点歌队列(${targetQueue[0].SongName})不符，立刻重新插入!`, 'Yellow');
-                    insertNextSongViaCDP(targetQueue[0].Id);
-                  }
-                }
-              }
             }
           }
         }
@@ -995,133 +792,69 @@ async function startCDPRadar() {
         writeLog('⚠️ [雷达] CDP 连接断开，1.5秒后准备重连...', 'Yellow');
         setGlobalStatus('等待后端');
         isCdpConnected = false;
-        setTimeout(startCDPRadar, 1500); // ⭐ 加快重连间隔
+        setTimeout(startCDPRadar, 1500);
       },
-      onError: (err: any) => {
-        writeLog(`❌ [雷达] CDP WebSocket 出错: ${err?.message}`, 'Red');
-        isCdpConnected = false;
-      }
+      onError: (err: any) => { writeLog(`❌ [雷达] CDP WebSocket 出错: ${err?.message}`, 'Red'); isCdpConnected = false; }
     });
   } catch (err: any) {
     writeLog(`⏳ [雷达] 等待网易云调试端口就绪... (${err.message})`, 'DarkGray');
     isCdpConnected = false;
-    setTimeout(startCDPRadar, 1500); // ⭐ 加快重连间隔
+    setTimeout(startCDPRadar, 1500);
   }
 }
 
 // ==========================================
-// 核心功能：获取真正的 Bilibili 头像
+// 辅助功能：获取真正的 Bilibili 头像 和 用户信息
 // ==========================================
 async function getBiliAvatar(uid: string): Promise<string> {
   try {
-    const res = await fetch(`https://api.bilibili.com/x/web-interface/card?mid=${uid}`, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Referer": "https://www.bilibili.com/"
-      }
-    });
+    const res = await fetch(`https://api.bilibili.com/x/web-interface/card?mid=${uid}`, { headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" } });
     const data: any = await res.json();
-    if (data.code === 0 && data.data?.card?.face) {
-      return data.data.card.face;
-    }
-  } catch {
-    writeLog(`[警告] 获取用户 ${uid} 头像失败`, 'Yellow');
-  }
+    if (data.code === 0 && data.data?.card?.face) return data.data.card.face;
+  } catch {}
   return `https://api.dicebear.com/7.x/identicon/svg?seed=${uid}`;
 }
 
-// ==========================================
-// ⭐ 获取当前登录账号详情（用户名 / UID / 头像 / 等级 / 自己的直播间 / 粉丝数据）
-//    对应 C# 版 UpdateUserInfoAsync，逻辑等价改写为 TS
-// ==========================================
 async function updateCurrentUserInfo(): Promise<void> {
   if (!biliCookie) return;
-
-  const headers: any = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://www.bilibili.com/",
-    "Cookie": biliCookie
-  };
-
+  const headers: any = { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/", "Cookie": biliCookie };
   try {
-    // 1. 获取账号基础信息
     const navRes = await fetch("https://api.bilibili.com/x/web-interface/nav", { headers });
     const navData: any = await navRes.json();
-
-    if (navData.code !== 0) {
-      writeLog(">>> [系统] Cookies 可能已失效，请重新扫码登录。", 'Yellow');
-      return;
-    }
+    if (navData.code !== 0) return;
 
     const d = navData.data;
-    currentUserInfo.uid = Number(d.mid) || 0;
-    currentUserInfo.uname = d.uname || '';
-    currentUserInfo.face = d.face || '';
-    currentUserInfo.level = d.level_info?.current_level ?? 0;
-
-    // 同步最新 UID
+    currentUserInfo.uid = Number(d.mid) || 0; currentUserInfo.uname = d.uname || ''; currentUserInfo.face = d.face || ''; currentUserInfo.level = d.level_info?.current_level ?? 0;
     biliUid = currentUserInfo.uid;
-
-    // 2. 获取自己账号的直播间ID（判断是否开通）
     currentUserInfo.myRoomId = 0;
     try {
       const roomRes = await fetch(`https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid=${currentUserInfo.uid}`, { headers });
       const roomData: any = await roomRes.json();
-      if (roomData.code === 0 && Number(roomData.data?.roomid) > 0) {
-        currentUserInfo.myRoomId = Number(roomData.data.roomid);
-      }
-    } catch { /* 忽略获取直播间时的网络错误 */ }
-
-    // 3. 获取主站粉丝数
+      if (roomData.code === 0 && Number(roomData.data?.roomid) > 0) currentUserInfo.myRoomId = Number(roomData.data.roomid);
+    } catch {}
     try {
       const statRes = await fetch(`https://api.bilibili.com/x/relation/stat?vmid=${currentUserInfo.uid}`, { headers });
       const statData: any = await statRes.json();
-      if (statData.code === 0 && statData.data?.follower !== undefined) {
-        currentUserInfo.followerCount = Number(statData.data.follower) || 0;
-      }
-    } catch { }
+      if (statData.code === 0 && statData.data?.follower !== undefined) currentUserInfo.followerCount = Number(statData.data.follower) || 0;
+    } catch {}
 
-    // 4. 大航海与粉丝团数量（仅开通直播间有效）
     if (currentUserInfo.myRoomId > 0) {
-      // 大航海
       try {
         const guardRes = await fetch(`https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList?roomid=${currentUserInfo.myRoomId}&page=1&ruid=${currentUserInfo.uid}&page_size=1`, { headers });
         const guardData: any = await guardRes.json();
-        if (guardData.code === 0 && guardData.data?.info?.num !== undefined) {
-          currentUserInfo.guardCount = Number(guardData.data.info.num) || 0;
-        }
-      } catch { }
-
-      // 直播粉丝团
+        if (guardData.code === 0 && guardData.data?.info?.num !== undefined) currentUserInfo.guardCount = Number(guardData.data.info.num) || 0;
+      } catch {}
       try {
         const clubRes = await fetch(`https://api.live.bilibili.com/live_user/v1/Club/get_club_info?uid=${currentUserInfo.uid}`, { headers });
         const clubData: any = await clubRes.json();
-        // 没粉丝团时 data 可能是数组，需判断是对象
-        if (clubData.code === 0 && clubData.data && !Array.isArray(clubData.data) && clubData.data.fans_num !== undefined) {
-          currentUserInfo.fanClubCount = Number(clubData.data.fans_num) || 0;
-        }
-      } catch { }
-    }
+        if (clubData.code === 0 && clubData.data && !Array.isArray(clubData.data) && clubData.data.fans_num !== undefined) currentUserInfo.fanClubCount = Number(clubData.data.fans_num) || 0;
+      } catch {}
 
-    // ⭐ 自动写入并保存账号自己的直播间ID（未开通则不写，保持为 0）
-    if (currentUserInfo.myRoomId > 0) {
       appConfig.myRoomId = currentUserInfo.myRoomId;
-      // 若尚未设置过监控房间，自动填入自己的直播间，方便主播直接开播
-      if (!appConfig.roomId) {
-        appConfig.roomId = currentUserInfo.myRoomId;
-        writeLog(`>>> [账号] 检测到本账号直播间 ${currentUserInfo.myRoomId}，已自动设为监控房间。`, 'Cyan');
-      }
+      if (!appConfig.roomId) { appConfig.roomId = currentUserInfo.myRoomId; writeLog(`>>> [账号] 已自动设为监控房间: ${currentUserInfo.myRoomId}`, 'Cyan'); }
     }
     saveConfig();
-
-    writeLog(
-        `>>> [账号] 已刷新登录信息：${currentUserInfo.uname} (UID:${currentUserInfo.uid})` +
-        (currentUserInfo.myRoomId > 0 ? ` 直播间:${currentUserInfo.myRoomId}` : ' 未开通直播间'),
-        'Green'
-    );
-  } catch (err: any) {
-    writeLog(`[系统] 获取用户信息失败: ${err.message}`, 'Yellow');
-  }
+  } catch (err: any) { writeLog(`[系统] 获取用户信息失败: ${err.message}`, 'Yellow'); }
 }
 
 // ==========================================
@@ -1130,119 +863,79 @@ async function updateCurrentUserInfo(): Promise<void> {
 async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top' | 'interrupt' | 'play_now' = 'normal') {
   try {
     const normalizedKeyword = keyword.replace(/\s+/g, '');
-    if (normalizedKeyword === '贞理的小曲' || normalizedKeyword === '真理的小曲') {
-      keyword = 'missing you 具岛直子';
-      writeLog(`[彩蛋] 触发真理的小曲，替换搜索关键词为: ${keyword}`, 'Magenta');
-    }
+    if (normalizedKeyword === '贞理的小曲' || normalizedKeyword === '真理的小曲') keyword = 'missing you 具岛直子';
 
     let songs: any[] = [];
 
-    // ⭐ 新增逻辑：判断是否以小写的 id= 开头
-    if (keyword.startsWith('id=')) {
-      const songId = keyword.substring(3).trim();
-      writeLog(`[点歌] 触发精确 ID 点歌，直接拉取 ID: ${songId}`, 'Cyan');
+    // ⭐ Folia 的纯净 Stage HTTP API 搜索模式
+    if (appConfig.sysConfig?.PlayerType === 'Folia') {
+      const token = appConfig.sysConfig?.FoliaToken?.trim();
+      const searchPayload = { query: keyword, limit: 1 };
 
-      // 注意 1：这里用的是 GET 方法和 song/detail 详情接口
-      const res = await fetch(`https://music.163.com/api/song/detail/?id=${songId}&ids=%5B${songId}%5D`, {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Cookie': 'os=pc; appver=2.9.8;'
-        }
-      });
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: any = await res.json();
-      songs = data.songs || [];
-
-    } else {
-      // 注意 2：原有正常的搜索逻辑要放在 else 里面
-      const res = await fetch(`https://music.163.com/api/search/get/web`, {
+      const res = await fetch(`http://127.0.0.1:32107/stage/search`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Cookie': 'os=pc; appver=2.9.8;'
-        },
-        body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(searchPayload)
       });
-
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: any = await res.json();
-      songs = data.result?.songs || []; // 搜索接口的数据结构是 result.songs
+      const foliaSongs = data.songs || [];
+      if (foliaSongs.length > 0) {
+        const fsong = foliaSongs[0];
+        songs = [{
+          id: fsong.songId,
+          name: fsong.title || fsong.name || keyword,
+          artists: fsong.artists || [{name: fsong.artist || '未知歌手'}]
+        }];
+      }
+    }
+    // 网易云搜索模式
+    else {
+      if (keyword.startsWith('id=')) {
+        const songId = keyword.substring(3).trim();
+        const res = await fetch(`https://music.163.com/api/song/detail/?id=${songId}&ids=%5B${songId}%5D`, { method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data: any = await res.json();
+        songs = data.songs || [];
+      } else {
+        const res = await fetch(`https://music.163.com/api/search/get/web`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' }, body: `s=${encodeURIComponent(keyword)}&type=1&limit=1` });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data: any = await res.json();
+        songs = data.result?.songs || [];
+      }
     }
 
     if (songs && songs.length > 0) {
       const s = songs[0];
-
       const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
-
-      const newSong = {
-        Id: String(s.id),
-        SongName: s.name,
-        ArtistName: s.artists?.map((a: any) => a.name).join('/') || s.ar?.map((a: any) => a.name).join('/') || '未知歌手',
-        OrderedBy: user.name || user.uname,
-        OrderedByUid: user.uid,
-        OrderedByAvatar: avatarUrl,
-        GuardLevel: user.guardLevel
-      };
+      const newSong = { Id: String(s.id), SongName: s.name, ArtistName: s.artists?.map((a: any) => a.name).join('/') || s.ar?.map((a: any) => a.name).join('/') || '未知歌手', OrderedBy: user.name || user.uname, OrderedByUid: user.uid, OrderedByAvatar: avatarUrl, GuardLevel: user.guardLevel };
 
       if (mode === 'interrupt') {
-        if (currentPlayingSong) {
-          targetQueue.unshift(currentPlayingSong);
-          writeLog(`[状态同步] 原歌曲被插队退回: ${currentPlayingSong.SongName}`, 'DarkGray');
-        }
-        setGlobalStatus(`⚡ 插队: ${newSong.SongName}`);
-        writeLog(`[点歌] ${user.uname} 强行插队播放了: ${newSong.SongName}`, 'Green');
-        forcePlaySongAsync(newSong);
+        if (currentPlayingSong) targetQueue.unshift(currentPlayingSong);
+        setGlobalStatus(`⚡ 插队: ${newSong.SongName}`); forcePlaySongAsync(newSong);
       }
-      else if (mode === 'play_now') {
-        setGlobalStatus(`▶️ 立即: ${newSong.SongName}`);
-        writeLog(`[点歌] ${user.uname} 强行立即播放了: ${newSong.SongName}`, 'Green');
-        forcePlaySongAsync(newSong);
-      }
+      else if (mode === 'play_now') { setGlobalStatus(`▶️ 立即: ${newSong.SongName}`); forcePlaySongAsync(newSong); }
       else if (mode === 'top') {
-        targetQueue.unshift(newSong);
-        writeLog(`[点歌] 置顶成功: ${newSong.SongName} (by ${newSong.OrderedBy})`, 'Green');
-        setGlobalStatus(`⬆️ 置顶: ${newSong.SongName}`);
-
+        targetQueue.unshift(newSong); setGlobalStatus(`⬆️ 置顶: ${newSong.SongName}`);
         if (targetQueue.length === 1 && !currentPlayingSong && isPlaying) {
-          if (appConfig.sysConfig?.IdleWaitNext === false) {
-            forcePlaySongAsync(targetQueue.shift());
-          } else {
-            await insertNextSongViaCDP(newSong.Id);
-          }
+          if (appConfig.sysConfig?.IdleWaitNext === false) forcePlaySongAsync(targetQueue.shift());
+          else await insertNextSongViaCDP(newSong.Id);
         }
-      }
-      else {
-        targetQueue.push(newSong);
-        writeLog(`[点歌] 入队成功: ${newSong.SongName} (by ${newSong.OrderedBy})`, 'Green');
-        setGlobalStatus(`✅ 点歌: ${newSong.SongName}`);
-
+      } else {
+        targetQueue.push(newSong); setGlobalStatus(`✅ 点歌: ${newSong.SongName}`);
         if (targetQueue.length === 1 && !currentPlayingSong && isPlaying) {
-          if (appConfig.sysConfig?.IdleWaitNext === false) {
-            forcePlaySongAsync(targetQueue.shift());
-          } else {
-            await insertNextSongViaCDP(newSong.Id);
-          }
+          if (appConfig.sysConfig?.IdleWaitNext === false) forcePlaySongAsync(targetQueue.shift());
+          else await insertNextSongViaCDP(newSong.Id);
         }
       }
     } else {
-      setGlobalStatus(`❌ 未搜到: ${keyword}`);
-      writeLog(`[点歌] 搜索失败: 未找到歌曲 "${keyword}"`, 'Yellow');
-      addReject(user, `未搜到歌曲: ${keyword}`);
+      setGlobalStatus(`❌ 未搜到: ${keyword}`); addReject(user, `未搜到歌曲: ${keyword}`);
     }
-  } catch {
-    writeLog('点歌搜索网络异常', 'Red');
-    setGlobalStatus('❌ 搜索网络异常');
-    addReject(user, '搜索网络异常');
-  }
+  } catch { setGlobalStatus('❌ 搜索网络异常'); addReject(user, '搜索网络异常'); }
 }
 
 function handleDanmaku(user: any, msg: string) {
-  if (msg.toLowerCase().includes('test') || msg.includes('测试')) {
-    writeLog(`[弹幕] 收到了来自 ${user.uname} 的测试通信! 内容: ${msg}`, 'Cyan');
-  }
+  if (msg.toLowerCase().includes('test') || msg.includes('测试')) writeLog(`[弹幕] 测试通信: ${msg}`, 'Cyan');
 
   const isOrder = msg.startsWith('点歌') || msg.startsWith('點歌');
   const isTopOrder = msg.startsWith('置顶点歌') || msg.startsWith('优先点歌');
@@ -1255,80 +948,46 @@ function handleDanmaku(user: any, msg: string) {
 
   if (isCancel) {
     const keyword = msg.replace(/^撤回/, '').trim();
-
     if (keyword) {
       const perm = checkPermission(user, 'ForceControlPermission');
-      if (!perm.allowed) {
-        setGlobalStatus(`⚠️ 拦截: 无特定撤回权限`);
-        writeLog(`[权限拦截] ${user.uname} 撤回指定歌曲被拒: 需要强控权限`, 'Yellow');
-        addReject(user, "权限不足: 需要强控权限");
-        return;
-      }
+      if (!perm.allowed) { addReject(user, "权限不足: 需要强控权限"); return; }
       const idx = targetQueue.findIndex(s => s.SongName.includes(keyword) || s.ArtistName.includes(keyword));
-      if (idx !== -1) {
-        const removed = targetQueue.splice(idx, 1)[0];
-        setGlobalStatus(`🗑️ 强行撤回: ${removed.SongName}`);
-        writeLog(`[点歌] ${user.uname} 强行撤回了歌曲: ${removed.SongName}`, 'Green');
-      } else {
-        setGlobalStatus(`❌ 撤回失败: 队列未找到`);
-        addReject(user, "撤回失败: 未在队列中找到");
-      }
+      if (idx !== -1) { const removed = targetQueue.splice(idx, 1)[0]; setGlobalStatus(`🗑️ 强行撤回: ${removed.SongName}`); }
+      else addReject(user, "撤回失败: 未在队列中找到");
     } else {
       const perm = checkPermission(user, 'CancelPermission');
-      if (!perm.allowed) {
-        setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
-        writeLog(`[权限拦截] ${user.uname} 撤回被拒: ${perm.reason}`, 'Yellow');
-        addReject(user, perm.reason!);
-        return;
-      }
+      if (!perm.allowed) { addReject(user, perm.reason!); return; }
       let foundIdx = -1;
-      for (let i = targetQueue.length - 1; i >= 0; i--) {
-        if (targetQueue[i].OrderedByUid === user.uid) {
-          foundIdx = i;
-          break;
-        }
-      }
-      if (foundIdx !== -1) {
-        const removed = targetQueue.splice(foundIdx, 1)[0];
-        setGlobalStatus(`🗑️ 已撤回: ${removed.SongName}`);
-        writeLog(`[点歌] ${user.uname} 撤回了自己点的: ${removed.SongName}`, 'Green');
-      } else {
-        setGlobalStatus(`❌ 撤回失败: 队列无你的歌`);
-        addReject(user, "队列中没有你点的歌");
-      }
+      for (let i = targetQueue.length - 1; i >= 0; i--) { if (targetQueue[i].OrderedByUid === user.uid) { foundIdx = i; break; } }
+      if (foundIdx !== -1) { const removed = targetQueue.splice(foundIdx, 1)[0]; setGlobalStatus(`🗑️ 已撤回: ${removed.SongName}`); }
+      else addReject(user, "队列中没有你点的歌");
     }
     return;
   }
 
   if (isSkip) {
     const perm = checkPermission(user, 'SkipPermission');
-    if (!perm.allowed) {
-      setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
-      writeLog(`[权限拦截] ${user.uname} 切歌被拒: ${perm.reason}`, 'Yellow');
-      addReject(user, perm.reason!);
-      return;
-    }
+    if (!perm.allowed) { addReject(user, perm.reason!); return; }
     setGlobalStatus('⏭️ 已手动切歌');
-    sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
+    if (targetQueue.length > 0) {
+      forcePlaySongAsync(targetQueue[0]);
+      currentPlayingSong = targetQueue.shift();
+    } else {
+      if (appConfig.sysConfig?.PlayerType !== 'Folia') {
+        sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
+      } else {
+        currentPlayingSong = null;
+      }
+    }
     return;
   }
 
   if (isOrder || isTopOrder || isInterruptOrder || isPlayNowOrder) {
-    let keyword = '';
-    let mode: 'normal' | 'top' | 'interrupt' | 'play_now' = 'normal';
-
-    if (isPlayNowOrder) {
-      keyword = msg.replace(/^立即点歌/, '').trim();
-      mode = 'play_now';
-    } else if (isInterruptOrder) {
-      keyword = msg.replace(/^插队点歌/, '').trim();
-      mode = 'interrupt';
-    } else if (isTopOrder) {
-      keyword = msg.replace(/^(置顶点歌|优先点歌)/, '').trim();
-      mode = 'top';
-    } else {
-      keyword = msg.substring(2).trim();
-    }
+    let keyword = ''; let mode: 'normal' | 'top' | 'interrupt' | 'play_now' = 'normal';
+    if (isPlayNowOrder) { keyword = msg.replace(/^立即点歌/, '').trim(); mode = 'play_now'; }
+    else if (isInterruptOrder) { keyword = msg.replace(/^插队点歌/, '').trim(); mode = 'interrupt'; }
+    else if (isTopOrder) { keyword = msg.replace(/^(置顶点歌|优先点歌)/, '').trim(); mode = 'top'; }
+    else { keyword = msg.substring(2).trim(); }
 
     const isSuperUser = appConfig.sysConfig?.SuperUsers?.includes(user.uname) || appConfig.sysConfig?.SuperUsers?.includes(user.uid);
     if (!isSuperUser) {
@@ -1339,49 +998,16 @@ function handleDanmaku(user: any, msg: string) {
       if (user.guardLevel === 1) cdSeconds = cds.Governor;
 
       if (cdSeconds > 0) {
-        const lastReq = userCooldowns.get(user.uid) || 0;
-        const passed = (Date.now() - lastReq) / 1000;
-        if (passed < cdSeconds) {
-          const wait = Math.ceil(cdSeconds - passed);
-          const reason = `冷却中，需等待 ${wait} 秒`;
-          setGlobalStatus(`⚠️ 冷却拦截`);
-          writeLog(`[冷却拦截] ${user.uname} 触发冷却，需等待 ${wait}秒`, 'Yellow');
-          addReject(user, reason);
-          return;
-        }
+        const passed = (Date.now() - (userCooldowns.get(user.uid) || 0)) / 1000;
+        if (passed < cdSeconds) { addReject(user, `冷却中，需等待 ${Math.ceil(cdSeconds - passed)} 秒`); return; }
       }
     }
 
-    if (mode === 'top') {
-      const perm = checkPermission(user, 'PriorityPermission');
-      if (!perm.allowed) {
-        setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
-        writeLog(`[权限拦截] ${user.uname} 置顶点歌被拒: ${perm.reason}`, 'Yellow');
-        addReject(user, perm.reason!);
-        return;
-      }
-    } else if (mode === 'interrupt' || mode === 'play_now') {
-      const perm = checkPermission(user, 'ForceControlPermission');
-      if (!perm.allowed) {
-        setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
-        writeLog(`[权限拦截] ${user.uname} 强切/插队被拒: ${perm.reason}`, 'Yellow');
-        addReject(user, perm.reason!);
-        return;
-      }
-    } else {
-      const perm = checkPermission(user, 'OrderPermission');
-      if (!perm.allowed) {
-        setGlobalStatus(`⚠️ 拦截: ${perm.reason}`);
-        writeLog(`[权限拦截] ${user.uname} 点歌被拒: ${perm.reason}`, 'Yellow');
-        addReject(user, perm.reason!);
-        return;
-      }
-    }
+    if (mode === 'top') { const perm = checkPermission(user, 'PriorityPermission'); if (!perm.allowed) { addReject(user, perm.reason!); return; } }
+    else if (mode === 'interrupt' || mode === 'play_now') { const perm = checkPermission(user, 'ForceControlPermission'); if (!perm.allowed) { addReject(user, perm.reason!); return; } }
+    else { const perm = checkPermission(user, 'OrderPermission'); if (!perm.allowed) { addReject(user, perm.reason!); return; } }
 
-    if (keyword) {
-      userCooldowns.set(user.uid, Date.now());
-      tryRequestSong(user, keyword, mode);
-    }
+    if (keyword) { userCooldowns.set(user.uid, Date.now()); tryRequestSong(user, keyword, mode); }
   }
 }
 
@@ -1390,87 +1016,51 @@ function handleDanmaku(user: any, msg: string) {
 // ==========================================
 async function startBiliQrLogin() {
   if (isQrLoggingIn) return;
-  isQrLoggingIn = true;
-  qrCodeBase64 = "";
-  qrLoginStatus = "正在向 B站请求二维码...";
-
+  isQrLoggingIn = true; qrCodeBase64 = ""; qrLoginStatus = "正在向 B站请求二维码...";
   try {
-    const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" };
+    const headers = { "User-Agent": "Mozilla/5.0" };
     const genRes = await fetch("https://passport.bilibili.com/x/passport-login/web/qrcode/generate", { headers });
     const genData: any = await genRes.json();
-    const url = genData.data?.url;
-    const qrcodeKey = genData.data?.qrcode_key;
+    if (!genData.data?.url) { qrLoginStatus = "错误：无法获取二维码"; isQrLoggingIn = false; return; }
 
-    if (!url) { qrLoginStatus = "错误：无法获取二维码"; isQrLoggingIn = false; return; }
-
-    const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=256x256&data=${encodeURIComponent(url)}`;
-    const qrImgRes = await fetch(qrApiUrl);
-    const arrayBuffer = await qrImgRes.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    qrCodeBase64 = "data:image/png;base64," + buffer.toString('base64');
+    const qrImgRes = await fetch(`https://api.qrserver.com/v1/create-qr-code/?size=256x256&data=${encodeURIComponent(genData.data.url)}`);
+    qrCodeBase64 = "data:image/png;base64," + Buffer.from(await qrImgRes.arrayBuffer()).toString('base64');
     qrLoginStatus = "请使用手机 B站 APP 扫码";
 
     if (qrPollTimer) clearInterval(qrPollTimer);
     let pollCount = 0;
-
     qrPollTimer = setInterval(async () => {
       pollCount++;
       if (pollCount > 60) { clearInterval(qrPollTimer!); qrLoginStatus = "二维码已失效，请重新发起"; isQrLoggingIn = false; return; }
-
       try {
-        const pollRes = await fetch(`https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=${qrcodeKey}`, { headers });
+        const pollRes = await fetch(`https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=${genData.data.qrcode_key}`, { headers });
         const pollData: any = await pollRes.json();
         const code = pollData.data?.code;
 
-        if (code === 86090) {
-          qrLoginStatus = "已扫码，请在手机上点击确认";
-        } else if (code === 86038) {
-          clearInterval(qrPollTimer!); qrLoginStatus = "二维码已失效，请重新发起"; isQrLoggingIn = false;
-        } else if (code === 0) {
-          clearInterval(qrPollTimer!);
-          qrLoginStatus = "扫码成功！正在提取身份凭证...";
-
-          const crossDomainUrl = pollData.data?.url || "";
-          if (crossDomainUrl) {
-            const urlObj = new URL(crossDomainUrl);
-            const params = new URLSearchParams(urlObj.search);
-            const cookies: string[] = [];
-            let uid = 0;
-
+        if (code === 86090) qrLoginStatus = "已扫码，请在手机上点击确认";
+        else if (code === 86038) { clearInterval(qrPollTimer!); qrLoginStatus = "二维码已失效，请重新发起"; isQrLoggingIn = false; }
+        else if (code === 0) {
+          clearInterval(qrPollTimer!); qrLoginStatus = "扫码成功！正在提取身份凭证...";
+          if (pollData.data?.url) {
+            const params = new URLSearchParams(new URL(pollData.data.url).search);
+            const cookies: string[] = []; let uid = 0;
             params.forEach((value, key) => {
               if (['DedeUserID', 'DedeUserID__ckMd5', 'SESSDATA', 'bili_jct'].includes(key)) cookies.push(`${key}=${value}`);
               if (key === 'DedeUserID') uid = parseInt(value, 10);
             });
-
-            biliCookie = cookies.join('; ');
-            biliUid = uid;
-            saveConfig();
-
-            // ⭐ 拉取账号详情：用户名/头像/等级 + 自动保存自己的直播间ID
+            biliCookie = cookies.join('; '); biliUid = uid; saveConfig();
             await updateCurrentUserInfo();
-
             if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);
           }
-
-          qrLoginStatus = "登录完成，请前往连接直播间！";
-          isQrLoggingIn = false;
+          qrLoginStatus = "登录完成，请前往连接直播间！"; isQrLoggingIn = false;
         }
       } catch { }
     }, 2000);
-
-  } catch (err: any) {
-    qrLoginStatus = `错误: ${err.message}`;
-    isQrLoggingIn = false;
-  }
+  } catch (err: any) { qrLoginStatus = `错误: ${err.message}`; isQrLoggingIn = false; }
 }
 
 function readRequestBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => body += chunk.toString());
-    req.on('end', () => resolve(body));
-    req.on('error', err => reject(err));
-  });
+  return new Promise((resolve, reject) => { let body = ''; req.on('data', chunk => body += chunk.toString()); req.on('end', () => resolve(body)); req.on('error', err => reject(err)); });
 }
 
 // ==========================================
@@ -1487,16 +1077,7 @@ function startBackendServer() {
 
     if (url.pathname === '/data') {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({
-        current: currentPlayingSong,
-        queue: targetQueue,
-        status: currentStatusMessage,
-        accepting: isAccepting,
-        playing: isPlaying,
-        uiConfig: appConfig.widgetStyle,
-        rejects: recentRejects,
-        cdpConnected: isCdpConnected // ⭐ 加入动态 CDP 连接状态感知
-      }));
+      res.end(JSON.stringify({ current: currentPlayingSong, queue: targetQueue, status: currentStatusMessage, accepting: isAccepting, playing: isPlaying, uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isCdpConnected }));
       return;
     }
 
@@ -1506,26 +1087,12 @@ function startBackendServer() {
         if (body.roomId !== undefined) appConfig.roomId = body.roomId;
         if (body.widgetStyle !== undefined) appConfig.widgetStyle = body.widgetStyle;
         if (body.sysConfig !== undefined) appConfig.sysConfig = { ...appConfig.sysConfig, ...body.sysConfig };
-
         saveConfig();
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.end(JSON.stringify({ success: true }));
+        res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true }));
         return;
       }
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({
-        roomId: appConfig.roomId,
-        myRoomId: appConfig.myRoomId || 0,
-        biliLogin: !!biliCookie,
-        uid: biliUid,
-        currentUser: currentUserInfo, // ⭐ 当前登录账号详情
-        version: app.getVersion(),
-        accepting: isAccepting,
-        playing: isPlaying,
-        widgetStyle: appConfig.widgetStyle,
-        cdpConnected: isCdpConnected,
-        config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 } }
-      }));
+      res.end(JSON.stringify({ roomId: appConfig.roomId, myRoomId: appConfig.myRoomId || 0, biliLogin: !!biliCookie, uid: biliUid, currentUser: currentUserInfo, version: app.getVersion(), accepting: isAccepting, playing: isPlaying, widgetStyle: appConfig.widgetStyle, cdpConnected: isCdpConnected, config: appConfig.sysConfig }));
       return;
     }
 
@@ -1533,125 +1100,91 @@ function startBackendServer() {
       const doc = JSON.parse(await readRequestBody(req));
       const { action, index } = doc;
 
-      if (action === 'delete' && index >= 0 && index < targetQueue.length) {
-        targetQueue.splice(index, 1);
-        setGlobalStatus('🗑️ 已移除曲目');
-      } else if (action === 'top' && index >= 0 && index < targetQueue.length) {
-        const item = targetQueue.splice(index, 1)[0];
-        targetQueue.unshift(item);
+      if (action === 'delete' && index >= 0 && index < targetQueue.length) { targetQueue.splice(index, 1); setGlobalStatus('🗑️ 已移除曲目'); }
+      else if (action === 'top' && index >= 0 && index < targetQueue.length) {
+        const item = targetQueue.splice(index, 1)[0]; targetQueue.unshift(item);
         if (isPlaying) insertNextSongViaCDP(item.Id);
         setGlobalStatus(`⬆️ 置顶: ${item.SongName}`);
       } else if (action === 'play_now' && index >= 0 && index < targetQueue.length) {
-        const item = targetQueue.splice(index, 1)[0];
-        forcePlaySongAsync(item);
+        const item = targetQueue.splice(index, 1)[0]; forcePlaySongAsync(item);
         setGlobalStatus(`▶️ 强制播放: ${item.SongName}`);
       } else if (action === 'skip_current') {
-        sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
+        if (targetQueue.length > 0) {
+          forcePlaySongAsync(targetQueue[0]);
+          currentPlayingSong = targetQueue.shift();
+        } else {
+          if (appConfig.sysConfig?.PlayerType !== 'Folia') {
+            sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
+          } else {
+            currentPlayingSong = null;
+          }
+        }
         setGlobalStatus('⏭️ 已切歌');
       } else if (action === 'reorder' && doc.from >= 0 && doc.from < targetQueue.length && doc.to >= 0 && doc.to < targetQueue.length) {
-        const item = targetQueue.splice(doc.from, 1)[0];
-        targetQueue.splice(doc.to, 0, item);
-        setGlobalStatus('🔄 列表已重排');
+        const item = targetQueue.splice(doc.from, 1)[0]; targetQueue.splice(doc.to, 0, item); setGlobalStatus('🔄 列表已重排');
       } else if (action === 'push_current_to_queue') {
         if (currentPlayingSong) {
-          targetQueue.push(currentPlayingSong);
-          skipForcePlayOnce = true;
-          setGlobalStatus('🔙 已退回点歌列表末端');
-          sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
+          targetQueue.push(currentPlayingSong); skipForcePlayOnce = true; setGlobalStatus('🔙 已退回点歌列表末端');
+          if (appConfig.sysConfig?.PlayerType !== 'Folia') {
+            sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
+          } else {
+            if(targetQueue.length > 0) { forcePlaySongAsync(targetQueue[0]); currentPlayingSong = targetQueue.shift(); } else currentPlayingSong = null;
+          }
         }
       }
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ success: true }));
+      res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true }));
       return;
     }
 
     if (url.pathname === '/api/room' && req.method === 'POST') {
       const doc = JSON.parse(await readRequestBody(req));
       if (doc.roomId) {
-        writeLog(`✅ 收到前端触发的切换直播间请求: ${doc.roomId}`, 'Cyan');
         const success = await connectToLiveRoom(doc.roomId);
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.end(JSON.stringify({ success }));
-        return;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success })); return;
       }
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ success: false }));
-      return;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: false })); return;
     }
 
-    if (url.pathname === '/api/state/toggle' && req.method === 'POST') {
-      isAccepting = !isAccepting;
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ success: true }));
-      return;
-    }
-
-    if (url.pathname === '/api/state/toggle_play' && req.method === 'POST') {
-      isPlaying = !isPlaying;
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ success: true }));
-      return;
-    }
+    if (url.pathname === '/api/state/toggle' && req.method === 'POST') { isAccepting = !isAccepting; res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
+    if (url.pathname === '/api/state/toggle_play' && req.method === 'POST') { isPlaying = !isPlaying; res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
 
     if (url.pathname === '/api/debug/play_next' && req.method === 'POST') {
-      const success = await sendCDPCommand(FiberStoreExtractJs + `;if (_ensureStore()) { window._reduxStore.dispatch({ type: 'async:action/doAction', payload: { actionId: 'playNext', data: { eventType: 'click' } } }); }`);
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ success }));
-      return;
+      let success = false;
+      if (appConfig.sysConfig?.PlayerType === 'Folia') {
+        if (targetQueue.length > 0) { forcePlaySongAsync(targetQueue[0]); currentPlayingSong = targetQueue.shift(); success = true; }
+      } else {
+        success = await sendCDPCommand(FiberStoreExtractJs + `;if (_ensureStore()) { window._reduxStore.dispatch({ type: 'async:action/doAction', payload: { actionId: 'playNext', data: { eventType: 'click' } } }); }`);
+      }
+      res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success })); return;
     }
 
     if (url.pathname === '/api/sys/restart_ncm' && req.method === 'POST') {
       restartNCMWithDebugPort();
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ success: true }));
-      return;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return;
     }
 
     if (url.pathname === '/api/update/check') {
       try {
         const um = new UpdateManager('https://app.enkianss.us/update/bilincm');
         const updateInfo = await um.checkForUpdatesAsync();
-
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        if (updateInfo) {
-          writeLog(`[更新] 发现新版本: v${updateInfo.TargetFullRelease.Version}`, 'Green');
-          res.end(JSON.stringify({ hasUpdate: true, version: updateInfo.TargetFullRelease.Version }));
-        } else {
-          writeLog(`[更新] 检查完毕，线上版本不高于当前版本，暂无更新。`, 'Cyan');
-          res.end(JSON.stringify({ hasUpdate: false }));
-        }
-      } catch (err: any) {
-        writeLog(`[更新] 检查失败: ${err.message}`, 'Red');
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.end(JSON.stringify({ error: `无法连接更新服务器` }));
-      }
+        if (updateInfo) res.end(JSON.stringify({ hasUpdate: true, version: updateInfo.TargetFullRelease.Version }));
+        else res.end(JSON.stringify({ hasUpdate: false }));
+      } catch (err: any) { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ error: `无法连接更新服务器` })); }
       return;
     }
 
     if (url.pathname === '/api/update/apply' && req.method === 'POST') {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ success: true }));
-
+      res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true }));
       try {
         const um = new UpdateManager('https://app.enkianss.us/update/bilincm');
         const updateInfo = await um.checkForUpdatesAsync();
-
         if (updateInfo) {
-          writeLog(`[更新] 开始通过 CF 节点下载新版本: v${updateInfo.TargetFullRelease.Version}...`, 'Cyan');
           setGlobalStatus(`🚀 下载更新中...`);
-
-          await um.downloadUpdateAsync(updateInfo, (progress: number) => {
-            if (progress % 20 === 0) writeLog(`[更新] 下载进度: ${progress}%`, 'DarkGray');
-          });
-
-          writeLog(`[更新] 下载完成，正在重启应用更新!`, 'Green');
-          um.waitExitThenApplyUpdate(updateInfo, false, true);
-          app.quit();
+          await um.downloadUpdateAsync(updateInfo, (progress: number) => { if (progress % 20 === 0) writeLog(`[更新] 下载进度: ${progress}%`, 'DarkGray'); });
+          um.waitExitThenApplyUpdate(updateInfo, false, true); app.quit();
         }
-      } catch (err: any) {
-        writeLog(`[更新] 下载或应用失败: ${err.message}`, 'Red');
-        setGlobalStatus(`❌ 更新失败`);
-      }
+      } catch { setGlobalStatus(`❌ 更新失败`); }
       return;
     }
 
@@ -1659,92 +1192,46 @@ function startBackendServer() {
       try {
         const { keyword } = JSON.parse(await readRequestBody(req));
 
-        const searchRes = await fetch(`https://music.163.com/api/search/get/web`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Cookie': 'os=pc; appver=2.9.8;'
-          },
-          body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
-        });
-
-        const searchData: any = await searchRes.json();
-        const songs = searchData.result?.songs;
+        let songs = [];
+        if (appConfig.sysConfig?.PlayerType === 'Folia') {
+          const token = appConfig.sysConfig?.FoliaToken?.trim();
+          const searchRes = await fetch(`http://127.0.0.1:32107/stage/search`, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ query: keyword, limit: 1 }) });
+          songs = (await searchRes.json()).songs || [];
+          if (songs.length > 0) songs[0] = { id: songs[0].songId };
+        } else {
+          const searchRes = await fetch(`https://music.163.com/api/search/get/web`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' }, body: `s=${encodeURIComponent(keyword)}&type=1&limit=1` });
+          songs = (await searchRes.json()).result?.songs || [];
+        }
 
         if (songs && songs.length > 0) {
           await insertNextSongViaCDP(songs[0].id);
-          res.setHeader('Content-Type', 'application/json; charset=utf-8');
-          res.end(JSON.stringify({ success: true }));
+          res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true }));
         } else {
-          res.setHeader('Content-Type', 'application/json; charset=utf-8');
-          res.end(JSON.stringify({ success: false, message: '未找到相关歌曲' }));
+          res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: false, message: '未找到相关歌曲' }));
         }
-      } catch {
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.end(JSON.stringify({ success: false }));
-      }
+      } catch { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: false })); }
       return;
     }
 
-    if (url.pathname === '/api/bili/qrstart' && req.method === 'POST') {
-      startBiliQrLogin();
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ success: true }));
-      return;
-    }
-
-    if (url.pathname === '/api/bili/qrstatus') {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ qrBase64: qrCodeBase64, status: qrLoginStatus, isLogin: !!biliCookie }));
-      return;
-    }
-
-    if (url.pathname === '/api/logs') {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify(sysLogs));
-      return;
-    }
+    if (url.pathname === '/api/bili/qrstart' && req.method === 'POST') { startBiliQrLogin(); res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
+    if (url.pathname === '/api/bili/qrstatus') { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ qrBase64: qrCodeBase64, status: qrLoginStatus, isLogin: !!biliCookie })); return; }
+    if (url.pathname === '/api/logs') { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify(sysLogs)); return; }
 
     if (req.method === 'GET' && !url.pathname.startsWith('/api/') && url.pathname !== '/data') {
       const distPath = path.join(__dirname, '../dist');
       let filePath = path.join(distPath, url.pathname === '/' ? 'index.html' : url.pathname);
-
-      if (!fs.existsSync(filePath)) {
-        filePath = path.join(distPath, 'index.html');
-      }
-
+      if (!fs.existsSync(filePath)) filePath = path.join(distPath, 'index.html');
       try {
         if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
           const ext = path.extname(filePath);
-          const mimeTypes: Record<string, string> = {
-            '.html': 'text/html',
-            '.js': 'text/javascript',
-            '.css': 'text/css',
-            '.png': 'image/png',
-            '.svg': 'image/svg+xml',
-            '.ico': 'image/x-icon',
-            '.json': 'application/json',
-            '.woff': 'font/woff',
-            '.woff2': 'font/woff2'
-          };
-          res.setHeader('Content-Type', mimeTypes[ext] || 'application/octet-stream');
-          res.writeHead(200);
-          res.end(fs.readFileSync(filePath));
-          return;
+          const mimeTypes: Record<string, string> = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.json': 'application/json', '.woff': 'font/woff', '.woff2': 'font/woff2' };
+          res.setHeader('Content-Type', mimeTypes[ext] || 'application/octet-stream'); res.writeHead(200); res.end(fs.readFileSync(filePath)); return;
         }
-      } catch (err) {
-        writeLog(`静态资源加载失败: ${err}`, 'Red');
-      }
+      } catch {}
     }
-
-    res.writeHead(404);
-    res.end();
+    res.writeHead(404); res.end();
   });
-
-  server.listen(5555, () => {
-    writeLog('✅ 内部 API 及静态网页服务已启动于 http://localhost:5555', 'Green');
-  });
+  server.listen(5555, () => { writeLog('✅ 内部 API 及静态网页服务已启动于 http://localhost:5555', 'Green'); });
 }
 
 // ==========================================
@@ -1752,33 +1239,14 @@ function startBackendServer() {
 // ==========================================
 app.whenReady().then(() => {
   writeLog('=== BiliNCM-Bot 内部日志已连接 ===', 'Cyan');
-  writeLog('如果连接出现问题，请关注此面板输出。', 'Cyan');
-
   loadConfig();
   restartNCMWithDebugPort();
   createOverlayWindow();
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createOverlayWindow();
-    }
-  });
-
-  writeLog("🚀 点歌机启动流程...", 'DarkGray');
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createOverlayWindow(); });
   startBackendServer();
-
-  // ⭐ 启动时若已登录，后台刷新一次账号信息（用户名/头像/自己的直播间等）
-  if (biliCookie) {
-    updateCurrentUserInfo();
-  }
-
-  if (appConfig.roomId) {
-    connectToLiveRoom(appConfig.roomId);
-  }
+  if (biliCookie) updateCurrentUserInfo();
+  if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);
 });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
-});
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

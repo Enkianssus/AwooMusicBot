@@ -662,7 +662,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             >
                                 <span className="text-[10px] leading-none">{playing ? '🟢' : '🔴'}</span>
                             </button>
-                            <h1 className="font-bold text-[15px] tracking-wide pointer-events-none whitespace-nowrap shrink-0" style={{ color: theme.titleColor }}>直播点歌机</h1>
+                            <h1 className="font-bold text-[15px] tracking-wide pointer-events-none whitespace-nowrap shrink-0" style={{ color: theme.titleColor }}>嗷呜点歌机</h1>
                         </div>
 
                         <div className="no-drag flex items-center relative h-6 flex-1 justify-end min-w-0">

@@ -906,6 +906,8 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const [activeTab, setActiveTab] = useState<string>('settings');
 
     const [updateInfo, setUpdateInfo] = useState<UpdateInfo>({ checking: false, info: null });
+    const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
+
     const [qrState, setQrState] = useState<QrState>({ loading: false, base64: '', message: '' });
     const [roomIdInput, setRoomIdInput] = useState<string>('');
     const [sysLogs, setSysLogs] = useState<SysLog[]>([]);
@@ -915,6 +917,10 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const [debugInput, setDebugInput] = useState<string>('');
 
     const [adminToast, setAdminToast] = useState<string>('');
+
+    // ⭐ 防抖重连定时器引用
+    const restartTimerRef = useRef<NodeJS.Timeout | null>(null);
+
     const showAdminToast = (msg: string) => {
         setAdminToast(msg);
         setTimeout(() => setAdminToast(''), 3000);
@@ -925,6 +931,15 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
     const isInitialConfigLoad = useRef(true);
     const lastConfigString = useRef('');
+
+    // ⭐ 组件卸载时清理定时器，防止内存泄漏
+    useEffect(() => {
+        return () => {
+            if (restartTimerRef.current) {
+                clearTimeout(restartTimerRef.current);
+            }
+        };
+    }, []);
 
     useEffect(() => {
         const fetchConfig = async () => {
@@ -1058,8 +1073,27 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
     const handleApplyUpdate = async () => {
         if(!confirm("确定要开始更新吗？程序将会自动下载并重启。")) return;
-        await fetch('http://localhost:5555/api/update/apply', { method: 'POST' });
-        showAdminToast("正在后台下载更新，请稍候，程序将自动重启...");
+        setDownloadProgress(0);
+
+        try {
+            await fetch('http://localhost:5555/api/update/apply', { method: 'POST' });
+            showAdminToast("正在后台下载更新，请稍候，程序将自动重启...");
+
+            // 模拟进度条，真实后台正在走 Updater 更新流
+            const timer = setInterval(() => {
+                setDownloadProgress(prev => {
+                    if (prev === null) {
+                        clearInterval(timer);
+                        return null;
+                    }
+                    const next = prev + (Math.random() * 8 + 2);
+                    return next > 95 ? 95 : next; // 卡在 95% 直到后端完成并自动重启
+                });
+            }, 1000);
+        } catch {
+            setDownloadProgress(null);
+            showAdminToast("❌ 更新请求失败，请检查网络连接");
+        }
     };
 
     const startQrLogin = async () => {
@@ -1098,11 +1132,13 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         } catch(err: any) { showAdminToast("❌ 请求后端失败：" + err.message); }
     };
 
+    // ⭐ 增加了错误状态识别和 Toast 拦截提示
     const handleDebugPlayNext = async () => {
         try {
             const res = await fetch('http://localhost:5555/api/debug/play_next', { method: 'POST' });
             const json = await res.json();
-            if(json.success) showAdminToast("✅ 切歌指令已发送！");
+            if(json.success) showAdminToast("✅ 切歌指令已成功发送！");
+            else showAdminToast("❌ 切歌失败，播放器拒绝响应或未连接！");
         } catch(err: any) { showAdminToast("❌ 请求后端失败：" + err.message); }
     };
 
@@ -1151,6 +1187,18 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
             ...prev,
             config: { ...prev.config, PlayerType: type }
         }));
+
+        // ⭐ 防抖逻辑：如果 1.2 秒内用户又切了播放器，清除之前的定时器
+        if (restartTimerRef.current) {
+            clearTimeout(restartTimerRef.current);
+        }
+
+        showAdminToast("已切换播放器，等待自动保存后将自动重连...");
+
+        // ⭐ 设置 1.2 秒定时器 (设定为 1200ms 是为了绝对保证上方的 800ms 自动保存逻辑先执行完毕)
+        restartTimerRef.current = setTimeout(() => {
+            handleRestartNCM();
+        }, 1200);
     };
 
     const permTypes = [
@@ -1402,7 +1450,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                 <div className="col-span-2">
                                                     {config.config.PlayerType === 'Folia' ? (
                                                         <span className={`text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${config.cdpConnected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
-                                                            {config.cdpConnected ? '✅ API 通畅' : '❌ 未连接'}
+                                                            {config.cdpConnected ? '✅ API 在线' : '❌ 未连接'}
                                                         </span>
                                                     ) : (
                                                         <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">未启用</span>
@@ -1421,7 +1469,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                 </div>
                                                 <div className="col-span-3 flex justify-end">
                                                     <button disabled={config.config.PlayerType !== 'Folia'} onClick={handleRestartNCM} className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-xs rounded-lg font-bold shadow transition-colors border border-purple-400/50 disabled:opacity-30 disabled:cursor-not-allowed">
-                                                        🔄 刷新连接
+                                                        🔄 测试连接
                                                     </button>
                                                 </div>
                                             </div>
@@ -1623,7 +1671,21 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
                                         <p className="text-sm text-gray-400 mb-8 leading-relaxed">一键连接 GitHub 检查最新版本。</p>
 
-                                        {updateInfo.info?.hasUpdate ? (
+                                        {downloadProgress !== null ? (
+                                            <div className="bg-green-900/30 border border-green-500/30 p-5 rounded-xl w-full text-left">
+                                                <div className="text-green-400 font-bold text-md mb-2 flex justify-between">
+                                                    <span>🚀 正在下载更新...</span>
+                                                    <span>{Math.floor(downloadProgress)}%</span>
+                                                </div>
+                                                <div className="w-full bg-black/50 h-3 rounded-full overflow-hidden">
+                                                    <div
+                                                        className="bg-green-500 h-full transition-all duration-300 ease-out"
+                                                        style={{ width: `${downloadProgress}%` }}
+                                                    ></div>
+                                                </div>
+                                                <div className="text-xs text-green-400/70 mt-3 text-center">下载完成后程序将自动重启，请勿关闭本窗口</div>
+                                            </div>
+                                        ) : updateInfo.info?.hasUpdate ? (
                                             <div className="bg-green-900/30 border border-green-500/30 p-5 rounded-xl w-full">
                                                 <div className="text-green-400 font-bold text-md mb-4">🎉 发现新版本: {updateInfo.info.version}</div>
                                                 <button onClick={handleApplyUpdate} className="px-5 py-3 bg-green-600 hover:bg-green-500 text-white text-md rounded-xl font-bold shadow-lg w-full transition-colors">立刻下载并重启更新</button>

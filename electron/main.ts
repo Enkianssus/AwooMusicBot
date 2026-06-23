@@ -252,6 +252,7 @@ let qrPollTimer: NodeJS.Timeout | null = null;
 let targetQueue: any[] = [];
 let currentPlayingSong: any = null;
 let lastTrackId: string | null = null;
+let lastQueueActionTime = 0; // 新增：全局队列操作防抖冷却时间
 
 const userCooldowns = new Map<string, number>();
 let recentRejects: { id: number, user: any, reason: string }[] = [];
@@ -412,30 +413,31 @@ function syncTrackChangeLogic(currId: string, currName: string, nextId: string |
   let stateChanged = false;
 
   if (!isPlaying) {
-    if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
-      writeLog(`[状态同步] 处于暂停状态，自动跳过待播曲目以防消耗: ${targetQueue[0].SongName}`, 'Yellow');
+    // 增加 ?.Id 防护，避免越界访问
+    if (targetQueue.length > 0 && currId === targetQueue[0]?.Id) {
+      writeLog(`[状态同步] 处于暂停状态，自动跳过待播曲目以防消耗: ${targetQueue[0]?.SongName}`, 'Yellow');
       playNextSong();
     } else {
       if (currentPlayingSong) { currentPlayingSong = null; stateChanged = true; }
     }
   }
   else {
-    if (currentPlayingSong && currId !== currentPlayingSong.Id) {
+    if (currentPlayingSong && currId !== currentPlayingSong?.Id) {
       const checkSkipForce = skipForcePlayOnce;
       skipForcePlayOnce = false;
 
-      if (targetQueue.length > 0 && currId === targetQueue[0].Id) {
-        writeLog(`[状态同步] 自然衔接到队首: ${targetQueue[0].SongName}`, 'Green');
+      if (targetQueue.length > 0 && currId === targetQueue[0]?.Id) {
+        writeLog(`[状态同步] 自然衔接到队首: ${targetQueue[0]?.SongName}`, 'Green');
         currentPlayingSong = targetQueue.shift();
         stateChanged = true;
       } else if (targetQueue.length > 0) {
-        if (checkSkipForce && targetQueue[0].Id === currentPlayingSong.Id) {
-          writeLog(`[状态同步] 退回操作触发: 放行原生曲目，点播曲延后: ${targetQueue[0].SongName}`, 'DarkGray');
-          insertNextSongViaCDP(targetQueue[0].Id);
+        if (checkSkipForce && targetQueue[0]?.Id === currentPlayingSong?.Id) {
+          writeLog(`[状态同步] 退回操作触发: 放行原生曲目，点播曲延后: ${targetQueue[0]?.SongName}`, 'DarkGray');
+          insertNextSongViaCDP(targetQueue[0]?.Id);
           currentPlayingSong = null;
           stateChanged = true;
         } else {
-          writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
+          writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0]?.SongName}`, 'Magenta');
           forcePlaySongAsync(targetQueue[0]);
           currentPlayingSong = targetQueue.shift();
           stateChanged = true;
@@ -446,28 +448,28 @@ function syncTrackChangeLogic(currId: string, currName: string, nextId: string |
         stateChanged = true;
       }
     } else if (!currentPlayingSong && targetQueue.length > 0) {
-      if (currId === targetQueue[0].Id) {
+      if (currId === targetQueue[0]?.Id) {
         currentPlayingSong = targetQueue.shift();
         stateChanged = true;
       } else {
         if (appConfig.sysConfig?.IdleWaitNext === false) {
-          writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0].SongName}`, 'Magenta');
+          writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0]?.SongName}`, 'Magenta');
           forcePlaySongAsync(targetQueue[0]);
           currentPlayingSong = targetQueue.shift();
           stateChanged = true;
         } else {
-          writeLog(`[状态同步] 当前空闲且未匹配，为队首曲目重注下一首: ${targetQueue[0].SongName}`, 'DarkGray');
-          insertNextSongViaCDP(targetQueue[0].Id);
+          writeLog(`[状态同步] 当前空闲且未匹配，为队首曲目重注下一首: ${targetQueue[0]?.SongName}`, 'DarkGray');
+          insertNextSongViaCDP(targetQueue[0]?.Id);
         }
       }
     }
 
-    if (stateChanged) setGlobalStatus(currentPlayingSong ? `[播放] ${currentPlayingSong.SongName}` : '点歌就绪');
+    if (stateChanged) setGlobalStatus(currentPlayingSong ? `[播放] ${currentPlayingSong?.SongName}` : '点歌就绪');
 
-    if (appConfig.sysConfig?.PlayerType !== 'Folia' && isPlaying && targetQueue.length > 0 && currentPlayingSong && currId === currentPlayingSong.Id) {
-      if (String(nextId) !== String(targetQueue[0].Id)) {
+    if (appConfig.sysConfig?.PlayerType !== 'Folia' && isPlaying && targetQueue.length > 0 && currentPlayingSong && currId === currentPlayingSong?.Id) {
+      if (String(nextId) !== String(targetQueue[0]?.Id)) {
         writeLog(`[保底纠正] 播放器下一首(${nextName})与点歌队列不符，立刻重新插入!`, 'Yellow');
-        insertNextSongViaCDP(targetQueue[0].Id);
+        insertNextSongViaCDP(targetQueue[0]?.Id);
       }
     }
   }
@@ -481,10 +483,21 @@ const FOLIA_HTTP_PORT = 32107;
 // ==========================================
 // 播放控制大一统抽象层
 // ==========================================
+
+// ⭐ 新增：Folia 全局并发操作锁，防止强控连招期间被其他弹幕指令插足
+let isFoliaHandlingAction = false;
+
 async function playNextSong(): Promise<boolean> {
   if (appConfig.sysConfig?.PlayerType === 'Folia') {
+    if (isFoliaHandlingAction) {
+      writeLog(`[防抖] 当前 Folia 正在执行强控连招，已忽略本次顺延切歌请求...`, 'Yellow');
+      return false;
+    }
+
     const token = appConfig.sysConfig?.FoliaToken?.trim();
     if (!token) return false;
+
+    isFoliaHandlingAction = true; // 上锁
     try {
       writeLog(`[切歌] 正在向 Folia 发送 next 控制指令...`, 'Cyan');
       const res = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
@@ -498,8 +511,11 @@ async function playNextSong(): Promise<boolean> {
         writeLog(`[切歌] Folia 拒绝执行 next (状态码: ${res.status})，执行强力回退干预...`, 'Yellow');
         if (targetQueue.length > 0) {
           const nextSong = targetQueue.shift();
-          writeLog(`[切歌] 强行拉起待播队列首曲: ${nextSong!.SongName}`, 'Magenta');
-          await forcePlaySongAsync(nextSong);
+          if (nextSong) {
+            writeLog(`[切歌] 强行拉起待播队列首曲: ${nextSong.SongName}`, 'Magenta');
+            isFoliaHandlingAction = false; // ⭐ 切歌补偿需要先解开锁，让 forcePlay 顺利执行
+            await forcePlaySongAsync(nextSong);
+          }
         } else {
           // 队列空了，发送强制暂停清空界面
           await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
@@ -517,6 +533,8 @@ async function playNextSong(): Promise<boolean> {
     } catch (err: any) {
       writeLog(`[切歌] Folia 通信异常: ${err.message}`, 'Red');
       return false;
+    } finally {
+      isFoliaHandlingAction = false; // 兜底解锁
     }
   } else {
     return await sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
@@ -524,6 +542,7 @@ async function playNextSong(): Promise<boolean> {
 }
 
 async function insertNextSongViaCDP(songId: string) {
+  if (!songId) return; // 增加防空保护
   if (appConfig.sysConfig?.PlayerType === 'Folia') {
     const token = appConfig.sysConfig?.FoliaToken?.trim();
     if (!token) return;
@@ -549,14 +568,30 @@ async function insertNextSongViaCDP(songId: string) {
   await sendCDPCommand(script);
 }
 
+// ⭐ 加了空值检查(!songInfo) 的终极防弹版强行播放 (带暂停与等待)
 async function forcePlaySongAsync(songInfo: any) {
-  currentPlayingSong = songInfo;
-  lastTrackId = songInfo.Id;
+  if (!songInfo) return; // 防止参数为空导致读取 Id 抛错导致应用崩溃
+
   if (appConfig.sysConfig?.PlayerType === 'Folia') {
+    if (isFoliaHandlingAction) {
+      writeLog(`[防抖] Folia 正在处理上一首的切歌连招，暂不接受新的强制播放: ${songInfo.SongName}。已将其退回队列首位等待自然衔接！`, 'Yellow');
+      targetQueue.unshift(songInfo); // 防丢保护，塞回队首
+      return;
+    }
+
+    isFoliaHandlingAction = true; // ⭐ 全局锁定，期间暂不接受其他的直接播放请求
+
+    currentPlayingSong = songInfo;
+    lastTrackId = songInfo.Id;
+
     const token = appConfig.sysConfig?.FoliaToken?.trim();
-    if (!token) return;
+    if (!token) {
+      isFoliaHandlingAction = false;
+      return;
+    }
+
     try {
-      // 1. 无延迟无暂停，直接插入到下一首
+      // 1. 将歌曲插入到下一首
       const insertRes = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/queue`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -567,25 +602,43 @@ async function forcePlaySongAsync(songInfo: any) {
         writeLog(`❌ Folia 拒绝强制播放插队 (状态码: ${insertRes.status})`, 'Red');
       }
 
-      // 2. 无延迟直接下一首控制指令
+      // 2. 发送暂停控制指令，停止当前歌曲并稳定播放器内部状态
+      await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'pause' })
+      });
+
+      // 3. 等待 500ms，让前端 UI 和内部状态彻底固化
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      // 4. 发送下一首控制指令，让播放器平滑跳转
       await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'next' })
       });
 
-      // 3. 将后续的点歌继续预先注入
-      if (isPlaying && targetQueue.length > 0) {
+      // 5. 走完后看代播歌单下一首，将这一首插入下一首进行预加载
+      if (isPlaying && targetQueue.length > 0 && targetQueue[0]?.Id) {
+        writeLog(`[预加载] 强切连招完毕，自动将待播队列第一首(${targetQueue[0].SongName})插入下一首...`, 'Cyan');
         setTimeout(() => insertNextSongViaCDP(targetQueue[0].Id), 1500);
       }
     } catch (e: any) {
       writeLog(`❌ Folia 强制播放控制异常: ${e.message}`, 'Red');
+    } finally {
+      isFoliaHandlingAction = false; // ⭐ 彻底释放连招锁
     }
     return;
   }
+
+  // 以下为网易云原生逻辑保持不变
+  currentPlayingSong = songInfo;
+  lastTrackId = songInfo.Id;
+
   const script = FiberStoreExtractJs + `;if (_ensureStore()) { window._reduxStore.dispatch({ type: 'async:action/doAction', payload: { actionId: 'play', data: { resource: { id: String(${songInfo.Id}) }, resourceType: 'track', eventType: 'dblclick' } } }); }`;
   await sendCDPCommand(script);
-  if (isPlaying && targetQueue.length > 0) setTimeout(() => insertNextSongViaCDP(targetQueue[0].Id), 1500);
+  if (isPlaying && targetQueue.length > 0 && targetQueue[0]?.Id) setTimeout(() => insertNextSongViaCDP(targetQueue[0].Id), 1500);
 }
 
 // ==========================================
@@ -890,33 +943,35 @@ async function startCDPRadar() {
         send('Runtime.evaluate', { expression: radarScript, returnByValue: true });
       },
       onMessage: (data: any) => {
-        const msg = JSON.parse(typeof data === 'string' ? data : data.toString());
-        if (msg.error) writeLog(`❌ [CDP 调用失败]: ${JSON.stringify(msg.error)}`, 'Red');
-        if (msg.method === 'Runtime.bindingCalled' && msg.params.name === '__ncmRadarCallback') {
-          const payload = JSON.parse(msg.params.payload);
+        try {
+          const msg = JSON.parse(typeof data === 'string' ? data : data.toString());
+          if (msg.error) writeLog(`❌ [CDP 调用失败]: ${JSON.stringify(msg.error)}`, 'Red');
+          if (msg.method === 'Runtime.bindingCalled' && msg.params.name === '__ncmRadarCallback') {
+            const payload = JSON.parse(msg.params.payload);
 
-          if (payload.event === 'RADAR_INIT_RETRYING') writeLog(`⏳ [挖树] 等待网易云 React 树加载...`, 'DarkGray');
-          else if (payload.event === 'RADAR_INIT_OK') {
-            writeLog(`✅ CDP 常驻雷达注入成功!`, 'Green');
-            setGlobalStatus('点歌就绪');
-            isCdpConnected = true;
-          }
-          else if (payload.event === 'RADAR_ALREADY_DEPLOYED') isCdpConnected = true;
-          else if (payload.event === 'TRACK_CHANGED') {
-            const currId = payload.current?.id;
-            const currName = payload.current?.name;
-            const nextId = payload.next?.id;
-            const nextName = payload.next?.name || '无';
+            if (payload.event === 'RADAR_INIT_RETRYING') writeLog(`⏳ [挖树] 等待网易云 React 树加载...`, 'DarkGray');
+            else if (payload.event === 'RADAR_INIT_OK') {
+              writeLog(`✅ CDP 常驻雷达注入成功!`, 'Green');
+              setGlobalStatus('点歌就绪');
+              isCdpConnected = true;
+            }
+            else if (payload.event === 'RADAR_ALREADY_DEPLOYED') isCdpConnected = true;
+            else if (payload.event === 'TRACK_CHANGED') {
+              const currId = payload.current?.id;
+              const currName = payload.current?.name;
+              const nextId = payload.next?.id;
+              const nextName = payload.next?.name || '无';
 
-            if (currId && currId !== lastTrackId) {
-              syncTrackChangeLogic(currId, currName, nextId, nextName);
-              lastTrackId = currId;
-            } else if (!currId && lastTrackId) {
-              syncTrackChangeLogic('', '播放停止', null, '无');
-              lastTrackId = null;
+              if (currId && currId !== lastTrackId) {
+                syncTrackChangeLogic(currId, currName, nextId, nextName);
+                lastTrackId = currId;
+              } else if (!currId && lastTrackId) {
+                syncTrackChangeLogic('', '播放停止', null, '无');
+                lastTrackId = null;
+              }
             }
           }
-        }
+        } catch (e: any) { writeLog(`❌ CDP 解析异常: ${e.message}`, 'Red'); }
       },
       onClose: () => {
         writeLog('⚠️ [雷达] CDP 连接断开，1.5秒后准备重连...', 'Yellow');
@@ -1252,22 +1307,41 @@ function startBackendServer() {
     }
 
     if (url.pathname === '/api/queue/action' && req.method === 'POST') {
+      // 队列操作防抖锁定（后端防护）
+      const now = Date.now();
+      if (now - lastQueueActionTime < 500) {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ success: false, message: '操作冷却中，请勿频繁点击' }));
+        return;
+      }
+      lastQueueActionTime = now;
+
       const doc = JSON.parse(await readRequestBody(req));
       const { action, index } = doc;
 
       if (action === 'delete' && index >= 0 && index < targetQueue.length) { targetQueue.splice(index, 1); setGlobalStatus('🗑️ 已移除曲目'); }
       else if (action === 'top' && index >= 0 && index < targetQueue.length) {
-        const item = targetQueue.splice(index, 1)[0]; targetQueue.unshift(item);
-        if (isPlaying) insertNextSongViaCDP(item.Id);
-        setGlobalStatus(`⬆️ 置顶: ${item.SongName}`);
+        const item = targetQueue.splice(index, 1)[0];
+        if (item) {
+          targetQueue.unshift(item);
+          if (isPlaying) insertNextSongViaCDP(item.Id);
+          setGlobalStatus(`⬆️ 置顶: ${item.SongName}`);
+        }
       } else if (action === 'play_now' && index >= 0 && index < targetQueue.length) {
-        const item = targetQueue.splice(index, 1)[0]; forcePlaySongAsync(item);
-        setGlobalStatus(`▶️ 强制播放: ${item.SongName}`);
+        const item = targetQueue.splice(index, 1)[0];
+        if (item) {
+          forcePlaySongAsync(item);
+          setGlobalStatus(`▶️ 强制播放: ${item.SongName}`);
+        }
       } else if (action === 'skip_current') {
         playNextSong();
         setGlobalStatus('⏭️ 已切歌');
       } else if (action === 'reorder' && doc.from >= 0 && doc.from < targetQueue.length && doc.to >= 0 && doc.to < targetQueue.length) {
-        const item = targetQueue.splice(doc.from, 1)[0]; targetQueue.splice(doc.to, 0, item); setGlobalStatus('🔄 列表已重排');
+        const item = targetQueue.splice(doc.from, 1)[0];
+        if (item) {
+          targetQueue.splice(doc.to, 0, item);
+          setGlobalStatus('🔄 列表已重排');
+        }
       } else if (action === 'push_current_to_queue') {
         if (currentPlayingSong) {
           targetQueue.push(currentPlayingSong); skipForcePlayOnce = true; setGlobalStatus('🔙 已退回点歌列表末端');

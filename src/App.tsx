@@ -170,6 +170,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [dragInfo, setDragInfo] = useState<DragInfo | null>(null);
     const [showSettings, setShowSettings] = useState<boolean>(false);
 
+    // ⭐ 新增: 全局 UI 500ms 冷却锁定
+    const [actionLock, setActionLock] = useState<boolean>(false);
+
     const [theme, setTheme] = useState<Theme>(() => {
         try {
             const saved = localStorage.getItem('bili-widget-theme');
@@ -185,6 +188,12 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         const id = Date.now() + Math.random();
         setToasts(prev => [...prev, { id, msg }]);
         setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
+    };
+
+    // ⭐ 触发冷却锁的方法
+    const triggerActionLock = () => {
+        setActionLock(true);
+        setTimeout(() => setActionLock(false), 1000);
     };
 
     const [widgetStyle, setWidgetStyle] = useState<WidgetStyle>(() => {
@@ -316,7 +325,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     }, []);
 
     const handleQueueAction = async (action: string, payload: any) => {
-        if (!isElectron) return;
+        // ⭐ 防抖保护
+        if (!isElectron || actionLock) return;
+        triggerActionLock();
         try {
             await fetch('http://localhost:5555/api/queue/action', {
                 method: 'POST',
@@ -327,7 +338,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     };
 
     const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>, type: 'current' | 'queue', index: number, item: SongInfo) => {
-        if (!isElectron) return;
+        // ⭐ 防抖保护
+        if (!isElectron || actionLock) return;
         e.preventDefault(); e.stopPropagation();
         setDragInfo({ type, index, item, x: e.clientX, y: e.clientY, actionType: 'none' });
 
@@ -388,6 +400,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             document.removeEventListener('pointerup', onPointerUp);
             setDragInfo(null);
 
+            // ⭐ 拖拽释放后，同样启动 500ms 冷却锁定
+            triggerActionLock();
+
             if (currentActionType === 'delete') {
                 if (type === 'queue') handleQueueAction('delete', { index });
                 if (type === 'current') handleQueueAction('skip_current', {});
@@ -414,8 +429,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     };
 
     const toggleAccepting = async (e?: React.MouseEvent) => {
-        if (!isElectron) return;
+        if (!isElectron || actionLock) return;
         e?.stopPropagation?.();
+        triggerActionLock();
         try {
             await fetch('http://localhost:5555/api/state/toggle', { method: 'POST' });
             setAccepting(!accepting);
@@ -423,8 +439,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     };
 
     const togglePlaying = async (e?: React.MouseEvent) => {
-        if (!isElectron) return;
+        if (!isElectron || actionLock) return;
         e?.stopPropagation?.();
+        triggerActionLock();
         try {
             await fetch('http://localhost:5555/api/state/toggle_play', { method: 'POST' });
             setPlaying(!playing);
@@ -657,7 +674,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             <button
                                 onMouseDown={e => { if(isElectron) e.stopPropagation(); }}
                                 onClick={togglePlaying}
-                                className={`flex items-center justify-center w-5 h-5 rounded-full transition-colors ${isElectron ? 'pointer-events-auto cursor-pointer no-drag' : 'pointer-events-none'} ${playing ? (isElectron ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-green-500/20 text-green-400') : (isElectron ? 'bg-red-500/20 text-red-400 hover:bg-red-500/40' : 'bg-red-500/20 text-red-400')}`}
+                                disabled={actionLock}
+                                className={`flex items-center justify-center w-5 h-5 rounded-full transition-colors ${isElectron ? 'pointer-events-auto cursor-pointer no-drag' : 'pointer-events-none'} ${playing ? (isElectron ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-green-500/20 text-green-400') : (isElectron ? 'bg-red-500/20 text-red-400 hover:bg-red-500/40' : 'bg-red-500/20 text-red-400')} ${actionLock ? 'opacity-50 pointer-events-none' : ''}`}
                                 title={isElectron ? (playing ? '点击暂停自动播放' : '点击开启自动播放') : undefined}
                             >
                                 <span className="text-[10px] leading-none">{playing ? '🟢' : '🔴'}</span>
@@ -688,9 +706,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 <div className="flex-1 flex flex-col p-4 overflow-hidden z-10 gap-4 custom-scrollbar relative">
                     {data.current ? (
                         <div
-                            className={`${isElectron ? 'no-drag cursor-move' : ''} current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 transition-opacity ${dragInfo?.type === 'current' ? 'opacity-30' : ''}`}
+                            className={`${isElectron ? 'no-drag cursor-move' : ''} current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 transition-opacity ${dragInfo?.type === 'current' ? 'opacity-30' : ''} ${actionLock ? 'pointer-events-none' : ''}`}
                             style={{ touchAction: 'none' }}
-                            onPointerDown={isElectron ? (e) => handlePointerDown(e, 'current', -1, data.current as SongInfo) : undefined}
+                            onPointerDown={isElectron && !actionLock ? (e) => handlePointerDown(e, 'current', -1, data.current as SongInfo) : undefined}
                         >
                             <div className="absolute right-[-10px] top-[-10px] opacity-5 text-7xl select-none pointer-events-none">🎵</div>
                             <div className={`w-12 h-12 rounded-full overflow-hidden border-[3px] ${playing ? getGuardStyle(data.current.GuardLevel).border || 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.2)]' : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} shrink-0 relative pointer-events-none`}>
@@ -740,7 +758,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             <button
                                 onMouseDown={e => { if(isElectron) e.stopPropagation(); }}
                                 onClick={toggleAccepting}
-                                className={`flex items-center justify-center w-5 h-5 rounded-full transition-colors ${isElectron ? 'no-drag pointer-events-auto cursor-pointer' : 'pointer-events-none'} ${accepting ? (isElectron ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-green-500/20 text-green-400') : (isElectron ? 'bg-red-500/20 text-red-400 hover:bg-red-500/40' : 'bg-red-500/20 text-red-400')}`}
+                                disabled={actionLock}
+                                className={`flex items-center justify-center w-5 h-5 rounded-full transition-colors ${isElectron ? 'no-drag pointer-events-auto cursor-pointer' : 'pointer-events-none'} ${accepting ? (isElectron ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-green-500/20 text-green-400') : (isElectron ? 'bg-red-500/20 text-red-400 hover:bg-red-500/40' : 'bg-red-500/20 text-red-400')} ${actionLock ? 'opacity-50 pointer-events-none' : ''}`}
                                 title={isElectron ? (accepting ? '点击暂停接单' : '点击开启接单') : undefined}
                             >
                                 <span className="text-[10px] leading-none">{accepting ? '🟢' : '🔴'}</span>
@@ -787,8 +806,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                                 <div
                                     key={uniqueKey}
                                     style={{ touchAction: 'none' }}
-                                    onPointerDown={isElectron ? (e) => handlePointerDown(e, 'queue', index, song) : undefined}
-                                    className={`${isElectron ? 'no-drag cursor-move' : ''} queue-item glass-card rounded-lg flex items-center gap-3 transition-all hover:bg-white/10 relative group/item ${isNew ? 'animate-slide-in' : ''} ${dragInfo?.type === 'queue' && dragInfo.index === index ? 'opacity-30' : ''} ${theme.compactQueue ? 'p-1.5' : 'p-2.5'}`}
+                                    onPointerDown={isElectron && !actionLock ? (e) => handlePointerDown(e, 'queue', index, song) : undefined}
+                                    className={`${isElectron ? 'no-drag cursor-move' : ''} queue-item glass-card rounded-lg flex items-center gap-3 transition-all hover:bg-white/10 relative group/item ${isNew ? 'animate-slide-in' : ''} ${dragInfo?.type === 'queue' && dragInfo.index === index ? 'opacity-30' : ''} ${theme.compactQueue ? 'p-1.5' : 'p-2.5'} ${actionLock ? 'pointer-events-none' : ''}`}
                                 >
                                     {theme.compactQueue ? (
                                         <div className="flex items-center w-full min-w-0 pointer-events-none pr-14">

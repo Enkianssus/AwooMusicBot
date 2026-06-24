@@ -1,7 +1,7 @@
 # 🎵 嗷呜点歌机 (B站网易云全自动点歌机)
 
 嗷呜点歌机 是一款专为 Bilibili 主播打造的现代化网易云音乐全自动弹幕点歌机。  
-本项目使用 Electron + React + TypeScript 进行了底层重构，开创性地利用 CDP (Chrome DevTools Protocol) 底层 JS 注入技术，直接接管网易云内核，为您带来丝滑、精准且完全静默的完美点歌体验。
+本项目使用 Electron + React + TypeScript 进行了底层重构，利用 CDP (Chrome DevTools Protocol) 底层 JS 注入技术，直接接管网易云内核，为您带来丝滑、精准且完全静默的完美点歌体验。
 
 
 

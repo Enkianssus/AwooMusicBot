@@ -30,12 +30,19 @@ jobs:
         id: get_version
         shell: powershell
         run: |
-          $package = Get-Content package.json | ConvertFrom-Json
-          echo "VERSION=$($package.version)" >> $env:GITHUB_ENV
           if ("${{ github.event_name }}" -eq "push") {
-            echo "TAG_NAME=${{ github.ref_name }}" >> $env:GITHUB_ENV
+            # 如果是由 tag 触发，直接从 tag 提取版本号（去掉开头的 'v'）
+            $tag = "${{ github.ref_name }}"
+            $ver = $tag -replace '^v', ''
+            echo "VERSION=$ver" >> $env:GITHUB_ENV
+            echo "TAG_NAME=$tag" >> $env:GITHUB_ENV
+            Write-Host "Triggered by tag. Extracted Version: $ver from Tag: $tag"
           } else {
+            # 如果是手动触发，则读取 package.json 里的版本
+            $package = Get-Content package.json | ConvertFrom-Json
+            echo "VERSION=$($package.version)" >> $env:GITHUB_ENV
             echo "TAG_NAME=v$($package.version)" >> $env:GITHUB_ENV
+            Write-Host "Manually triggered. Read Version: $($package.version) from package.json"
           }
 
       - name: Build Electron Unpacked

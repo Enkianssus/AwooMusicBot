@@ -12,7 +12,7 @@ import { createRequire } from 'module';
 const customRequire = createRequire(import.meta.url);
 const { UpdateManager } = customRequire('velopack');
 
-// 强制修复 Windows 终端的 UTF-8 中文乱码问题
+// 强制修复 Windows 终端 of UTF-8 中文乱码问题
 try {
   if (process.platform === 'win32') {
     execSync('chcp 65001');
@@ -252,7 +252,7 @@ let qrPollTimer: NodeJS.Timeout | null = null;
 let targetQueue: any[] = [];
 let currentPlayingSong: any = null;
 let lastTrackId: string | null = null;
-let lastQueueActionTime = 0; // 新增：全局队列操作防抖冷却时间
+let lastQueueActionTime = 0; // 全局队列操作防抖冷却时间
 
 const userCooldowns = new Map<string, number>();
 let recentRejects: { id: number, user: any, reason: string }[] = [];
@@ -568,7 +568,7 @@ async function insertNextSongViaCDP(songId: string) {
   await sendCDPCommand(script);
 }
 
-// ⭐ 加了空值检查(!songInfo) 的终极防弹版强行播放 (带暂停与等待)
+// ⭐ 加了空值检查(!songInfo) 和同曲重播防护的终极版强制播放
 async function forcePlaySongAsync(songInfo: any) {
   if (!songInfo) return; // 防止参数为空导致读取 Id 抛错导致应用崩溃
 
@@ -582,6 +582,9 @@ async function forcePlaySongAsync(songInfo: any) {
     isFoliaHandlingAction = true; // ⭐ 全局锁定，期间暂不接受其他的直接播放请求
 
     currentPlayingSong = songInfo;
+
+    // ⭐ 核心修复：比对即将播放的歌曲 ID 和当前 Folia 实际正在播的 lastTrackId 是否相同
+    const isSameSong = String(songInfo.Id) === String(lastTrackId);
     lastTrackId = songInfo.Id;
 
     const token = appConfig.sysConfig?.FoliaToken?.trim();
@@ -590,8 +593,48 @@ async function forcePlaySongAsync(songInfo: any) {
       return;
     }
 
+    // ⭐ 如果正在播放的歌 刚好也是下一首/或者强制跳转这首，直接发起一键原地重播指令
+    if (isSameSong) {
+      writeLog(`[重新播放] 检测到目标歌曲与当前播放相同，优先发起原地重开 (Seek 0ms)...`, 'Cyan');
+      try {
+        const seekRes = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'seek', positionMs: 0 })
+        });
+        if (seekRes.ok) {
+          writeLog(`[重新播放] Seek 0ms 发送并重播成功`, 'Green');
+          isFoliaHandlingAction = false;
+          return;
+        } else {
+          writeLog(`[重新播放] Seek 0ms 遭拒（状态码: ${seekRes.status}），退切退回补偿控制...`, 'Yellow');
+        }
+      } catch (e: any) {
+        writeLog(`[重新播放] Seek 异常: ${e.message}，尝试退切补偿连招...`, 'Yellow');
+      }
+
+      // 补偿退切：快速下一首再退回上一首
+      try {
+        await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
+          method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'next' })
+        });
+        await new Promise(resolve => setTimeout(resolve, 300));
+        await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
+          method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'prev' })
+        });
+        writeLog(`[重新播放] 退切连招补偿成功完成！`, 'Green');
+      } catch (e: any) {
+        writeLog(`[重新播放] 退切连招失败: ${e.message}`, 'Red');
+      } finally {
+        isFoliaHandlingAction = false;
+      }
+      return;
+    }
+
     try {
-      // 1. 将歌曲插入到下一首
+      // 1. 无延迟无暂停，直接将歌曲插入到下一首
       const insertRes = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/queue`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -602,24 +645,14 @@ async function forcePlaySongAsync(songInfo: any) {
         writeLog(`❌ Folia 拒绝强制播放插队 (状态码: ${insertRes.status})`, 'Red');
       }
 
-      // 2. 发送暂停控制指令，停止当前歌曲并稳定播放器内部状态
-      await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'pause' })
-      });
-
-      // 3. 等待 500ms，让前端 UI 和内部状态彻底固化
-      await new Promise(resolve => setTimeout(resolve, 500));
-
-      // 4. 发送下一首控制指令，让播放器平滑跳转
+      // 2. 无延迟直接发送下一首控制指令
       await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'next' })
       });
 
-      // 5. 走完后看代播歌单下一首，将这一首插入下一首进行预加载
+      // 3. 将后续的点歌继续预先注入
       if (isPlaying && targetQueue.length > 0 && targetQueue[0]?.Id) {
         writeLog(`[预加载] 强切连招完毕，自动将待播队列第一首(${targetQueue[0].SongName})插入下一首...`, 'Cyan');
         setTimeout(() => insertNextSongViaCDP(targetQueue[0].Id), 1500);
@@ -627,12 +660,11 @@ async function forcePlaySongAsync(songInfo: any) {
     } catch (e: any) {
       writeLog(`❌ Folia 强制播放控制异常: ${e.message}`, 'Red');
     } finally {
-      isFoliaHandlingAction = false; // ⭐ 彻底释放连招锁
+      isFoliaHandlingAction = false;
     }
     return;
   }
 
-  // 以下为网易云原生逻辑保持不变
   currentPlayingSong = songInfo;
   lastTrackId = songInfo.Id;
 
@@ -707,7 +739,7 @@ async function startFoliaRadar() {
       } catch (e) {}
     },
     onClose: () => {
-      if (ws !== foliaWs) return; // 忽略旧连接的关闭事件
+      if (ws !== foliaWs) return;
       isCdpConnected = false;
       if (!foliaWsIntentionalClose) {
         writeLog('⚠️ [雷达] Folia WebSocket 意外断开，3秒后重连...', 'Yellow');
@@ -1068,39 +1100,59 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
     let playSongId = '';
     let displaySong: any = null;
 
+    // ⭐ 精准强力的正则表达式识别 id=
+    const idMatch = keyword.match(/^id\s*=\s*(\d+)/i);
+
     if (appConfig.sysConfig?.PlayerType === 'Folia') {
       const token = appConfig.sysConfig?.FoliaToken?.trim();
-      // 彻底切断网易云 API，直接原味使用 Folia 官方查询结果
-      const searchRes = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/search`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: keyword, limit: 1 })
-      });
-      if (!searchRes.ok) throw new Error(`HTTP ${searchRes.status}`);
-      const searchData = await searchRes.json();
-      const foliaSongs = searchData.songs || [];
 
-      if (foliaSongs.length > 0) {
-        const fsong = foliaSongs[0];
-        playSongId = String(fsong.songId || fsong.id);
+      if (idMatch) {
+        // ⭐ 1. 命中 Folia ID 点歌：通过公开 API 获取歌曲名称及歌手用于 Overlay 界面展示
+        const songId = idMatch[1];
+        playSongId = songId;
+        displaySong = { name: `ID点歌: ${songId}`, artist: '未知歌手' };
+        try {
+          const res = await fetch(`https://music.163.com/api/song/detail/?id=${songId}&ids=%5B${songId}%5D`, { method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' } });
+          if (res.ok) {
+            const data = await res.json().catch(() => null);
+            const songs = data?.songs || [];
+            if (songs.length > 0) {
+              displaySong = { name: songs[0].name, artist: songs[0].artists?.map((a: any) => a.name).join('/') || songs[0].ar?.map((a: any) => a.name).join('/') || '未知歌手' };
+            }
+          }
+        } catch { /* 忽略网络异常，保留兜底数据 */ }
+      } else {
+        // ⭐ 2. 命中 Folia 歌名点歌：使用原汁原味的 Folia 官方 Search 接口
+        const searchRes = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/search`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: keyword, limit: 1 })
+        });
+        if (!searchRes.ok) throw new Error(`HTTP ${searchRes.status}`);
+        const searchData = await searchRes.json();
+        const foliaSongs = searchData.songs || [];
 
-        // 直接使用 Folia 返回的歌手信息，官方已支持纯字符串数组
-        let artistStr = '未知歌手';
-        if (Array.isArray(fsong.artists)) {
-          artistStr = fsong.artists.map((a: any) => typeof a === 'string' ? a : a.name).join('/');
-        } else if (fsong.artist) {
-          artistStr = fsong.artist;
+        if (foliaSongs.length > 0) {
+          const fsong = foliaSongs[0];
+          playSongId = String(fsong.songId || fsong.id);
+
+          let artistStr = '未知歌手';
+          if (Array.isArray(fsong.artists)) {
+            artistStr = fsong.artists.map((a: any) => typeof a === 'string' ? a : a.name).join('/');
+          } else if (fsong.artist) {
+            artistStr = fsong.artist;
+          }
+
+          displaySong = {
+            name: fsong.title || fsong.name || keyword,
+            artist: artistStr
+          };
         }
-
-        displaySong = {
-          name: fsong.title || fsong.name || keyword,
-          artist: artistStr
-        };
       }
     } else {
       // 原有网易云点歌逻辑，保持不变
-      if (keyword.startsWith('id=')) {
-        const songId = keyword.substring(3).trim();
+      if (idMatch) {
+        const songId = idMatch[1];
         const res = await fetch(`https://music.163.com/api/song/detail/?id=${songId}&ids=%5B${songId}%5D`, { method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' } });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const songs = (await res.json()).songs || [];
@@ -1404,24 +1456,33 @@ function startBackendServer() {
         const { keyword } = JSON.parse(await readRequestBody(req));
         let playSongId = '';
 
-        // 独立分两头处理面板的调试请求，保持和真实弹幕逻辑一致
+        const idMatch = keyword.match(/^id\s*=\s*(\d+)/i);
+
         if (appConfig.sysConfig?.PlayerType === 'Folia') {
           const token = appConfig.sysConfig?.FoliaToken?.trim();
-          const searchRes = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/search`, {
-            method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: keyword, limit: 1 })
-          });
-          const searchData = await searchRes.json();
-          const foliaSongs = searchData.songs || [];
-          if (foliaSongs.length > 0) playSongId = String(foliaSongs[0].songId || foliaSongs[0].id);
+          if (idMatch) {
+            playSongId = String(idMatch[1]);
+          } else {
+            const searchRes = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/search`, {
+              method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ query: keyword, limit: 1 })
+            });
+            const searchData = await searchRes.json();
+            const foliaSongs = searchData.songs || [];
+            if (foliaSongs.length > 0) playSongId = String(foliaSongs[0].songId || foliaSongs[0].id);
+          }
         } else {
-          const searchRes = await fetch(`https://music.163.com/api/search/get/web`, {
-            method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' },
-            body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
-          });
-          const searchData: any = await searchRes.json();
-          const songs = searchData.result?.songs || [];
-          if (songs.length > 0) playSongId = String(songs[0].id);
+          if (idMatch) {
+            playSongId = String(idMatch[1]);
+          } else {
+            const searchRes = await fetch(`https://music.163.com/api/search/get/web`, {
+              method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' },
+              body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
+            });
+            const searchData: any = await searchRes.json();
+            const songs = searchData.result?.songs || [];
+            if (songs.length > 0) playSongId = String(songs[0].id);
+          }
         }
 
         if (playSongId) {

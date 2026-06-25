@@ -67,6 +67,21 @@ process.on('unhandledRejection', (reason) => {
 let overlayWindow: BrowserWindow | null = null;
 let adminWindow: BrowserWindow | null = null;
 
+// ⭐ 新增：智能获取国内 IP 伪装头部绕过版权与海外连接封锁
+function getChinaBypassHeaders(): Record<string, string> {
+  const chinaIPs = [
+    "218.75.111.114",  // 浙江杭州 电信
+    "111.206.176.1",   // 北京 联通
+    "112.12.12.12",    // 浙江 移动
+    "223.5.5.5"        // 阿里公共DNS
+  ];
+  const fakeIP = chinaIPs[Math.floor(Math.random() * chinaIPs.length)];
+  return {
+    "X-Real-IP": fakeIP,
+    "X-Forwarded-For": fakeIP
+  };
+}
+
 function getDevUrl(): string | undefined {
   return process.env['VITE_DEV_SERVER_URL'] || process.env['ELECTRON_RENDERER_URL'];
 }
@@ -179,9 +194,6 @@ ipcMain.on('overlay-resize', (event, w, h) => {
   }
 });
 
-// ==========================================
-// 数据持久化与全局状态管理
-// ==========================================
 const CONFIG_PATH = path.join(app.getPath('userData'), 'bili_bot_config.json');
 
 let appConfig: any = {
@@ -413,7 +425,6 @@ function syncTrackChangeLogic(currId: string, currName: string, nextId: string |
   let stateChanged = false;
 
   if (!isPlaying) {
-    // 增加 ?.Id 防护，避免越界访问
     if (targetQueue.length > 0 && currId === targetQueue[0]?.Id) {
       writeLog(`[状态同步] 处于暂停状态，自动跳过待播曲目以防消耗: ${targetQueue[0]?.SongName}`, 'Yellow');
       playNextSong();
@@ -475,16 +486,8 @@ function syncTrackChangeLogic(currId: string, currName: string, nextId: string |
   }
 }
 
-// ==========================================
-// ⭐ Folia 官方 API 接口封装 (固定 32107 端口)
-// ==========================================
 const FOLIA_HTTP_PORT = 32107;
 
-// ==========================================
-// 播放控制大一统抽象层
-// ==========================================
-
-// ⭐ 新增：Folia 全局并发操作锁，防止强控连招期间被其他弹幕指令插足
 let isFoliaHandlingAction = false;
 
 async function playNextSong(): Promise<boolean> {
@@ -497,7 +500,7 @@ async function playNextSong(): Promise<boolean> {
     const token = appConfig.sysConfig?.FoliaToken?.trim();
     if (!token) return false;
 
-    isFoliaHandlingAction = true; // 上锁
+    isFoliaHandlingAction = true;
     try {
       writeLog(`[切歌] 正在向 Folia 发送 next 控制指令...`, 'Cyan');
       const res = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
@@ -506,18 +509,16 @@ async function playNextSong(): Promise<boolean> {
         body: JSON.stringify({ action: 'next' })
       });
 
-      // 如果 Folia 拒绝切歌 (报409等，说明其播放队列没下一首)，强制人工干预
       if (!res.ok) {
         writeLog(`[切歌] Folia 拒绝执行 next (状态码: ${res.status})，执行强力回退干预...`, 'Yellow');
         if (targetQueue.length > 0) {
           const nextSong = targetQueue.shift();
           if (nextSong) {
             writeLog(`[切歌] 强行拉起待播队列首曲: ${nextSong.SongName}`, 'Magenta');
-            isFoliaHandlingAction = false; // ⭐ 切歌补偿需要先解开锁，让 forcePlay 顺利执行
+            isFoliaHandlingAction = false;
             await forcePlaySongAsync(nextSong);
           }
         } else {
-          // 队列空了，发送强制暂停清空界面
           await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -534,7 +535,7 @@ async function playNextSong(): Promise<boolean> {
       writeLog(`[切歌] Folia 通信异常: ${err.message}`, 'Red');
       return false;
     } finally {
-      isFoliaHandlingAction = false; // 兜底解锁
+      isFoliaHandlingAction = false;
     }
   } else {
     return await sendCDPCommand(FiberStoreExtractJs + `;if(_ensureStore()){window._reduxStore.dispatch({type:'async:action/doAction',payload:{actionId:'playNext',data:{eventType:'click'}}});}`);
@@ -542,12 +543,11 @@ async function playNextSong(): Promise<boolean> {
 }
 
 async function insertNextSongViaCDP(songId: string) {
-  if (!songId) return; // 增加防空保护
+  if (!songId) return;
   if (appConfig.sysConfig?.PlayerType === 'Folia') {
     const token = appConfig.sysConfig?.FoliaToken?.trim();
     if (!token) return;
     try {
-      // 彻底遵守 Folia 队列插入协议，传送纯数字 songId
       const res = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/queue`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -568,68 +568,24 @@ async function insertNextSongViaCDP(songId: string) {
   await sendCDPCommand(script);
 }
 
-// ⭐ 加了空值检查(!songInfo) 和同曲重播防护的终极版强制播放
 async function forcePlaySongAsync(songInfo: any) {
-  if (!songInfo) return; // 防止参数为空导致读取 Id 抛错导致应用崩溃
+  if (!songInfo) return;
 
   if (appConfig.sysConfig?.PlayerType === 'Folia') {
     if (isFoliaHandlingAction) {
       writeLog(`[防抖] Folia 正在处理上一首的切歌连招，暂不接受新的强制播放: ${songInfo.SongName}。已将其退回队列首位等待自然衔接！`, 'Yellow');
-      targetQueue.unshift(songInfo); // 防丢保护，塞回队首
+      targetQueue.unshift(songInfo);
       return;
     }
 
-    isFoliaHandlingAction = true; // ⭐ 全局锁定，期间暂不接受其他的直接播放请求
+    isFoliaHandlingAction = true;
 
     currentPlayingSong = songInfo;
-
-    // ⭐ 核心修复：比对即将播放的歌曲 ID 和当前 Folia 实际正在播的 lastTrackId 是否相同
-    const isSameSong = String(songInfo.Id) === String(lastTrackId);
     lastTrackId = songInfo.Id;
 
     const token = appConfig.sysConfig?.FoliaToken?.trim();
     if (!token) {
       isFoliaHandlingAction = false;
-      return;
-    }
-
-    // ⭐ 如果正在播放的歌 刚好也是下一首/或者强制跳转这首，直接发起一键原地重播指令
-    if (isSameSong) {
-      writeLog(`[重新播放] 检测到目标歌曲与当前播放相同，优先发起原地重开 (Seek 0ms)...`, 'Cyan');
-      try {
-        const seekRes = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'seek', positionMs: 0 })
-        });
-        if (seekRes.ok) {
-          writeLog(`[重新播放] Seek 0ms 发送并重播成功`, 'Green');
-          isFoliaHandlingAction = false;
-          return;
-        } else {
-          writeLog(`[重新播放] Seek 0ms 遭拒（状态码: ${seekRes.status}），退切退回补偿控制...`, 'Yellow');
-        }
-      } catch (e: any) {
-        writeLog(`[重新播放] Seek 异常: ${e.message}，尝试退切补偿连招...`, 'Yellow');
-      }
-
-      // 补偿退切：快速下一首再退回上一首
-      try {
-        await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
-          method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'next' })
-        });
-        await new Promise(resolve => setTimeout(resolve, 300));
-        await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
-          method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'prev' })
-        });
-        writeLog(`[重新播放] 退切连招补偿成功完成！`, 'Green');
-      } catch (e: any) {
-        writeLog(`[重新播放] 退切连招失败: ${e.message}`, 'Red');
-      } finally {
-        isFoliaHandlingAction = false;
-      }
       return;
     }
 
@@ -772,25 +728,57 @@ async function restartNCMWithDebugPort() {
   let exePath = appConfig.sysConfig?.NcmExePath || '';
   isCdpConnected = false;
 
-  if (exePath && fs.existsSync(exePath)) {
-    writeLog('>>> [系统] 使用缓存的网易云音乐路径启动...', 'DarkGray');
-  } else {
-    exePath = '';
-    try {
-      const psCmd = `powershell -NoProfile -Command "$p=(Get-Process cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1).Path; if($p){[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($p))}"`;
-      const { stdout } = await execAsync(psCmd);
-      const b64 = stdout.trim();
-      if (b64) exePath = Buffer.from(b64, 'base64').toString('utf8');
-    } catch {}
+  let runningPath = '';
+  try {
+    const psCmd = `powershell -NoProfile -Command "$p=(Get-Process cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1).Path; if($p){[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($p))}"`;
+    const { stdout } = await execAsync(psCmd);
+    const b64 = stdout.trim();
+    if (b64) runningPath = Buffer.from(b64, 'base64').toString('utf8');
+  } catch {}
 
-    if (!exePath || !fs.existsSync(exePath)) {
-      const possiblePaths = [
-        process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Netease', 'CloudMusic', 'cloudmusic.exe'),
-        process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'Netease', 'CloudMusic', 'cloudmusic.exe'),
-        'C:\\Program Files (x86)\\Netease\\CloudMusic\\cloudmusic.exe', 'D:\\Program Files (x86)\\Netease\\CloudMusic\\cloudmusic.exe',
-        'D:\\软件\\网易云音乐\\cloudmusic.exe', 'E:\\Program Files (x86)\\Netease\\CloudMusic\\cloudmusic.exe'
-      ].filter(Boolean) as string[];
-      for (const p of possiblePaths) { if (fs.existsSync(p)) { exePath = p; break; } }
+  // ⭐ 新增功能：若当前无进程运行且无保存路径，自动利用 PowerShell 查询注册表寻回安装路径并启动网易云音乐
+  if (!runningPath && !exePath) {
+    writeLog(">>> [系统] 未检测到运行中的网易云进程且缓存配置为空，开始查询 Windows 注册表...", "Cyan");
+    try {
+      const regCmd = `powershell -NoProfile -Command "
+        $paths = @(
+          'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\网易云音乐',
+          'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\网易云音乐'
+        );
+        foreach ($path in $paths) {
+          if (Test-Path $path) {
+            $val = (Get-ItemProperty -Path $path -Name 'DisplayIcon' -ErrorAction SilentlyContinue).DisplayIcon;
+            if ($val) {
+              $val = $val.Trim('\"');
+              [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($val));
+              break;
+            }
+          }
+        }
+      "`;
+      const { stdout } = await execAsync(regCmd);
+      const regB64 = stdout.trim();
+      if (regB64) {
+        const regPath = Buffer.from(regB64, 'base64').toString('utf8').trim();
+        if (regPath && fs.existsSync(regPath)) {
+          exePath = regPath;
+          appConfig.sysConfig.NcmExePath = exePath;
+          saveConfig();
+          writeLog(`>>> [系统] 成功从 Windows 注册表自动检索到网易云物理路径: ${exePath}`, "Green");
+        }
+      }
+    } catch (regErr: any) {
+      writeLog(`⚠️ [系统] 注册表寻回路标失败: ${regErr.message}`, "Yellow");
+    }
+  }
+
+  // 如果提取到了正在运行中的程序路径，自动同步并保存
+  if (runningPath) {
+    exePath = runningPath;
+    if (appConfig.sysConfig?.NcmExePath !== exePath) {
+      if (!appConfig.sysConfig) appConfig.sysConfig = {};
+      appConfig.sysConfig.NcmExePath = exePath;
+      saveConfig();
     }
   }
 
@@ -803,17 +791,11 @@ async function restartNCMWithDebugPort() {
   const cdpPort = appConfig.sysConfig?.CdpPort || 9222;
 
   if (exePath && fs.existsSync(exePath)) {
-    if (appConfig.sysConfig?.NcmExePath !== exePath) {
-      if (!appConfig.sysConfig) appConfig.sysConfig = {};
-      appConfig.sysConfig.NcmExePath = exePath;
-      saveConfig();
-    }
-    writeLog(`>>> [系统] 成功锁定网易云执行文件: ${exePath}`, 'Cyan');
+    writeLog(`>>> [系统] 🚀 已发令带调试端口 (${cdpPort}) 重新启动网易云音乐！等待其加载...`, 'Green');
     try {
       const cwd = path.dirname(exePath);
       const ncmProcess = spawn(exePath, [`--remote-debugging-port=${cdpPort}`], { cwd, detached: true, stdio: 'ignore' });
       ncmProcess.unref();
-      writeLog(`>>> [系统] 🚀 已发令带调试端口 (${cdpPort}) 重新启动网易云音乐！等待其加载...`, 'Green');
     } catch (err: any) { writeLog(`❌ [错误] 启动网易云失败: ${err?.message || err}`, 'Red'); }
   } else {
     writeLog('⚠️ [提示] 找不到网易云音乐安装路径，请手动以调试模式启动！', 'Yellow');
@@ -1024,7 +1006,7 @@ async function startCDPRadar() {
 }
 
 // ==========================================
-// 核心功能：获取真正的 Bilibili 头像
+// 核心功能：获取 B站 头像与用户信息
 // ==========================================
 async function getBiliAvatar(uid: string): Promise<string> {
   try {
@@ -1100,19 +1082,26 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
     let playSongId = '';
     let displaySong: any = null;
 
-    // ⭐ 精准强力的正则表达式识别 id=
+    // 正则表达式匹配 id=
     const idMatch = keyword.match(/^id\s*=\s*(\d+)/i);
 
     if (appConfig.sysConfig?.PlayerType === 'Folia') {
       const token = appConfig.sysConfig?.FoliaToken?.trim();
 
       if (idMatch) {
-        // ⭐ 1. 命中 Folia ID 点歌：通过公开 API 获取歌曲名称及歌手用于 Overlay 界面展示
+        // ⭐ 命中 Folia ID 点歌：通过公开 API 获取歌曲名称及歌手（注入 IP 绕过）
         const songId = idMatch[1];
         playSongId = songId;
         displaySong = { name: `ID点歌: ${songId}`, artist: '未知歌手' };
         try {
-          const res = await fetch(`https://music.163.com/api/song/detail/?id=${songId}&ids=%5B${songId}%5D`, { method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' } });
+          const res = await fetch(`https://music.163.com/api/song/detail/?id=${songId}&ids=%5B${songId}%5D`, {
+            method: 'GET',
+            headers: {
+              'User-Agent': 'Mozilla/5.0',
+              'Cookie': 'os=pc; appver=2.9.8;',
+              ...getChinaBypassHeaders() // ⭐ 注入国内 IP
+            }
+          });
           if (res.ok) {
             const data = await res.json().catch(() => null);
             const songs = data?.songs || [];
@@ -1122,7 +1111,7 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
           }
         } catch { /* 忽略网络异常，保留兜底数据 */ }
       } else {
-        // ⭐ 2. 命中 Folia 歌名点歌：使用原汁原味的 Folia 官方 Search 接口
+        // 命中 Folia 歌名点歌：使用 Folia 官方 Search 接口
         const searchRes = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/search`, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -1150,10 +1139,17 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
         }
       }
     } else {
-      // 原有网易云点歌逻辑，保持不变
+      // 原有网易云点歌逻辑：带国内 IP 伪装注入
       if (idMatch) {
         const songId = idMatch[1];
-        const res = await fetch(`https://music.163.com/api/song/detail/?id=${songId}&ids=%5B${songId}%5D`, { method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' } });
+        const res = await fetch(`https://music.163.com/api/song/detail/?id=${songId}&ids=%5B${songId}%5D`, {
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0',
+            'Cookie': 'os=pc; appver=2.9.8;',
+            ...getChinaBypassHeaders() // ⭐ 注入国内 IP
+          }
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const songs = (await res.json()).songs || [];
         if (songs.length > 0) {
@@ -1161,7 +1157,16 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
           displaySong = { name: songs[0].name, artist: songs[0].artists?.map((a: any) => a.name).join('/') || songs[0].ar?.map((a: any) => a.name).join('/') || '未知歌手' };
         }
       } else {
-        const res = await fetch(`https://music.163.com/api/search/get/web`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' }, body: `s=${encodeURIComponent(keyword)}&type=1&limit=1` });
+        const res = await fetch(`https://music.163.com/api/search/get/web`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'Mozilla/5.0',
+            'Cookie': 'os=pc; appver=2.9.8;',
+            ...getChinaBypassHeaders() // ⭐ 注入国内 IP
+          },
+          body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const songs = (await res.json()).result?.songs || [];
         if (songs.length > 0) {
@@ -1476,7 +1481,13 @@ function startBackendServer() {
             playSongId = String(idMatch[1]);
           } else {
             const searchRes = await fetch(`https://music.163.com/api/search/get/web`, {
-              method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', 'Cookie': 'os=pc; appver=2.9.8;' },
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'Mozilla/5.0',
+                'Cookie': 'os=pc; appver=2.9.8;',
+                ...getChinaBypassHeaders() // ⭐ 注入国内 IP 伪装绕过
+              },
               body: `s=${encodeURIComponent(keyword)}&type=1&limit=1`
             });
             const searchData: any = await searchRes.json();

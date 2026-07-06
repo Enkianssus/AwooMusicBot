@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import path from 'node:path'
-import electron from 'vite-plugin-electron/simple'
+import electronSimple from 'vite-plugin-electron/simple'
+// 兼容不同 Node/打包环境下的 default 嵌套
+const electron = (electronSimple as any).default ?? electronSimple
 import react from '@vitejs/plugin-react'
 
 // https://vitejs.dev/config/

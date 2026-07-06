@@ -1,7 +1,7 @@
 {
   "name": "bilincm-ts",
   "private": true,
-  "version": "1.0.9",
+  "version": "1.0.11",
   "type": "module",
   "description": "B站点歌机 TypeScript 客户端",
   "author": "Enkianssus",

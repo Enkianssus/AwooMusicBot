@@ -183,6 +183,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [toasts, setToasts] = useState<ToastInfo[]>([]);
     const lastToastTimeRef = useRef<number>(0);
     const lastSyncTimeRef = useRef<number>(0);
+    const appsIssueToastShownRef = useRef<boolean>(false);
 
     const triggerToast = (msg: string) => {
         const id = Date.now() + Math.random();
@@ -317,6 +318,17 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 if (typeof json.cdpConnected === 'boolean') {
                     setIsCdpConnected(json.cdpConnected);
                 }
+
+                // ⭐ 针对 WindowsApps 启动权限错误的 Overlay 静默诊断与浮窗强提示
+                if (json.status && (json.status.includes('EPERM') || json.status.includes('WindowsApps'))) {
+                    if (!appsIssueToastShownRef.current) {
+                        appsIssueToastShownRef.current = true;
+                        triggerToast("⚠️ 启动失败！检测到网易云可能处于系统安全目录下(WindowsApps)或发生权限问题。请点击设置进入控制面板查看异常排查指南！");
+                    }
+                } else {
+                    appsIssueToastShownRef.current = false;
+                }
+
             } catch { setIsConnected(false); }
         };
         fetchData();
@@ -932,6 +944,14 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const [sysLogs, setSysLogs] = useState<SysLog[]>([]);
     const logsEndRef = useRef<HTMLDivElement>(null);
 
+    // ⭐ 新增: 自动滚动日志锁定与日志容器引用
+    const [autoScroll, setAutoScroll] = useState<boolean>(true);
+    const logContainerRef = useRef<HTMLDivElement>(null);
+
+    // ⭐ 新增: 智能诊断警告触发状态
+    const [hasWindowsAppsIssue, setHasWindowsAppsIssue] = useState<boolean>(false);
+    const [hasBiliLoopIssue, setHasBiliLoopIssue] = useState<boolean>(false);
+
     const [superUserInput, setSuperUserInput] = useState<string>('');
     const [debugInput, setDebugInput] = useState<string>('');
 
@@ -1032,8 +1052,8 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         return () => clearInterval(timer);
     }, [activeTab]);
 
+    // ⭐ 改动：不管处于哪个 Tab 都会在后台静默轮询日志进行环境检测（如果是 logs tab 轮询频率调至 1秒，其他 tab 为 2.5秒）
     useEffect(() => {
-        if (activeTab !== 'logs') return;
         const fetchLogs = async () => {
             try {
                 const res = await fetch('http://localhost:5555/api/logs');
@@ -1042,15 +1062,54 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
             } catch {}
         };
         fetchLogs();
-        const timer = setInterval(fetchLogs, 1000);
+        const intervalTime = activeTab === 'logs' ? 1000 : 2500;
+        const timer = setInterval(fetchLogs, intervalTime);
         return () => clearInterval(timer);
     }, [activeTab]);
 
+    // ⭐ 新增: 实时自动化诊断错误关键字分析
     useEffect(() => {
-        if (activeTab === 'logs' && logsEndRef.current) {
-            logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        if (sysLogs.length === 0) return;
+
+        // 1. 诊断 WindowsApps / spawn EPERM 权限受阻
+        const winAppsError = sysLogs.some(log =>
+            log.Message.includes('spawn EPERM') ||
+            log.Message.includes('WindowsApps') ||
+            log.Message.includes('权限不足')
+        );
+        setHasWindowsAppsIssue(winAppsError);
+
+        // 2. 诊断 B站 直播间 WebSocket 连接断线环路 (重复产生连接事件)
+        const connectEvents = sysLogs.filter(log =>
+            log.Message.includes('直播间已连接') ||
+            log.Message.includes('弹幕监控启动')
+        );
+        // 如果日志中多次出现该日志，且相互间隔排布，说明正在遭遇频繁断线重连问题
+        setHasBiliLoopIssue(connectEvents.length >= 2);
+
+    }, [sysLogs]);
+
+    // ⭐ 新增: 处理日志自适应滚动和手动阅读判定
+    const handleLogScroll = () => {
+        const el = logContainerRef.current;
+        if (!el) return;
+
+        // 判定用户是否已经滚动到最下方 (误差距离 45px)
+        const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 45;
+
+        if (isAtBottom && !autoScroll) {
+            setAutoScroll(true); // 恢复自动滚动
+        } else if (!isAtBottom && autoScroll) {
+            setAutoScroll(false); // 锁定滚动，支持用户自由阅读
         }
-    }, [sysLogs, activeTab]);
+    };
+
+    // ⭐ 改动: 仅当 autoScroll 为开启状态时执行平滑置底滚动
+    useEffect(() => {
+        if (activeTab === 'logs' && autoScroll && logContainerRef.current) {
+            logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+        }
+    }, [sysLogs, activeTab, autoScroll]);
 
     const handleConnectRoom = async () => {
         const rid = parseInt(roomIdInput);
@@ -1151,7 +1210,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         } catch(err: any) { showAdminToast("❌ 请求后端失败：" + err.message); }
     };
 
-    // ⭐ 增加了错误状态识别和 Toast 拦截提示
+    // ⭐ 增加了错误状态识别 and Toast 拦截提示
     const handleDebugPlayNext = async () => {
         try {
             const res = await fetch('http://localhost:5555/api/debug/play_next', { method: 'POST' });
@@ -1207,14 +1266,14 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
             config: { ...prev.config, PlayerType: type }
         }));
 
-        // ⭐ 防抖逻辑：如果 1.2 秒内用户又切了播放器，清除之前的定时器
+        // ⭐ 如果 1.2 秒内用户又切了播放器，清除之前的定时器
         if (restartTimerRef.current) {
             clearTimeout(restartTimerRef.current);
         }
 
         showAdminToast("已切换播放器，等待自动保存后将自动重连...");
 
-        // ⭐ 设置 1.2 秒定时器 (设定为 1200ms 是为了绝对保证上方的 800ms 自动保存逻辑先执行完毕)
+        // ⭐ 设置 1.2 秒定时器 (确保 800ms 的自动保存完成后触发重连)
         restartTimerRef.current = setTimeout(() => {
             handleRestartNCM();
         }, 1200);
@@ -1248,6 +1307,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                         { id: 'status', icon: '🏠', label: '运行状态' },
                         { id: 'settings', icon: '⚙️', label: '基础设置' },
                         { id: 'logs', icon: '📝', label: '运行日志' },
+                        { id: 'faq', icon: '❓', label: '常见问题' },
                         { id: 'login', icon: '📱', label: '扫码登录' },
                         { id: 'update', icon: '🚀', label: '版本升级' },
                         { id: 'debug', icon: '🐞', label: '调试测试' }
@@ -1263,6 +1323,60 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                         <div className="h-full flex items-center justify-center text-white/50">正在连接后端服务...</div>
                     ) : (
                         <div className="max-w-3xl mx-auto">
+
+                            {/* ⭐ 新增: 全局联动智能异常自诊断提示栏 (在所有Tab的最上方持续警醒显示) */}
+                            {(hasWindowsAppsIssue || hasBiliLoopIssue) && (
+                                <div className="mb-6 space-y-3 animate-fadeIn">
+                                    {hasWindowsAppsIssue && (
+                                        <div className="bg-red-500/15 border border-red-500/30 p-4 rounded-xl flex items-start gap-3 text-red-200 shadow-lg">
+                                            <span className="text-xl shrink-0 mt-0.5">⚠️</span>
+                                            <div className="text-xs space-y-1 flex-1">
+                                                <div className="font-bold text-red-400 text-sm">检测到网易云音乐启动受阻 (spawn EPERM)</div>
+                                                <p className="leading-relaxed text-gray-300">
+                                                    当前点歌机自动锁定并运行的路径带有 <code className="text-red-300 bg-red-950 px-1 py-0.5 rounded font-mono">WindowsApps</code>。
+                                                    说明您之前安装并使用的是 **Windows 应用商店版网易云**，该版本运行于独立受保沙盒中，系统强行阻止一切第三方点歌机直接将其调起控制。
+                                                </p>
+                                                <div className="pt-2 flex flex-col sm:flex-row gap-2">
+                                                    <span className="font-bold text-white bg-red-500/30 px-2 py-0.5 rounded shrink-0 self-start">核心解决方案</span>
+                                                    <span className="text-gray-200">
+                                                        请前往系统控制面板中<strong>彻底卸载微软商店版网易云</strong>，然后必须前往 <a href="https://music.163.com/" target="_blank" rel="noreferrer" className="text-blue-400 underline font-bold hover:text-blue-300">网易云音乐官方网站</a> 重新下载 Win32 传统安装包。安装完成后，删除或清理点歌机的旧路径缓存后再启动。
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {hasBiliLoopIssue && (
+                                        <div className="bg-amber-500/15 border border-amber-500/30 p-4 rounded-xl flex items-start gap-3 text-amber-200 shadow-lg">
+                                            <span className="text-xl shrink-0 mt-0.5">🌐</span>
+                                            <div className="text-xs space-y-1.5 flex-1">
+                                                <div className="font-bold text-amber-400 text-sm">检测到 B站弹幕监控连接不断断线重连</div>
+                                                <p className="leading-relaxed text-gray-300">
+                                                    诊断发现日志中正在密集、频繁地重复刷新“<span className="text-amber-300">直播间已连接，弹幕监控启动！</span>”。这代表弹幕服务器连接在建立成功后瞬间遭遇断裂阻碍。
+                                                </p>
+                                                <div className="pt-1 flex flex-col gap-1 text-gray-200 bg-black/20 p-2.5 rounded-lg border border-white/5">
+                                                    <div className="font-bold text-white flex items-center gap-1">🛠️ 请依序排查以下3项：</div>
+                                                    <ul className="list-decimal pl-4 space-y-1 text-gray-300 mt-1">
+                                                        <li>
+                                                            <strong className="text-white">关闭全局 VPN/代理网络：</strong>
+                                                            如果您使用了纯美国或其他海外节点的全局梯子，B站会出于风控安全直接拒绝/掐断来自这些回环 IP 的直播 Websocket 连接。请尝试**关掉代理**，或切回**国内节点**，或在梯子中设置**绕过本地主机 / PAC分流模式**。
+                                                        </li>
+                                                        <li>
+                                                            <strong className="text-white">重新登录：</strong>
+                                                            有些时候 B站 连接握手鉴权信息超时失效也会导致不断被断线重连。请前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300 focus:outline-none" onClick={() => setActiveTab('login')}>扫码登录</button> 页，重新绑定登录任意一个普通的 B站 账号获取全新的连接状态。
+                                                        </li>
+                                                        <li>
+                                                            <strong className="text-white">核对房间号：</strong>
+                                                            请务必输入正确的**直播间数字房间号**，而绝非主播的个人 UID。
+                                                        </li>
+                                                    </ul>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
                             {activeTab === 'status' && (
                                 <div className="space-y-6 animate-slide-in-right flex flex-col h-full">
                                     <div>
@@ -1326,19 +1440,168 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
                             {activeTab === 'logs' && (
                                 <div className="space-y-4 animate-slide-in-right flex flex-col h-[70vh]">
-                                    <h2 className="text-2xl font-bold text-white mb-2">后端实时日志 (Log)</h2>
-                                    <div className="flex-1 bg-[#090b0f] rounded-xl border border-white/10 p-4 font-mono text-[13px] overflow-y-auto custom-scrollbar flex flex-col gap-2 shadow-inner">
-                                        {sysLogs.length === 0 ? (
-                                            <div className="text-gray-500 text-center mt-10">暂无日志...</div>
-                                        ) : (
-                                            sysLogs.map((log, i) => (
-                                                <div key={i} className="flex gap-4 leading-relaxed">
-                                                    <span className="text-gray-600 shrink-0">[{log.Time}]</span>
-                                                    <span style={{color: mapConsoleColor(log.Color)}} className="break-all whitespace-pre-wrap">{log.Message}</span>
-                                                </div>
-                                            ))
+                                    <div className="flex justify-between items-center pr-2">
+                                        <h2 className="text-2xl font-bold text-white mb-2">后端实时日志 (Log)</h2>
+                                        {/* ⭐ 新增: 精致的滚动模式控制开关，让用户在阅读日志时可手动锁定 */}
+                                        <div className="flex items-center gap-3 bg-black/40 px-3 py-1.5 rounded-lg border border-white/5">
+                                            <label className="text-xs text-gray-400 flex items-center gap-1.5 cursor-pointer select-none">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={autoScroll}
+                                                    onChange={e => {
+                                                        setAutoScroll(e.target.checked);
+                                                        if (e.target.checked && logContainerRef.current) {
+                                                            logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+                                                        }
+                                                    }}
+                                                    className="w-3.5 h-3.5 rounded border-white/20 bg-black/50 text-blue-500 focus:ring-0 cursor-pointer"
+                                                />
+                                                <span>自动滚动</span>
+                                            </label>
+                                            <div className="w-[1px] h-3 bg-white/10"></div>
+                                            <button
+                                                onClick={() => {
+                                                    setAutoScroll(true);
+                                                    if (logContainerRef.current) {
+                                                        logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+                                                    }
+                                                }}
+                                                className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors"
+                                            >
+                                                ⬇️ 滚到底部
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    {/* ⭐ 改动: 日志容器加入 ref 监听和 scroll 回调事件，检测用户向上翻页操作并智能关闭 autoScroll */}
+                                    <div className="flex-1 relative min-h-0">
+                                        <div
+                                            ref={logContainerRef}
+                                            onScroll={handleLogScroll}
+                                            className="w-full h-full bg-[#090b0f] rounded-xl border border-white/10 p-4 font-mono text-[13px] overflow-y-auto custom-scrollbar flex flex-col gap-2 shadow-inner"
+                                        >
+                                            {sysLogs.length === 0 ? (
+                                                <div className="text-gray-500 text-center mt-10">暂无日志...</div>
+                                            ) : (
+                                                sysLogs.map((log, i) => (
+                                                    <div key={i} className="flex gap-4 leading-relaxed">
+                                                        <span className="text-gray-600 shrink-0">[{log.Time}]</span>
+                                                        <span style={{color: mapConsoleColor(log.Color)}} className="break-all whitespace-pre-wrap">{log.Message}</span>
+                                                    </div>
+                                                ))
+                                            )}
+                                            <div ref={logsEndRef} className="h-[2px]" />
+                                        </div>
+
+                                        {/* ⭐ 新增: 当 autoScroll 在用户查阅日志时被锁定，显示极为好看和友好的动态按钮，一键恢复置底滚动 */}
+                                        {!autoScroll && (
+                                            <button
+                                                onClick={() => {
+                                                    setAutoScroll(true);
+                                                    if (logContainerRef.current) {
+                                                        logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+                                                    }
+                                                }}
+                                                className="absolute bottom-4 right-4 bg-blue-600 hover:bg-blue-500 text-white px-3 py-2 rounded-full shadow-lg text-xs font-bold transition-all flex items-center gap-1.5 animate-bounce select-none border border-blue-400/30"
+                                            >
+                                                <span>⬇️</span> 自动滚动已暂停 (点击恢复)
+                                            </button>
                                         )}
-                                        <div ref={logsEndRef} />
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* ⭐ 新增: 常见问题异常排查 FAQ 界面 */}
+                            {activeTab === 'faq' && (
+                                <div className="space-y-6 animate-slide-in-right pb-10">
+                                    <h2 className="text-2xl font-bold text-white mb-6">❓ 常见问题与自助诊断</h2>
+
+                                    {/* FAQ CARD 1: 网易云无法控制 */}
+                                    <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-4 shadow-inner">
+                                        <h3 className="text-md font-bold text-red-400 flex items-center gap-2 pb-2 border-b border-white/5">
+                                            <span>🎵</span> 问题 1：点歌机启动网易云失败或无法控制（无法连接/雷达离线）？
+                                        </h3>
+
+                                        <div className="space-y-4 text-sm leading-relaxed text-gray-300">
+                                            <div>
+                                                <strong className="text-white block mb-1">诊断 A：检查您是否安装了“微软商店（Microsoft Store）”版本</strong>
+                                                <p className="text-xs text-gray-400 leading-relaxed">
+                                                    请进入控制面板的 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('logs')}>运行日志</button> 查看最近一轮网易云启动地址。若路径中包含 <code className="px-1.5 py-0.5 rounded bg-red-950 text-red-300 font-mono text-xs">WindowsApps</code> 文件夹（如 <code>C:\Program Files\WindowsApps\...</code>），则代表此应用是微软商店包。
+                                                </p>
+                                                <div className="mt-2 text-xs bg-black/40 p-3 rounded-lg border border-white/5">
+                                                    <span className="text-amber-400 font-bold block mb-1">为什么这会导致失败？</span>
+                                                    微软商店下载的版本处于系统严密沙箱保护中。Windows 规定任何第三方外部应用都**无权直接通过绝对路径调起**沙箱内的 `.exe`，因此会导致后端抛出 <strong>spawn EPERM</strong> 的“权限不足”报错。同时，沙盒内隔离了底层的 WebSocket 通信，令点歌雷达无法获取控制权。
+                                                </div>
+                                                <p className="text-xs text-gray-300 mt-2 font-bold flex items-center gap-1.5">
+                                                    <span className="text-green-400">💡 解决方案：</span>
+                                                    前往系统“已安装的应用”里<strong>卸载商店版网易云音乐</strong>，然后打开 <a href="https://music.163.com/" target="_blank" rel="noreferrer" className="text-cyan-400 font-bold underline hover:text-cyan-300">网易云官方网站</a> 下载传统的 Win32 客户端。重新安装后，请清理或重新选择点歌机里的扫描路径即可。
+                                                </p>
+                                            </div>
+
+                                            <div className="border-t border-white/5 pt-3">
+                                                <strong className="text-white block mb-1">诊断 B：端口占用情况（普通Win32版重试指南）</strong>
+                                                <p className="text-xs text-gray-400 leading-relaxed">
+                                                    如果是官网传统版本网易云仍然无法正常连接，可能是其默认的控制端口 <code className="text-blue-400 font-mono">9222</code> 被您的浏览器、网游加速器或其他注入软件提前占用。
+                                                </p>
+                                                <p className="text-xs text-gray-300 mt-2 font-bold flex items-center gap-1.5">
+                                                    <span className="text-green-400">💡 解决方案：</span>
+                                                    请切换至 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('settings')}>基础设置</button>，将网易云调试端口由 <code className="text-blue-400 font-mono">9222</code> 调整更改为 <code className="text-blue-400 font-mono">9223</code>（即原端口值 + 1），然后点击其右侧的<strong>“强制重载 / 重连”</strong>按钮！
+                                                </p>
+                                            </div>
+
+                                            <div className="border-t border-white/5 pt-3">
+                                                <strong className="text-white block mb-1">🛠️ 如何一键测试网易云是否控制成功？</strong>
+                                                <p className="text-xs text-gray-400 leading-relaxed">
+                                                    点歌机是否已完成对接，不需要真正等人点歌。直接前往控制面板的 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('debug')}>调试测试</button> 分页下，点击<strong>“模拟切歌指令：立即触发播放下一首”</strong>。如果您的电脑桌面端网易云音乐瞬间执行了切歌操作，说明连接控制已经**完全打通且完美在线**！
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* FAQ CARD 2: B站弹幕无法监控 */}
+                                    <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-4 shadow-inner">
+                                        <h3 className="text-md font-bold text-yellow-400 flex items-center gap-2 pb-2 border-b border-white/5">
+                                            <span>💬</span> 问题 2：在直播间里发送弹幕点歌，点歌机完全没有反应？
+                                        </h3>
+
+                                        <div className="space-y-4 text-sm leading-relaxed text-gray-300">
+                                            <div>
+                                                <strong className="text-white block mb-1">第一步：自测点歌机是否正常收到弹幕消息</strong>
+                                                <p className="text-xs text-gray-400 leading-relaxed">
+                                                    请前往您的 B 站直播间发送一条极其简单的测试弹幕：<code className="px-1 py-0.5 rounded bg-black/50 text-cyan-300 font-mono font-bold">test</code> 或 <code className="px-1 py-0.5 rounded bg-black/50 text-cyan-300 font-mono font-bold">测试</code>。
+                                                </p>
+                                                <p className="text-xs text-gray-400 leading-relaxed mt-1">
+                                                    随后，立刻在点歌机控制台点击 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('logs')}>运行日志</button> 翻阅刚刚产生的新记录，寻找是否出现了以下类似信息：
+                                                </p>
+                                                <code className="text-cyan-300 font-mono text-[12px] block bg-black/60 p-2.5 rounded border border-white/5 mt-1.5 select-all">
+                                                    [23:16:30] [弹幕] 测试通信: test
+                                                </code>
+                                                <p className="text-xs text-gray-400 leading-relaxed mt-1.5">
+                                                    <strong className="text-red-400">如果没有刷新任何弹幕日志：</strong> 代表您根本没有与 B 站直播间建立底层的物理网络连接。请看下方的第二步排查。
+                                                </p>
+                                            </div>
+
+                                            <div className="border-t border-white/5 pt-3">
+                                                <strong className="text-white block mb-1.5">第二步：依次进行网络、凭证和房间号校准排查</strong>
+                                                <ul className="list-decimal pl-5 space-y-2.5 text-xs text-gray-400">
+                                                    <li>
+                                                        <strong className="text-white">是否开启了全局代理梯子（如纯美国/海外节点 VPN）？</strong>
+                                                        如果您挂了全局科学上网，B站 的直播服务器检测到境外 IP 连接时，出于防爬虫与账号风控安全拦截策略，会<strong>直接掐灭并拒绝</strong> Websocket 弹幕回环请求，导致连接一直反复断开（频繁报“弹幕监控启动！”）。<br/>
+                                                        <strong className="text-green-400">解决方法：</strong> 请尝试彻底<strong>关闭全局网络代理（梯子）</strong>，切换回<strong>中国本地宽带/5G直连</strong>，或在梯子中设置 Bypass 局域网分流。
+                                                    </li>
+                                                    <li>
+                                                        <strong className="text-white">账号授权凭证失效？</strong>
+                                                        有时系统缓存的扫码登录身份由于过期被服务器丢弃，阻碍了后续的监视连接。<br/>
+                                                        <strong className="text-green-400">解决方法：</strong> 请前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('login')}>扫码登录</button> 重新生成一个登录二维码并重新扫码鉴权绑定。使用任意普通 B 站个人号登录均可成功拉取弹幕。
+                                                    </li>
+                                                    <li>
+                                                        <strong className="text-white">房间号错填成 UID？</strong>
+                                                        千万不要在运行状态配置中把主播的个人 UID（即几千万的一长串数字）填了进去。<br/>
+                                                        <strong className="text-green-400">解决方法：</strong> 请前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('status')}>运行状态</button>，确认输入的房间号是该直播网页链接最末尾的那串纯数字，如果是短号就输入短号。
+                                                    </li>
+                                                </ul>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
                             )}

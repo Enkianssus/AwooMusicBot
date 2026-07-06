@@ -715,7 +715,74 @@ async function startFoliaRadar() {
 }
 
 // ==========================================
-// 网易云音乐 CDP 注入接管
+// ⭐ 注册表深度寻轨定位器 (Windows 专享)
+// ==========================================
+function getCloudMusicPathFromRegistry(): Promise<string> {
+  const regKeys = [
+    'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\网易云音乐',
+    'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\网易云音乐'
+  ];
+
+  return new Promise((resolve, reject) => {
+    if (process.platform !== 'win32') {
+      return reject(new Error('非 Windows 系统，跳过注册表寻轨'));
+    }
+
+    let index = 0;
+
+    function tryNextKey() {
+      if (index >= regKeys.length) {
+        return reject(new Error('遍历了所有预设的注册表节点，未检测到网易云音乐安装信息'));
+      }
+
+      const currentKey = regKeys[index];
+      writeLog(`[注册表DEBUG] 🔍 正在检索注册表节点: ${currentKey}`, 'DarkGray');
+      const command = `reg query "${currentKey}" /v DisplayIcon`;
+
+      exec(command, (error, stdout) => {
+        if (error) {
+          writeLog(`[注册表DEBUG] 📭 该节点下未查询到 DisplayIcon 项 (代码: ${error.code})`, 'DarkGray');
+          index++;
+          tryNextKey();
+        } else {
+          writeLog(`[注册表DEBUG] 📬 命中注册表项！正在解析原始字符串数据...`, 'Cyan');
+          const lines = stdout.split('\n');
+          for (let line of lines) {
+            if (line.includes('DisplayIcon')) {
+              // 按照 2 个或更多的空白字符对“键-类型-值”进行高精度切分
+              const parts = line.trim().split(/\s{2,}/);
+              if (parts.length >= 3) {
+                let execPath = parts[2].trim();
+                writeLog(`[注册表DEBUG] 🧬 提取到原始物理地址: ${execPath}`, 'DarkGray');
+
+                // 深度清洗：剔除路径两侧可能包裹的双引号
+                if (execPath.startsWith('"') && execPath.endsWith('"')) {
+                  execPath = execPath.slice(1, -1);
+                }
+
+                // 深度清洗：剔除 Windows 注册表可能自带的图标索引后缀（如 C:\Netease\cloudmusic.exe,0）
+                if (execPath.includes(',')) {
+                  execPath = execPath.split(',')[0].trim();
+                  writeLog(`[注册表DEBUG] 🧹 剔除图标索引后缀，清洗后执行路径为: ${execPath}`, 'DarkGray');
+                }
+
+                return resolve(execPath);
+              }
+            }
+          }
+          writeLog(`[注册表DEBUG] ⚠️ 该注册表节点虽然存在，但内部数据格式异常，无法解析出 DisplayIcon。`, 'Yellow');
+          index++;
+          tryNextKey();
+        }
+      });
+    }
+
+    tryNextKey();
+  });
+}
+
+// ==========================================
+// 网易云音乐 CDP 注入接管及自动寻路
 // ==========================================
 async function restartNCMWithDebugPort() {
   if (appConfig.sysConfig?.PlayerType === 'Folia') {
@@ -728,6 +795,26 @@ async function restartNCMWithDebugPort() {
   let exePath = appConfig.sysConfig?.NcmExePath || '';
   isCdpConnected = false;
 
+  // ⭐ 新增：如果本地没有保存任何网易云路径或路径被清除（即首次打开/未保存配置）
+  if (!exePath) {
+    writeLog(">>> [系统] 本地配置文件中未检测到网易云路径，启动自动寻轨机制...", "Cyan");
+    try {
+      const regPath = await getCloudMusicPathFromRegistry();
+      if (regPath && fs.existsSync(regPath)) {
+        exePath = regPath;
+        if (!appConfig.sysConfig) appConfig.sysConfig = {};
+        appConfig.sysConfig.NcmExePath = exePath;
+        saveConfig();
+        writeLog(`>>> [系统] 注册表寻路成功，已将网易云路径保存至本地配置: ${exePath}`, "Green");
+      } else {
+        writeLog(`⚠️ [系统] 注册表解析完成，但检测到该物理地址在硬盘上不存在: ${regPath}`, "Yellow");
+      }
+    } catch (regErr: any) {
+      writeLog(`⚠️ [系统] 自动检索注册表失败: ${regErr.message}`, "Yellow");
+    }
+  }
+
+  // 尝试获取当前正在后台静默运行的网易云路径进行备份与热更新
   let runningPath = '';
   try {
     const psCmd = `powershell -NoProfile -Command "$p=(Get-Process cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1).Path; if($p){[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($p))}"`;
@@ -736,69 +823,37 @@ async function restartNCMWithDebugPort() {
     if (b64) runningPath = Buffer.from(b64, 'base64').toString('utf8');
   } catch {}
 
-  // ⭐ 新增功能：若当前无进程运行且无保存路径，自动利用 PowerShell 查询注册表寻回安装路径并启动网易云音乐
-  if (!runningPath && !exePath) {
-    writeLog(">>> [系统] 未检测到运行中的网易云进程且缓存配置为空，开始查询 Windows 注册表...", "Cyan");
-    try {
-      const regCmd = `powershell -NoProfile -Command "
-        $paths = @(
-          'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\网易云音乐',
-          'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\网易云音乐'
-        );
-        foreach ($path in $paths) {
-          if (Test-Path $path) {
-            $val = (Get-ItemProperty -Path $path -Name 'DisplayIcon' -ErrorAction SilentlyContinue).DisplayIcon;
-            if ($val) {
-              $val = $val.Trim('\"');
-              [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($val));
-              break;
-            }
-          }
-        }
-      "`;
-      const { stdout } = await execAsync(regCmd);
-      const regB64 = stdout.trim();
-      if (regB64) {
-        const regPath = Buffer.from(regB64, 'base64').toString('utf8').trim();
-        if (regPath && fs.existsSync(regPath)) {
-          exePath = regPath;
-          appConfig.sysConfig.NcmExePath = exePath;
-          saveConfig();
-          writeLog(`>>> [系统] 成功从 Windows 注册表自动检索到网易云物理路径: ${exePath}`, "Green");
-        }
-      }
-    } catch (regErr: any) {
-      writeLog(`⚠️ [系统] 注册表寻回路标失败: ${regErr.message}`, "Yellow");
-    }
-  }
-
-  // 如果提取到了正在运行中的程序路径，自动同步并保存
+  // 如果提取到了正在运行中的程序路径，且与已有配置不同，自动同步保存
   if (runningPath) {
-    exePath = runningPath;
-    if (appConfig.sysConfig?.NcmExePath !== exePath) {
+    writeLog(`>>> [系统] 检测到当前正有运行中的网易云进程: ${runningPath}`, 'DarkGray');
+    if (runningPath !== exePath) {
+      exePath = runningPath;
       if (!appConfig.sysConfig) appConfig.sysConfig = {};
       appConfig.sysConfig.NcmExePath = exePath;
       saveConfig();
+      writeLog(`>>> [系统] 运行状态与本地记录不一致，已将其自动修正并保存为: ${exePath}`, 'Green');
     }
   }
 
   try {
     await execAsync('taskkill /f /im cloudmusic.exe');
-    writeLog('>>> [系统] 已强制关闭当前网易云进程。', 'DarkGray');
+    writeLog('>>> [系统] 已强制杀掉当前网易云进程，准备进行调试端口热重启...', 'DarkGray');
   } catch {}
 
   await new Promise(resolve => setTimeout(resolve, 2000));
   const cdpPort = appConfig.sysConfig?.CdpPort || 9222;
 
   if (exePath && fs.existsSync(exePath)) {
-    writeLog(`>>> [系统] 🚀 已发令带调试端口 (${cdpPort}) 重新启动网易云音乐！等待其加载...`, 'Green');
+    writeLog(`>>> [系统] 🚀 正在唤醒网易云音乐并注入调试端口 (${cdpPort})！物理路径: ${exePath}`, 'Green');
     try {
       const cwd = path.dirname(exePath);
       const ncmProcess = spawn(exePath, [`--remote-debugging-port=${cdpPort}`], { cwd, detached: true, stdio: 'ignore' });
       ncmProcess.unref();
-    } catch (err: any) { writeLog(`❌ [错误] 启动网易云失败: ${err?.message || err}`, 'Red'); }
+    } catch (err: any) {
+      writeLog(`❌ [错误] 启动网易云失败: ${err?.message || err}`, 'Red');
+    }
   } else {
-    writeLog('⚠️ [提示] 找不到网易云音乐安装路径，请手动以调试模式启动！', 'Yellow');
+    writeLog('⚠️ [提示] 找不到网易云音乐安装路径，请检查注册表或手动启动客户端！', 'Yellow');
   }
 
   setTimeout(startCDPRadar, 2500);

@@ -1,67 +1,90 @@
-name: Debug Build
+name: Build and Release Velopack
 
 on:
-  workflow_dispatch:
   push:
-  pull_request:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  debug:
+  build-windows:
     runs-on: windows-latest
 
     steps:
-      # 1️⃣ 拉代码（关键：确保不是旧commit）
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # 2️⃣ Node环境
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
           cache: 'npm'
 
-      # 3️⃣ 打印环境信息
-      - name: Print environment
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Get Version and Sync package.json
+        id: get_version
+        shell: powershell
         run: |
-          node -v
-          npm -v
-          echo "==== Current directory ===="
-          dir
+          # 1. 读取当前的 package.json
+          $package = Get-Content package.json | ConvertFrom-Json
 
-      # 4️⃣ 查看所有 vite config（关键）
-      - name: Find vite configs
-        run: |
-          echo "==== vite.config.* ===="
-          dir vite.config.*
+          if ("${{ github.event_name }}" -eq "push") {
+            # 如果是由 tag 触发，直接从 tag 提取版本号（去掉开头的 'v'）
+            $tag = "${{ github.ref_name }}"
+            $ver = $tag -replace '^v', ''
+            Write-Host "Triggered by tag. Extracted Version: $ver from Tag: $tag"
+          } else {
+            # 如果是手动触发，则读取 package.json 里的版本
+            $ver = $package.version
+            $tag = "v$ver"
+            Write-Host "Manually triggered. Read Version: $ver from package.json"
+          }
 
-      # 5️⃣ 打印 vite config 内容（关键）
-      - name: Print vite config
-        run: |
-          echo "==== vite.config.ts ===="
-          type vite.config.ts
+          # 2. 【核心修复】将真实的打包版本号强行写回到 package.json 中！
+          # -Depth 100 确保 package.json 复杂的嵌套依赖结构不会被截断
+          $package.version = $ver
+          $package | ConvertTo-Json -Depth 100 | Set-Content package.json -Encoding utf8
+          Write-Host "Successfully synced package.json version to: $ver"
 
-      # 6️⃣ 安装依赖（锁死版本）
-      - name: Install dependencies
-        run: npm ci
+          # 3. 写入 GitHub Actions 环境变量
+          Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$ver"
+          Add-Content -Path $env:GITHUB_ENV -Value "TAG_NAME=$tag"
 
-      # 7️⃣ 检查依赖树（查 import_simple 来源）
-      - name: Check dependencies
-        run: |
-          npm ls vite
-          npm ls vite-plugin-electron
-          npm ls
-
-      # 8️⃣ 预编译 TS（排查编译问题）
-      - name: Type check
-        run: npx tsc --noEmit
-
-      # 9️⃣ 单独跑 vite build（不跑 electron）
-      - name: Vite build only
-        run: npx vite build --debug
-
-      # 🔟 完整 build（最终复现）
-      - name: Full build
+      - name: Build Electron Unpacked
         run: npm run build
+
+      - name: Install Velopack CLI
+        run: dotnet tool install -g vpk
+
+      - name: Rename exe to ASCII
+        shell: powershell
+        run: |
+          Get-ChildItem "dist_electron\win-unpacked\*.exe" | ForEach-Object {
+            Rename-Item $_.FullName "BiliNCM.exe"
+            Write-Host "Renamed $($_.Name) to BiliNCM.exe"
+          }
+          Get-ChildItem "dist_electron\win-unpacked\*.exe" | Select-Object Name
+
+      - name: Pack with Velopack
+        shell: pwsh
+        run: |
+          chcp 65001 > $null
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          vpk pack -u bilincm -v $env:VERSION -p dist_electron/win-unpacked -e BiliNCM.exe --packTitle "嗷呜点歌机" -i assets/icon.ico
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "BiliNCM Release ${{ env.TAG_NAME }}"
+          tag_name: "${{ env.TAG_NAME }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: Releases/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

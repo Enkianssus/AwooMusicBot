@@ -20,18 +20,18 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install Dependencies
-        run: npm install
+        run: npm ci
 
       - name: Get Version and Sync package.json
         id: get_version
         shell: powershell
         run: |
           # 1. 读取当前的 package.json
-          $package = Get-Content package.json | ConvertFrom-Json
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
 
           if ("${{ github.event_name }}" -eq "push") {
             # 如果是由 tag 触发，直接从 tag 提取版本号（去掉开头的 'v'）
@@ -46,9 +46,10 @@ jobs:
           }
 
           # 2. 【核心修复】将真实的打包版本号强行写回到 package.json 中！
-          # -Depth 100 确保 package.json 复杂的嵌套依赖结构不会被截断
+          # 使用 UTF8 无 BOM 写入，避免 PostCSS / JSON.parse 读到 BOM 报错
           $package.version = $ver
-          $package | ConvertTo-Json -Depth 100 | Set-Content package.json -Encoding utf8
+          $json = $package | ConvertTo-Json -Depth 100
+          [System.IO.File]::WriteAllText("$PWD\package.json", $json, (New-Object System.Text.UTF8Encoding($false)))
           Write-Host "Successfully synced package.json version to: $ver"
 
           # 3. 写入 GitHub Actions 环境变量

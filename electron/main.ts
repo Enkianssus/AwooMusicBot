@@ -263,11 +263,47 @@ let qrPollTimer: NodeJS.Timeout | null = null;
 
 let targetQueue: any[] = [];
 let currentPlayingSong: any = null;
+type PlayerCurrentSong = {
+  Id: string;
+  SongName: string;
+  ArtistName: string;
+  OrderedByUid: string;
+  OrderedByAvatar: string;
+  OrderedBy: string;
+  Source: 'player';
+};
+
+type PlayerCurrentPayload = {
+  id?: string;
+  name?: string;
+  artist?: string;
+  coverUrl?: string;
+  source?: 'NCM' | 'Folia';
+};
+
+let playerCurrentSong: PlayerCurrentSong | null = null;
 let lastTrackId: string | null = null;
 let lastQueueActionTime = 0; // 全局队列操作防抖冷却时间
 
 const userCooldowns = new Map<string, number>();
 let recentRejects: { id: number, user: any, reason: string }[] = [];
+
+function updatePlayerCurrentSong(song: PlayerCurrentPayload | null) {
+  if (!song?.id) {
+    playerCurrentSong = null;
+    return;
+  }
+
+  playerCurrentSong = {
+    Id: song.id,
+    SongName: song.name || '未知歌曲',
+    ArtistName: song.artist || '未知歌手',
+    OrderedByUid: `player-${song.source || 'NCM'}`,
+    OrderedByAvatar: song.coverUrl || '',
+    OrderedBy: '',
+    Source: 'player'
+  };
+}
 
 async function addReject(user: any, reason: string) {
   const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
@@ -683,11 +719,27 @@ async function startFoliaRadar() {
           const track = payload.track || payload.current || payload.data?.track || (payload.id || payload.songId ? payload : null);
           const currentId = track?.id || track?.songId ? String(track.id || track.songId) : null;
           const songName = track?.title || track?.name || '未知曲目';
+          const artistName = Array.isArray(track?.artists)
+            ? track.artists.map((artist: unknown) => {
+              if (typeof artist === 'string') return artist;
+              if (artist && typeof artist === 'object') {
+                const name = Object.getOwnPropertyDescriptor(artist, 'name')?.value;
+                return typeof name === 'string' ? name : '';
+              }
+              return '';
+            }).filter(Boolean).join('/')
+            : (track?.artist || track?.artistName || '未知歌手');
+          const coverUrl = track?.coverUrl || track?.cover || track?.picUrl || track?.album?.picUrl || track?.album?.cover || '';
+
+          if (currentId) {
+            updatePlayerCurrentSong({ id: currentId, name: songName, artist: artistName, coverUrl, source: 'Folia' });
+          }
 
           if (currentId && currentId !== lastTrackId) {
             syncTrackChangeLogic(currentId, songName, null, '未知');
             lastTrackId = currentId;
           } else if (!currentId && lastTrackId && eventName === 'TRACK_CHANGED') {
+            updatePlayerCurrentSong(null);
             syncTrackChangeLogic('', '播放已停止', null, '无');
             lastTrackId = null;
           }
@@ -970,27 +1022,70 @@ async function startCDPRadar() {
                   setTimeout(initRadar, 1500); return; 
               }
               if (window.__radarDeployed && window.__radarSubscribeAlive) {
-                  window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_ALREADY_DEPLOYED' }));
+                  try {
+                      const state = window._reduxStore.getState();
+                      const playing = state?.playing || {};
+                      const currentId = playing.resourceTrackId || playing.onlineResourceId || playing.curTrack?.id || playing.curPlaying?.trackId || playing.curPlaying?.track?.id;
+                      const track = playing.curTrack || playing.curPlaying?.track || playing.curPlayingWithUpdateTimeLimit?.track;
+                      const artists = Array.isArray(track?.artists || playing.resourceArtists) ? (track?.artists || playing.resourceArtists).map(artist => typeof artist === 'string' ? artist : artist?.name).filter(Boolean).join('/') : '';
+                      const current = currentId ? {
+                          id: String(currentId),
+                          name: track?.name || playing.resourceName || '未知歌曲',
+                          artist: artists || '未知歌手',
+                          coverUrl: playing.resourceCoverUrl || track?.album?.picUrl || track?.album?.cover || ''
+                      } : null;
+                      window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_ALREADY_DEPLOYED', currentId: currentId ? String(currentId) : null, current }));
+                  } catch {
+                      window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_ALREADY_DEPLOYED' }));
+                  }
                   return;
               }
               window.__radarDeployed = true; window.__radarSubscribeAlive = true;
 
+              const normalizeArtists = (artists) => Array.isArray(artists)
+                  ? artists.map(artist => typeof artist === 'string' ? artist : artist?.name).filter(Boolean).join('/')
+                  : '';
+              const extractTrackInfo = (id, track, coverUrl) => {
+                  const trackId = track?.id || id;
+                  if (!trackId) return null;
+                  return {
+                      id: String(trackId),
+                      name: track?.name || '未知歌曲',
+                      artist: normalizeArtists(track?.artists) || '未知歌手',
+                      coverUrl: coverUrl || track?.album?.picUrl || track?.album?.cover || ''
+                  };
+              };
               const extractSongInfo = (id, list) => {
                   if (!id) return null;
                   const song = list.find(item => String(item.id) === String(id));
                   if (!song) return null;
-                  return { id: String(song.id), name: song.track?.name || '未知歌曲', artist: song.track?.artists?.map(a => a.name).join('/') || '未知歌手' };
+                  return extractTrackInfo(song.id, song.track, null);
+              };
+              const extractCurrentSongInfo = (id, state, list) => {
+                  const fromList = extractSongInfo(id, list);
+                  if (fromList) return fromList;
+                  const playing = state?.playing || {};
+                  const track = playing.curTrack || playing.curPlaying?.track || playing.curPlayingWithUpdateTimeLimit?.track;
+                  if (track) return extractTrackInfo(id, track, playing.resourceCoverUrl);
+                  return extractTrackInfo(id, { id, name: playing.resourceName, artists: playing.resourceArtists }, playing.resourceCoverUrl);
+              };
+              const getCurrentTrackId = (state) => {
+                  const playing = state?.playing || {};
+                  return playing.resourceTrackId || playing.onlineResourceId || playing.curTrack?.id || playing.curPlaying?.trackId || playing.curPlaying?.track?.id;
               };
 
               let state = window._reduxStore.getState();
-              let localLastId = state.playing?.resourceTrackId || state.playing?.onlineResourceId;
+              let localLastId = getCurrentTrackId(state);
+              let curList = state.playingList?.curPlayingList || [];
+              let currentIndex = curList.findIndex(item => String(item.id) === String(localLastId));
+              let initNextSong = currentIndex !== -1 && currentIndex + 1 < curList.length ? extractSongInfo(curList[currentIndex + 1].id, curList) : null;
 
-              window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_INIT_OK', currentId: localLastId ? String(localLastId) : null }));
+              window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_INIT_OK', currentId: localLastId ? String(localLastId) : null, current: extractCurrentSongInfo(localLastId, state, curList), next: initNextSong }));
 
               window._reduxStore.subscribe(() => {
                   try {
                       state = window._reduxStore.getState();
-                      const currentTrackId = state.playing?.resourceTrackId || state.playing?.onlineResourceId;
+                      const currentTrackId = getCurrentTrackId(state);
                       const curList = state.playingList?.curPlayingList || [];
 
                       if (currentTrackId && currentTrackId !== localLastId) {
@@ -998,9 +1093,9 @@ async function startCDPRadar() {
                           const currentIndex = curList.findIndex(item => String(item.id) === String(currentTrackId));
                           let currSong = null; let nextSong = null;
                           if (currentIndex !== -1) {
-                              currSong = extractSongInfo(currentTrackId, curList);
+                              currSong = extractCurrentSongInfo(currentTrackId, state, curList);
                               if (currentIndex + 1 < curList.length) nextSong = extractSongInfo(curList[currentIndex + 1].id, curList);
-                          } else { currSong = { id: String(currentTrackId), name: '(列表外)', artist: '' }; }
+                          } else { currSong = extractCurrentSongInfo(currentTrackId, state, curList); }
 
                           try { window.__ncmRadarCallback(JSON.stringify({ event: 'TRACK_CHANGED', timestamp: Date.now(), previous: prevSong, current: currSong, next: nextSong })); } catch {}
                           localLastId = currentTrackId;
@@ -1023,18 +1118,27 @@ async function startCDPRadar() {
               writeLog(`✅ CDP 常驻雷达注入成功!`, 'Green');
               setGlobalStatus('点歌就绪');
               isCdpConnected = true;
+              updatePlayerCurrentSong(payload.current ? { ...payload.current, id: String(payload.current.id), source: 'NCM' } : null);
+              if (payload.current?.id) lastTrackId = String(payload.current.id);
             }
-            else if (payload.event === 'RADAR_ALREADY_DEPLOYED') isCdpConnected = true;
+            else if (payload.event === 'RADAR_ALREADY_DEPLOYED') {
+              isCdpConnected = true;
+              updatePlayerCurrentSong(payload.current ? { ...payload.current, id: String(payload.current.id), source: 'NCM' } : null);
+              if (payload.current?.id) lastTrackId = String(payload.current.id);
+            }
             else if (payload.event === 'TRACK_CHANGED') {
               const currId = payload.current?.id;
               const currName = payload.current?.name;
               const nextId = payload.next?.id;
               const nextName = payload.next?.name || '无';
 
+              updatePlayerCurrentSong(payload.current ? { ...payload.current, id: String(payload.current.id), source: 'NCM' } : null);
+
               if (currId && currId !== lastTrackId) {
                 syncTrackChangeLogic(currId, currName, nextId, nextName);
                 lastTrackId = currId;
               } else if (!currId && lastTrackId) {
+                updatePlayerCurrentSong(null);
                 syncTrackChangeLogic('', '播放停止', null, '无');
                 lastTrackId = null;
               }
@@ -1399,7 +1503,7 @@ function startBackendServer() {
 
     if (url.pathname === '/data') {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ current: currentPlayingSong, queue: targetQueue, status: currentStatusMessage, accepting: isAccepting, playing: isPlaying, uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isCdpConnected }));
+      res.end(JSON.stringify({ current: currentPlayingSong, playerCurrent: playerCurrentSong, queue: targetQueue, status: currentStatusMessage, accepting: isAccepting, playing: isPlaying, uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isCdpConnected }));
       return;
     }
 

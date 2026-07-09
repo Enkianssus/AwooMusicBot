@@ -38,6 +38,7 @@ interface SongInfo {
     OrderedByAvatar: string;
     OrderedBy: string;
     GuardLevel?: number;
+    Source?: 'player';
 }
 
 interface ToastInfo {
@@ -157,7 +158,7 @@ interface OverlayWidgetProps {
 }
 
 const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
-    const [data, setData] = useState<{ current: SongInfo | null; queue: SongInfo[]; status: string }>({ current: null, queue: [], status: '' });
+    const [data, setData] = useState<{ current: SongInfo | null; playerCurrent: SongInfo | null; queue: SongInfo[]; status: string }>({ current: null, playerCurrent: null, queue: [], status: '' });
     const [isConnected, setIsConnected] = useState<boolean>(true);
     const [isCdpConnected, setIsCdpConnected] = useState<boolean>(true);
     const [accepting, setAccepting] = useState<boolean>(true);
@@ -310,7 +311,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                     return safeQueue;
                 });
 
-                setData({ current: json.current || null, queue: safeQueue, status: json.status || '' });
+                setData({ current: json.current || null, playerCurrent: json.playerCurrent || null, queue: safeQueue, status: json.status || '' });
                 setAccepting(json.accepting ?? true);
                 setPlaying(json.playing ?? true);
                 setIsConnected(true);
@@ -584,6 +585,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         return '';
     };
 
+    const displayCurrent = data.current ?? data.playerCurrent;
+    const isRequestCurrent = data.current !== null;
+
     return (
         <div className={isElectron
             ? "w-full h-screen p-5 flex flex-col font-sans select-none group box-border overflow-hidden bg-transparent pointer-events-none no-drag"
@@ -716,27 +720,31 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 )}
 
                 <div className="flex-1 flex flex-col p-4 overflow-hidden z-10 gap-4 custom-scrollbar relative">
-                    {data.current ? (
+                    {displayCurrent ? (
                         <div
-                            className={`${isElectron ? 'no-drag cursor-move' : ''} current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 transition-opacity ${dragInfo?.type === 'current' ? 'opacity-30' : ''} ${actionLock ? 'pointer-events-none' : ''}`}
+                            className={`${isElectron ? `no-drag ${isRequestCurrent ? 'cursor-move' : 'cursor-default'}` : ''} current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 transition-opacity ${dragInfo?.type === 'current' ? 'opacity-30' : ''} ${actionLock ? 'pointer-events-none' : ''}`}
                             style={{ touchAction: 'none' }}
-                            onPointerDown={isElectron && !actionLock ? (e) => handlePointerDown(e, 'current', -1, data.current as SongInfo) : undefined}
+                            onPointerDown={isElectron && !actionLock && isRequestCurrent ? (e) => handlePointerDown(e, 'current', -1, displayCurrent) : undefined}
                         >
                             <div className="absolute right-[-10px] top-[-10px] opacity-5 text-7xl select-none pointer-events-none">🎵</div>
-                            <div className={`w-12 h-12 rounded-full overflow-hidden border-[3px] ${playing ? getGuardStyle(data.current.GuardLevel).border || 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.2)]' : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} shrink-0 relative pointer-events-none`}>
-                                <img src={data.current.OrderedByAvatar} alt="avatar" referrerPolicy="no-referrer" className={`w-full h-full object-cover ${!playing ? 'grayscale opacity-80' : ''}`} onError={(e)=>{(e.target as HTMLImageElement).src=`https://api.dicebear.com/7.x/identicon/svg?seed=${(data.current as SongInfo).OrderedByUid}`}} />
+                            <div className={`w-12 h-12 rounded-full overflow-hidden border-[3px] ${playing ? getGuardStyle(displayCurrent.GuardLevel).border || 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.2)]' : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} shrink-0 relative pointer-events-none`}>
+                                <img src={displayCurrent.OrderedByAvatar} alt="avatar" referrerPolicy="no-referrer" className={`w-full h-full object-cover ${!playing ? 'grayscale opacity-80' : ''}`} onError={(e)=>{(e.target as HTMLImageElement).src=`https://api.dicebear.com/7.x/identicon/svg?seed=${displayCurrent.OrderedByUid}`}} />
                             </div>
                             <div className="flex flex-col min-w-0 pointer-events-none">
                                 {playing ? (
-                                    <div className="text-green-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span> 正在播放</div>
+                                    <div className="text-green-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span> {isRequestCurrent ? '正在播放' : '自动播放中'}</div>
                                 ) : (
                                     <div className="text-yellow-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-yellow-400 rounded-full"></span> 自动播放已暂停</div>
                                 )}
-                                <div className="text-[15px] font-bold truncate drop-shadow-md" style={{ color: theme.textColor }}>{data.current.SongName}</div>
-                                <div className="text-xs truncate mt-0.5" style={{ color: theme.subTextColor }}>{data.current.ArtistName}</div>
+                                <div className="text-[15px] font-bold truncate drop-shadow-md" style={{ color: theme.textColor }}>{displayCurrent.SongName}</div>
+                                <div className="text-xs truncate mt-0.5" style={{ color: theme.subTextColor }}>{displayCurrent.ArtistName}</div>
                                 <div className="text-[11px] mt-1 flex items-center gap-1.5" style={{ color: theme.subTextColor }}>
-                                    <span className="truncate">由 <span style={{ color: theme.titleColor, opacity: 0.9 }}>{data.current.OrderedBy}</span> 点播</span>
-                                    {getGuardStyle(data.current.GuardLevel).label && <span className={`text-[9px] px-1 rounded-sm font-bold tracking-wider leading-none py-0.5 shadow-sm ${getGuardStyle(data.current.GuardLevel).tag}`}>{getGuardStyle(data.current.GuardLevel).label}</span>}
+                                    {isRequestCurrent ? (
+                                        <span className="truncate">由 <span style={{ color: theme.titleColor, opacity: 0.9 }}>{displayCurrent.OrderedBy}</span> 点播</span>
+                                    ) : (
+                                        <span className="truncate" style={{ color: theme.titleColor, opacity: 0.9 }}>{displayCurrent.OrderedBy}</span>
+                                    )}
+                                    {getGuardStyle(displayCurrent.GuardLevel).label && <span className={`text-[9px] px-1 rounded-sm font-bold tracking-wider leading-none py-0.5 shadow-sm ${getGuardStyle(displayCurrent.GuardLevel).tag}`}>{getGuardStyle(displayCurrent.GuardLevel).label}</span>}
                                 </div>
                             </div>
                         </div>

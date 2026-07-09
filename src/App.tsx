@@ -78,6 +78,117 @@ interface QrState {
     message: string;
 }
 
+interface LyricLine {
+    index: number;
+    time: number;
+    text: string;
+    translation: string;
+}
+
+interface LyricsPayload {
+    trackId: string;
+    songName: string;
+    artistName: string;
+    playedTime: number | null;
+    duration: number | null;
+    progress: number;
+    current: LyricLine | null;
+    previous: LyricLine | null;
+    next: LyricLine | null;
+    hasLyrics: boolean;
+    isLoading: boolean;
+    updatedAt: number;
+}
+
+interface LyricsApiResponse {
+    lyrics: LyricsPayload | null;
+    cdpConnected: boolean;
+}
+
+interface LyricsDisplayOptions {
+    alignment: 'left' | 'center' | 'right';
+    showTranslation: boolean;
+    textColor: string;
+    translationColor: string;
+    outlineColor: string;
+    progressColor: string;
+    fontFamily: string;
+}
+
+const defaultLyricsDisplayOptions: LyricsDisplayOptions = {
+    alignment: 'center',
+    showTranslation: true,
+    textColor: '#ffffff',
+    translationColor: 'rgba(255, 255, 255, 0.72)',
+    outlineColor: 'rgba(0, 0, 0, 0.95)',
+    progressColor: '#22d3ee',
+    fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
+}
+
+function readString(value: unknown): string {
+    return typeof value === 'string' ? value : '';
+}
+
+function readFiniteNumber(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+}
+
+function readLyricLine(value: unknown): LyricLine | null {
+    if (!isRecord(value)) return null;
+
+    const index = readFiniteNumber(value.index);
+    const time = readFiniteNumber(value.time);
+    if (index === null || time === null) return null;
+
+    return {
+        index,
+        time,
+        text: readString(value.text),
+        translation: readString(value.translation)
+    };
+}
+
+function readLyricsPayload(value: unknown): LyricsPayload | null {
+    if (!isRecord(value)) return null;
+
+    const progress = readFiniteNumber(value.progress);
+    const updatedAt = readFiniteNumber(value.updatedAt);
+    if (progress === null || updatedAt === null) return null;
+
+    return {
+        trackId: readString(value.trackId),
+        songName: readString(value.songName),
+        artistName: readString(value.artistName),
+        playedTime: readFiniteNumber(value.playedTime),
+        duration: readFiniteNumber(value.duration),
+        progress: Math.max(0, Math.min(1, progress)),
+        current: readLyricLine(value.current),
+        previous: readLyricLine(value.previous),
+        next: readLyricLine(value.next),
+        hasLyrics: value.hasLyrics === true,
+        isLoading: value.isLoading === true,
+        updatedAt
+    };
+}
+
+function readLyricsApiResponse(value: unknown): LyricsApiResponse {
+    if (!isRecord(value)) return { lyrics: null, cdpConnected: false };
+
+    return {
+        lyrics: readLyricsPayload(value.lyrics),
+        cdpConnected: value.cdpConnected === true
+    };
+}
+
 // ==========================================
 // 2. 全局样式
 // ==========================================
@@ -1989,9 +2100,120 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     );
 };
 
+const LyricsWidget: React.FC = () => {
+    const [lyrics, setLyrics] = useState<LyricsPayload | null>(null);
+    const [cdpConnected, setCdpConnected] = useState(false);
+    const [requestFailed, setRequestFailed] = useState(false);
+    const options = defaultLyricsDisplayOptions;
+    const textShadow = [
+        `0 0 3px ${options.outlineColor}`,
+        `1px 1px 2px ${options.outlineColor}`,
+        `-1px -1px 2px ${options.outlineColor}`,
+        '0 6px 24px rgba(0, 0, 0, 0.6)'
+    ].join(', ');
+
+    useEffect(() => {
+        let disposed = false;
+
+        const refreshLyrics = async () => {
+            try {
+                const res = await fetch('http://localhost:5555/api/lyrics');
+                const body: unknown = await res.json();
+                const parsed = readLyricsApiResponse(body);
+                if (disposed) return;
+                setLyrics(parsed.lyrics);
+                setCdpConnected(parsed.cdpConnected);
+                setRequestFailed(false);
+            } catch {
+                if (disposed) return;
+                setLyrics(null);
+                setCdpConnected(false);
+                setRequestFailed(true);
+            }
+        };
+
+        refreshLyrics();
+        const timer = window.setInterval(refreshLyrics, 500);
+        return () => {
+            disposed = true;
+            window.clearInterval(timer);
+        };
+    }, []);
+
+    const currentLine = lyrics?.current;
+    const translation = options.showTranslation ? currentLine?.translation : '';
+    const statusText = requestFailed
+        ? '歌词服务未连接'
+        : !cdpConnected
+            ? '等待网易云连接'
+            : lyrics?.isLoading
+                ? '歌词加载中'
+                : lyrics && !lyrics.hasLyrics
+                    ? '暂无歌词'
+                    : '等待播放';
+    const mainText = currentLine?.text || statusText;
+    const songLabel = lyrics?.songName
+        ? `${lyrics.songName}${lyrics.artistName ? ` - ${lyrics.artistName}` : ''}`
+        : '';
+
+    return (
+        <>
+            <GlobalStyles />
+            <div
+                className="min-h-screen w-screen overflow-hidden bg-transparent px-6 py-8 text-white flex items-center justify-center"
+                style={{ fontFamily: options.fontFamily }}
+            >
+                <div
+                    className="w-full max-w-5xl flex flex-col gap-4"
+                    style={{ textAlign: options.alignment, alignItems: options.alignment === 'center' ? 'center' : options.alignment === 'right' ? 'flex-end' : 'flex-start' }}
+                >
+                    {songLabel && (
+                        <div
+                            className="max-w-full truncate text-xs sm:text-sm md:text-base font-medium tracking-normal"
+                            style={{ color: options.translationColor, textShadow }}
+                        >
+                            {songLabel}
+                        </div>
+                    )}
+
+                    <div
+                        className="max-w-full whitespace-pre-wrap break-words text-2xl sm:text-5xl md:text-6xl font-bold leading-tight tracking-normal"
+                        style={{ color: options.textColor, textShadow, wordBreak: 'keep-all', overflowWrap: 'anywhere' }}
+                    >
+                        {mainText}
+                    </div>
+
+                    {translation && (
+                        <div
+                            className="max-w-full whitespace-pre-wrap break-words text-lg sm:text-2xl md:text-3xl font-semibold leading-snug tracking-normal"
+                            style={{ color: options.translationColor, textShadow, wordBreak: 'keep-all', overflowWrap: 'anywhere' }}
+                        >
+                            {translation}
+                        </div>
+                    )}
+
+                    {lyrics?.hasLyrics && cdpConnected && (
+                        <div className="h-1 w-full max-w-xl overflow-hidden rounded-full bg-white/20">
+                            <div
+                                className="h-full rounded-full transition-all duration-300"
+                                style={{ width: `${lyrics.progress * 100}%`, background: options.progressColor }}
+                            />
+                        </div>
+                    )}
+                </div>
+            </div>
+        </>
+    );
+};
+
 const App: React.FC = () => {
     const params = new URLSearchParams(window.location.search);
     const isAdmin = params.get('admin') === 'true';
+    const isLyrics = window.location.pathname === '/lyrics';
+
+    if (isLyrics) {
+        return <LyricsWidget />;
+    }
 
     if (isAdmin) {
         return (

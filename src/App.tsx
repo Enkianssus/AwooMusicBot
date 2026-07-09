@@ -154,7 +154,7 @@ type LyricsColorSettingKey = 'MainColor' | 'TranslationColor' | 'OutlineColor';
 
 const defaultLyricsWidgetSettings: LyricsWidgetSettings = {
     Alignment: 'center',
-    ShowSongInfo: true,
+    ShowSongInfo: false,
     ShowTranslation: true,
     MainColor: '#ffffff',
     TranslationColor: '#d1d5db',
@@ -371,6 +371,23 @@ function buildLyricsTextShadow(options: LyricsDisplayOptions): string | undefine
     const offset = Math.max(1, Math.round(options.shadowSize / 4));
     return `0 ${offset}px ${options.shadowSize}px rgba(0, 0, 0, 0.6)`;
 }
+
+function getLyricsLinePlaybackProgress(lyrics: LyricsPayload | null): number {
+    if (!lyrics?.current || lyrics.playedTime === null) return 0;
+
+    const endTime = lyrics.next?.time ?? lyrics.duration;
+    if (endTime === null || endTime <= lyrics.current.time) return lyrics.progress;
+
+    return Math.max(0, Math.min(1, (lyrics.playedTime - lyrics.current.time) / (endTime - lyrics.current.time)));
+}
+
+function getLyricsScrollProgress(progress: number): number {
+    const scrollDurationRatio = 0.8;
+    if (progress >= scrollDurationRatio) return 1;
+    return Math.max(0, progress / scrollDurationRatio);
+}
+
+const LYRICS_SCROLL_CLIP_BLEED_PX = 128;
 
 // ==========================================
 // 2. 全局样式
@@ -1235,6 +1252,7 @@ interface LyricsTextProps {
     readonly outlineEnabled: boolean;
     readonly outlineColor: string;
     readonly outlineSize: number;
+    readonly scrollProgress?: number;
 }
 
 const LyricsText: React.FC<LyricsTextProps> = ({
@@ -1245,13 +1263,88 @@ const LyricsText: React.FC<LyricsTextProps> = ({
     textShadow,
     outlineEnabled,
     outlineColor,
-    outlineSize
+    outlineSize,
+    scrollProgress
 }) => {
-    const strokeStyle: React.CSSProperties = {
+    const containerRef = useRef<HTMLDivElement>(null);
+    const contentRef = useRef<HTMLSpanElement>(null);
+    const [overflowWidth, setOverflowWidth] = useState(0);
+    const canScroll = scrollProgress !== undefined;
+
+    useEffect(() => {
+        if (!canScroll) {
+            setOverflowWidth(0);
+            return;
+        }
+
+        const measure = () => {
+            const container = containerRef.current;
+            const content = contentRef.current;
+            if (!container || !content) return;
+            const computedStyle = window.getComputedStyle(container);
+            const horizontalPadding = parseFloat(computedStyle.paddingLeft) + parseFloat(computedStyle.paddingRight);
+            const contentViewportWidth = Math.max(0, container.clientWidth - horizontalPadding);
+            setOverflowWidth(Math.max(0, content.scrollWidth - contentViewportWidth));
+        };
+
+        measure();
+        window.addEventListener('resize', measure);
+
+        let resizeObserver: ResizeObserver | null = null;
+        if (typeof ResizeObserver !== 'undefined') {
+            resizeObserver = new ResizeObserver(measure);
+            if (containerRef.current) resizeObserver.observe(containerRef.current);
+            if (contentRef.current) resizeObserver.observe(contentRef.current);
+        }
+
+        return () => {
+            window.removeEventListener('resize', measure);
+            resizeObserver?.disconnect();
+        };
+    }, [canScroll, style.fontSize, text]);
+
+    const baseStrokeStyle: React.CSSProperties = {
         color: 'transparent',
         WebkitTextFillColor: 'transparent',
         WebkitTextStroke: `${outlineSize}px ${outlineColor}`
     };
+    const strokeStyle: React.CSSProperties = {
+        ...baseStrokeStyle,
+        boxSizing: 'border-box',
+        padding: 'inherit'
+    };
+    const scrollOffset = canScroll ? overflowWidth * getLyricsScrollProgress(scrollProgress) : 0;
+    const scrollContentStyle: React.CSSProperties = {
+        transform: scrollOffset > 0 ? `translateX(${-scrollOffset}px)` : undefined,
+        transition: 'transform 80ms linear',
+        willChange: overflowWidth > 0 ? 'transform' : undefined
+    };
+
+    if (canScroll) {
+        return (
+            <div
+                ref={containerRef}
+                className={className}
+                style={{
+                    ...style,
+                    position: 'relative',
+                    textAlign: overflowWidth > 0 ? 'left' : undefined,
+                    clipPath: overflowWidth > 0 ? `inset(-${LYRICS_SCROLL_CLIP_BLEED_PX}px 0 -${LYRICS_SCROLL_CLIP_BLEED_PX}px 0)` : undefined
+                }}
+            >
+                <span ref={contentRef} className="relative inline-block min-w-max whitespace-nowrap" style={scrollContentStyle}>
+                    {outlineEnabled && outlineSize > 0 && (
+                        <span aria-hidden="true" className="absolute inset-0 block pointer-events-none select-none" style={baseStrokeStyle}>
+                            {text}
+                        </span>
+                    )}
+                    <span className="relative block" style={{ color, textShadow }}>
+                        {text}
+                    </span>
+                </span>
+            </div>
+        );
+    }
 
     return (
         <div className={className} style={{ ...style, position: 'relative' }}>
@@ -1299,6 +1392,11 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const showAdminToast = (msg: string) => {
         setAdminToast(msg);
         setTimeout(() => setAdminToast(''), 3000);
+    };
+
+    const copyPanelLink = (url: string) => {
+        void navigator.clipboard.writeText(url);
+        showAdminToast("✅ 链接复制成功！");
     };
 
     const activeTabRef = useRef<string>(activeTab);
@@ -1785,12 +1883,22 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                     <div>
                                         <h2 className="text-2xl font-bold text-white mb-6">运行状态</h2>
 
-                                        <div className="bg-white/5 p-5 rounded-xl border border-white/10 flex justify-between items-center mb-5 shadow-inner">
-                                            <div>
+                                        <div className="bg-white/5 p-5 rounded-xl border border-white/10 flex flex-col sm:flex-row sm:justify-between sm:items-center items-start mb-3 shadow-inner gap-4">
+                                            <div className="min-w-0">
                                                 <div className="text-sm text-gray-400 mb-1">OBS 捕捉地址 / 局域网访问</div>
-                                                <div className="text-lg font-mono text-cyan-400 select-all">http://localhost:5555/</div>
+                                                <div className="text-lg font-mono text-cyan-400 select-all break-all">http://localhost:5555/</div>
                                             </div>
-                                            <button onClick={() => { navigator.clipboard.writeText("http://localhost:5555/"); showAdminToast("✅ 链接复制成功！"); }} className="px-5 py-2.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded-lg text-sm font-bold transition-colors border border-blue-500/30 flex items-center gap-2">
+                                            <button onClick={() => copyPanelLink("http://localhost:5555/")} className="px-5 py-2.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded-lg text-sm font-bold transition-colors border border-blue-500/30 flex items-center gap-2 shrink-0">
+                                                📋 复制链接
+                                            </button>
+                                        </div>
+
+                                        <div className="bg-white/5 p-5 rounded-xl border border-white/10 flex flex-col sm:flex-row sm:justify-between sm:items-center items-start mb-5 shadow-inner gap-4">
+                                            <div className="min-w-0">
+                                                <div className="text-sm text-gray-400 mb-1">桌面歌词地址</div>
+                                                <div className="text-lg font-mono text-cyan-400 select-all break-all">http://localhost:5555/lyrics</div>
+                                            </div>
+                                            <button onClick={() => copyPanelLink("http://localhost:5555/lyrics")} className="px-5 py-2.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded-lg text-sm font-bold transition-colors border border-blue-500/30 flex items-center gap-2 shrink-0">
                                                 📋 复制链接
                                             </button>
                                         </div>
@@ -2552,14 +2660,29 @@ const LyricsWidget: React.FC = () => {
         ? `${displayedLyrics.songName}${displayedLyrics.artistName ? ` - ${displayedLyrics.artistName}` : ''}`
         : '';
     const alignItems = options.alignment === 'center' ? 'center' : options.alignment === 'right' ? 'flex-end' : 'flex-start';
+    const textShadowOffset = options.shadowEnabled && options.shadowSize > 0 ? Math.max(1, Math.round(options.shadowSize / 4)) : 0;
+    const textBleedX = Math.max(options.outlineEnabled ? options.outlineSize : 0, options.shadowEnabled ? options.shadowSize : 0);
+    const textBleedY = Math.max(options.outlineEnabled ? options.outlineSize : 0, options.shadowEnabled ? options.shadowSize + textShadowOffset : 0);
+    const songLabelStyle: React.CSSProperties = textBleedX > 0 || textBleedY > 0
+        ? {
+            margin: `${-textBleedY}px ${-textBleedX}px`,
+            padding: `${textBleedY}px ${textBleedX}px`
+        }
+        : {};
+    const scrollingLineBleedX = textBleedX > 0 ? textBleedX + 16 : 0;
+    const scrollingLineBleedStyle: React.CSSProperties = textBleedX > 0 || textBleedY > 0
+        ? {
+            margin: `${-textBleedY}px 0`,
+            padding: `${textBleedY}px ${scrollingLineBleedX}px`
+        }
+        : {};
+    const lineScrollProgress = getLyricsLinePlaybackProgress(displayedLyrics);
     const mainTextStyle: React.CSSProperties = {
-        wordBreak: 'keep-all',
-        overflowWrap: 'anywhere',
+        ...scrollingLineBleedStyle,
         fontSize: `clamp(24px, 8vw, ${options.mainFontSize}px)`
     };
     const translationStyle: React.CSSProperties = {
-        wordBreak: 'keep-all',
-        overflowWrap: 'anywhere',
+        ...scrollingLineBleedStyle,
         fontSize: `clamp(18px, 5vw, ${options.translationFontSize}px)`
     };
 
@@ -2567,7 +2690,7 @@ const LyricsWidget: React.FC = () => {
         <>
             <GlobalStyles />
             <div
-                className="min-h-screen w-screen overflow-hidden bg-transparent px-6 py-8 text-white flex items-center justify-center"
+                className="min-h-screen w-screen overflow-hidden bg-transparent text-white flex items-center justify-center"
                 style={{ fontFamily: options.fontFamily }}
             >
                 <div
@@ -2578,7 +2701,7 @@ const LyricsWidget: React.FC = () => {
                         <LyricsText
                             text={songLabel}
                             className="max-w-full truncate text-xs sm:text-sm md:text-base font-medium tracking-normal"
-                            style={{}}
+                            style={songLabelStyle}
                             color={options.translationColor}
                             textShadow={textShadow}
                             outlineEnabled={options.outlineEnabled}
@@ -2588,26 +2711,30 @@ const LyricsWidget: React.FC = () => {
                     )}
 
                     <LyricsText
+                        key={`main-${currentLine?.index ?? 'status'}-${currentLine?.time ?? 0}`}
                         text={mainText}
-                        className="max-w-full whitespace-pre-wrap break-words font-bold leading-tight tracking-normal"
+                        className="w-full max-w-full whitespace-nowrap font-bold leading-tight tracking-normal"
                         style={mainTextStyle}
                         color={options.textColor}
                         textShadow={textShadow}
                         outlineEnabled={options.outlineEnabled}
                         outlineColor={options.outlineColor}
                         outlineSize={options.outlineSize}
+                        scrollProgress={currentLine ? lineScrollProgress : undefined}
                     />
 
                     {translation && (
                         <LyricsText
+                            key={`translation-${currentLine?.index ?? 'status'}-${currentLine?.time ?? 0}`}
                             text={translation}
-                            className="max-w-full whitespace-pre-wrap break-words font-semibold leading-snug tracking-normal"
+                            className="w-full max-w-full whitespace-nowrap font-semibold leading-snug tracking-normal"
                             style={translationStyle}
                             color={options.translationColor}
                             textShadow={textShadow}
                             outlineEnabled={options.outlineEnabled}
                             outlineColor={options.outlineColor}
                             outlineSize={options.outlineSize}
+                            scrollProgress={currentLine ? lineScrollProgress : undefined}
                         />
                     )}
                 </div>

@@ -216,7 +216,7 @@ interface LyricsWidgetConfig {
 
 const DEFAULT_LYRICS_WIDGET_CONFIG: LyricsWidgetConfig = {
   Alignment: 'center',
-  ShowSongInfo: true,
+  ShowSongInfo: false,
   ShowTranslation: true,
   MainColor: '#ffffff',
   TranslationColor: '#d1d5db',

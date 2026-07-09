@@ -206,7 +206,9 @@ interface LyricsWidgetConfig {
   TranslationColor: string;
   OutlineEnabled: boolean;
   OutlineColor: string;
+  OutlineSize: number;
   ShadowEnabled: boolean;
+  ShadowSize: number;
   FontFamily: string;
   MainFontSize: number;
   TranslationFontSize: number;
@@ -220,11 +222,22 @@ const DEFAULT_LYRICS_WIDGET_CONFIG: LyricsWidgetConfig = {
   TranslationColor: '#d1d5db',
   OutlineEnabled: true,
   OutlineColor: '#000000',
+  OutlineSize: 2,
   ShadowEnabled: true,
+  ShadowSize: 24,
   FontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
   MainFontSize: 56,
   TranslationFontSize: 30
 };
+
+const FALLBACK_FONT_FAMILIES = [
+  'system-ui',
+  'sans-serif',
+  'serif',
+  'monospace'
+];
+
+let cachedFontFamilies: string[] | null = null;
 
 let appConfig: any = {
   roomId: 0,
@@ -430,7 +443,9 @@ function readLyricsWidgetConfig(value: unknown): LyricsWidgetConfig {
     TranslationColor: readColor(value.TranslationColor, DEFAULT_LYRICS_WIDGET_CONFIG.TranslationColor),
     OutlineEnabled: readBoolean(value.OutlineEnabled, DEFAULT_LYRICS_WIDGET_CONFIG.OutlineEnabled),
     OutlineColor: readColor(value.OutlineColor, DEFAULT_LYRICS_WIDGET_CONFIG.OutlineColor),
+    OutlineSize: readBoundedNumber(value.OutlineSize, DEFAULT_LYRICS_WIDGET_CONFIG.OutlineSize, 0, 8),
     ShadowEnabled: readBoolean(value.ShadowEnabled, DEFAULT_LYRICS_WIDGET_CONFIG.ShadowEnabled),
+    ShadowSize: readBoundedNumber(value.ShadowSize, DEFAULT_LYRICS_WIDGET_CONFIG.ShadowSize, 0, 80),
     FontFamily: readString(value.FontFamily) || DEFAULT_LYRICS_WIDGET_CONFIG.FontFamily,
     MainFontSize: readBoundedNumber(value.MainFontSize, DEFAULT_LYRICS_WIDGET_CONFIG.MainFontSize, 24, 96),
     TranslationFontSize: readBoundedNumber(value.TranslationFontSize, DEFAULT_LYRICS_WIDGET_CONFIG.TranslationFontSize, 14, 64)
@@ -442,6 +457,33 @@ function getLyricsWidgetConfig(): LyricsWidgetConfig {
   if (!appConfig.sysConfig) appConfig.sysConfig = {};
   appConfig.sysConfig.LyricsWidget = config;
   return config;
+}
+
+function normalizeFontFamilyName(value: string): string {
+  return value.trim().replace(/^["']|["']$/g, '');
+}
+
+function parseFontFamilies(output: string): string[] {
+  const names = new Set<string>(FALLBACK_FONT_FAMILIES);
+  for (const line of output.split(/\r?\n/)) {
+    for (const item of line.split(',')) {
+      const name = normalizeFontFamilyName(item);
+      if (name && !name.startsWith('.')) names.add(name);
+    }
+  }
+  return [...names].sort((left, right) => left.localeCompare(right, 'zh-Hans'));
+}
+
+async function getSystemFontFamilies(): Promise<string[]> {
+  if (cachedFontFamilies) return cachedFontFamilies;
+
+  try {
+    const { stdout } = await execAsync('fc-list --format="%{family}\\n"', { timeout: 3000, maxBuffer: 1024 * 1024 });
+    cachedFontFamilies = parseFontFamilies(stdout);
+  } catch {
+    cachedFontFamilies = [...FALLBACK_FONT_FAMILIES];
+  }
+  return cachedFontFamilies;
 }
 
 function parseLrcTimestamp(tag: string): number | null {
@@ -1911,12 +1953,21 @@ function startBackendServer() {
       return;
     }
 
+    if (url.pathname === '/api/system/fonts') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ fonts: await getSystemFontFamilies() }));
+      return;
+    }
+
     if (url.pathname === '/api/config') {
       if (req.method === 'POST') {
         const body = JSON.parse(await readRequestBody(req));
         if (body.roomId !== undefined) appConfig.roomId = body.roomId;
         if (body.widgetStyle !== undefined) appConfig.widgetStyle = body.widgetStyle;
-        if (body.sysConfig !== undefined) appConfig.sysConfig = { ...appConfig.sysConfig, ...body.sysConfig };
+        if (body.sysConfig !== undefined) {
+          appConfig.sysConfig = { ...appConfig.sysConfig, ...body.sysConfig };
+          appConfig.sysConfig.LyricsWidget = readLyricsWidgetConfig(appConfig.sysConfig.LyricsWidget);
+        }
         saveConfig();
         res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true }));
         return;

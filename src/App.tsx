@@ -110,7 +110,9 @@ interface LyricsWidgetSettings {
     readonly TranslationColor: string;
     readonly OutlineEnabled: boolean;
     readonly OutlineColor: string;
+    readonly OutlineSize: number;
     readonly ShadowEnabled: boolean;
+    readonly ShadowSize: number;
     readonly FontFamily: string;
     readonly MainFontSize: number;
     readonly TranslationFontSize: number;
@@ -130,10 +132,16 @@ interface LyricsDisplayOptions {
     readonly translationColor: string;
     readonly outlineEnabled: boolean;
     readonly outlineColor: string;
+    readonly outlineSize: number;
     readonly shadowEnabled: boolean;
+    readonly shadowSize: number;
     readonly fontFamily: string;
     readonly mainFontSize: number;
     readonly translationFontSize: number;
+}
+
+interface SystemFontsResponse {
+    readonly fonts: readonly string[];
 }
 
 interface AdminConfigState {
@@ -152,7 +160,9 @@ const defaultLyricsWidgetSettings: LyricsWidgetSettings = {
     TranslationColor: '#d1d5db',
     OutlineEnabled: true,
     OutlineColor: '#000000',
+    OutlineSize: 2,
     ShadowEnabled: true,
+    ShadowSize: 24,
     FontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
     MainFontSize: 56,
     TranslationFontSize: 30
@@ -231,7 +241,9 @@ function readLyricsWidgetSettings(value: unknown): LyricsWidgetSettings {
         TranslationColor: readColor(value.TranslationColor, defaultLyricsWidgetSettings.TranslationColor),
         OutlineEnabled: readBoolean(value.OutlineEnabled, defaultLyricsWidgetSettings.OutlineEnabled),
         OutlineColor: readColor(value.OutlineColor, defaultLyricsWidgetSettings.OutlineColor),
+        OutlineSize: readBoundedNumber(value.OutlineSize, defaultLyricsWidgetSettings.OutlineSize, 0, 8),
         ShadowEnabled: readBoolean(value.ShadowEnabled, defaultLyricsWidgetSettings.ShadowEnabled),
+        ShadowSize: readBoundedNumber(value.ShadowSize, defaultLyricsWidgetSettings.ShadowSize, 0, 80),
         FontFamily: readString(value.FontFamily) || defaultLyricsWidgetSettings.FontFamily,
         MainFontSize: readBoundedNumber(value.MainFontSize, defaultLyricsWidgetSettings.MainFontSize, 24, 96),
         TranslationFontSize: readBoundedNumber(value.TranslationFontSize, defaultLyricsWidgetSettings.TranslationFontSize, 14, 64)
@@ -247,7 +259,9 @@ function toLyricsDisplayOptions(settings: LyricsWidgetSettings): LyricsDisplayOp
         translationColor: settings.TranslationColor,
         outlineEnabled: settings.OutlineEnabled,
         outlineColor: settings.OutlineColor,
+        outlineSize: settings.OutlineSize,
         shadowEnabled: settings.ShadowEnabled,
+        shadowSize: settings.ShadowSize,
         fontFamily: settings.FontFamily,
         mainFontSize: settings.MainFontSize,
         translationFontSize: settings.TranslationFontSize
@@ -287,6 +301,16 @@ function readLyricsApiResponse(value: unknown): LyricsApiResponse {
         cdpConnected: value.cdpConnected === true,
         config: readLyricsWidgetSettings(value.config)
     };
+}
+
+function readStringList(value: unknown): readonly string[] {
+    if (!Array.isArray(value)) return [];
+    return value.filter(item => typeof item === 'string' && item.trim().length > 0);
+}
+
+function readSystemFontsResponse(value: unknown): SystemFontsResponse {
+    if (!isRecord(value)) return { fonts: [] };
+    return { fonts: readStringList(value.fonts) };
 }
 
 function estimatePlayedTime(lyrics: LyricsPayload, now: number): number | null {
@@ -342,18 +366,10 @@ function getLyricsProbeDelay(lyrics: LyricsPayload | null): number {
 }
 
 function buildLyricsTextShadow(options: LyricsDisplayOptions): string | undefined {
-    const shadows: string[] = [];
-    if (options.outlineEnabled) {
-        shadows.push(
-            `0 0 3px ${options.outlineColor}`,
-            `1px 1px 2px ${options.outlineColor}`,
-            `-1px -1px 2px ${options.outlineColor}`
-        );
-    }
-    if (options.shadowEnabled) {
-        shadows.push('0 6px 24px rgba(0, 0, 0, 0.6)');
-    }
-    return shadows.length > 0 ? shadows.join(', ') : undefined;
+    if (!options.shadowEnabled || options.shadowSize <= 0) return undefined;
+
+    const offset = Math.max(1, Math.round(options.shadowSize / 4));
+    return `0 ${offset}px ${options.shadowSize}px rgba(0, 0, 0, 0.6)`;
 }
 
 // ==========================================
@@ -1210,8 +1226,50 @@ interface AdminWidgetProps {
     onClose: () => void;
 }
 
+interface LyricsTextProps {
+    readonly text: string;
+    readonly className: string;
+    readonly style: React.CSSProperties;
+    readonly color: string;
+    readonly textShadow: string | undefined;
+    readonly outlineEnabled: boolean;
+    readonly outlineColor: string;
+    readonly outlineSize: number;
+}
+
+const LyricsText: React.FC<LyricsTextProps> = ({
+    text,
+    className,
+    style,
+    color,
+    textShadow,
+    outlineEnabled,
+    outlineColor,
+    outlineSize
+}) => {
+    const strokeStyle: React.CSSProperties = {
+        color: 'transparent',
+        WebkitTextFillColor: 'transparent',
+        WebkitTextStroke: `${outlineSize}px ${outlineColor}`
+    };
+
+    return (
+        <div className={className} style={{ ...style, position: 'relative' }}>
+            {outlineEnabled && outlineSize > 0 && (
+                <span aria-hidden="true" className="absolute inset-0 block pointer-events-none select-none" style={strokeStyle}>
+                    {text}
+                </span>
+            )}
+            <span className="relative block" style={{ color, textShadow }}>
+                {text}
+            </span>
+        </div>
+    );
+};
+
 const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const [config, setConfig] = useState<any>(null);
+    const [systemFonts, setSystemFonts] = useState<readonly string[]>([]);
     const [activeTab, setActiveTab] = useState<string>('settings');
 
     const [updateInfo, setUpdateInfo] = useState<UpdateInfo>({ checking: false, info: null });
@@ -1287,6 +1345,23 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         fetchConfig();
         const timer = setInterval(fetchConfig, 2000);
         return () => clearInterval(timer);
+    }, []);
+
+    useEffect(() => {
+        let disposed = false;
+        const fetchFonts = async () => {
+            try {
+                const res = await fetch('http://localhost:5555/api/system/fonts');
+                const body: unknown = await res.json();
+                if (!disposed) setSystemFonts(readSystemFontsResponse(body).fonts);
+            } catch {
+                if (!disposed) setSystemFonts([]);
+            }
+        };
+        fetchFonts();
+        return () => {
+            disposed = true;
+        };
     }, []);
 
     useEffect(() => {
@@ -1526,6 +1601,10 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     };
 
     const lyricsWidgetSettings = config?.config ? readLyricsWidgetSettings(config.config.LyricsWidget) : defaultLyricsWidgetSettings;
+    const fontOptions = [
+        ...(systemFonts.includes(lyricsWidgetSettings.FontFamily) ? [] : [lyricsWidgetSettings.FontFamily]),
+        ...systemFonts
+    ];
     const updateLyricsWidgetSetting = <K extends keyof LyricsWidgetSettings>(key: K, value: LyricsWidgetSettings[K]) => {
         setConfig((prev: AdminConfigState | null) => {
             if (!prev?.config) return prev;
@@ -2151,13 +2230,44 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
                                         <div>
                                             <label className="block text-xs text-gray-400 mb-2">字体</label>
-                                            <input
-                                                type="text"
+                                            <select
                                                 value={lyricsWidgetSettings.FontFamily}
                                                 onChange={e => updateLyricsWidgetSetting('FontFamily', e.target.value)}
                                                 className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none"
-                                                placeholder="system-ui, sans-serif"
-                                            />
+                                                style={{ fontFamily: lyricsWidgetSettings.FontFamily }}
+                                            >
+                                                {fontOptions.map(font => (
+                                                    <option key={font} value={font} style={{ fontFamily: font }}>
+                                                        {font}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">描边大小</label>
+                                                <input
+                                                    type="number"
+                                                    min="0"
+                                                    max="8"
+                                                    value={lyricsWidgetSettings.OutlineSize}
+                                                    onChange={e => updateLyricsWidgetSetting('OutlineSize', readBoundedNumber(e.target.value, defaultLyricsWidgetSettings.OutlineSize, 0, 8))}
+                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none"
+                                                />
+                                            </div>
+
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">投影大小</label>
+                                                <input
+                                                    type="number"
+                                                    min="0"
+                                                    max="80"
+                                                    value={lyricsWidgetSettings.ShadowSize}
+                                                    onChange={e => updateLyricsWidgetSetting('ShadowSize', readBoundedNumber(e.target.value, defaultLyricsWidgetSettings.ShadowSize, 0, 80))}
+                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none"
+                                                />
+                                            </div>
                                         </div>
 
                                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -2443,15 +2553,11 @@ const LyricsWidget: React.FC = () => {
         : '';
     const alignItems = options.alignment === 'center' ? 'center' : options.alignment === 'right' ? 'flex-end' : 'flex-start';
     const mainTextStyle: React.CSSProperties = {
-        color: options.textColor,
-        textShadow,
         wordBreak: 'keep-all',
         overflowWrap: 'anywhere',
         fontSize: `clamp(24px, 8vw, ${options.mainFontSize}px)`
     };
     const translationStyle: React.CSSProperties = {
-        color: options.translationColor,
-        textShadow,
         wordBreak: 'keep-all',
         overflowWrap: 'anywhere',
         fontSize: `clamp(18px, 5vw, ${options.translationFontSize}px)`
@@ -2469,28 +2575,40 @@ const LyricsWidget: React.FC = () => {
                     style={{ textAlign: options.alignment, alignItems }}
                 >
                     {options.showSongInfo && songLabel && (
-                        <div
+                        <LyricsText
+                            text={songLabel}
                             className="max-w-full truncate text-xs sm:text-sm md:text-base font-medium tracking-normal"
-                            style={{ color: options.translationColor, textShadow }}
-                        >
-                            {songLabel}
-                        </div>
+                            style={{}}
+                            color={options.translationColor}
+                            textShadow={textShadow}
+                            outlineEnabled={options.outlineEnabled}
+                            outlineColor={options.outlineColor}
+                            outlineSize={options.outlineSize}
+                        />
                     )}
 
-                    <div
+                    <LyricsText
+                        text={mainText}
                         className="max-w-full whitespace-pre-wrap break-words font-bold leading-tight tracking-normal"
                         style={mainTextStyle}
-                    >
-                        {mainText}
-                    </div>
+                        color={options.textColor}
+                        textShadow={textShadow}
+                        outlineEnabled={options.outlineEnabled}
+                        outlineColor={options.outlineColor}
+                        outlineSize={options.outlineSize}
+                    />
 
                     {translation && (
-                        <div
+                        <LyricsText
+                            text={translation}
                             className="max-w-full whitespace-pre-wrap break-words font-semibold leading-snug tracking-normal"
                             style={translationStyle}
-                        >
-                            {translation}
-                        </div>
+                            color={options.translationColor}
+                            textShadow={textShadow}
+                            outlineEnabled={options.outlineEnabled}
+                            outlineColor={options.outlineColor}
+                            outlineSize={options.outlineSize}
+                        />
                     )}
                 </div>
             </div>

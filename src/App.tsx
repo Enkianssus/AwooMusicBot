@@ -79,50 +79,83 @@ interface QrState {
 }
 
 interface LyricLine {
-    index: number;
-    time: number;
-    text: string;
-    translation: string;
+    readonly index: number;
+    readonly time: number;
+    readonly text: string;
+    readonly translation: string;
 }
 
 interface LyricsPayload {
-    trackId: string;
-    songName: string;
-    artistName: string;
-    playedTime: number | null;
-    duration: number | null;
-    progress: number;
-    current: LyricLine | null;
-    previous: LyricLine | null;
-    next: LyricLine | null;
-    hasLyrics: boolean;
-    isLoading: boolean;
-    updatedAt: number;
+    readonly trackId: string;
+    readonly songName: string;
+    readonly artistName: string;
+    readonly playedTime: number | null;
+    readonly duration: number | null;
+    readonly progress: number;
+    readonly lines: LyricLine[];
+    readonly current: LyricLine | null;
+    readonly previous: LyricLine | null;
+    readonly next: LyricLine | null;
+    readonly hasLyrics: boolean;
+    readonly isLoading: boolean;
+    readonly isPlaying: boolean;
+    readonly updatedAt: number;
+}
+
+interface LyricsWidgetSettings {
+    readonly Alignment: 'left' | 'center' | 'right';
+    readonly ShowSongInfo: boolean;
+    readonly ShowTranslation: boolean;
+    readonly MainColor: string;
+    readonly TranslationColor: string;
+    readonly OutlineEnabled: boolean;
+    readonly OutlineColor: string;
+    readonly ShadowEnabled: boolean;
+    readonly FontFamily: string;
+    readonly MainFontSize: number;
+    readonly TranslationFontSize: number;
 }
 
 interface LyricsApiResponse {
-    lyrics: LyricsPayload | null;
-    cdpConnected: boolean;
+    readonly lyrics: LyricsPayload | null;
+    readonly cdpConnected: boolean;
+    readonly config: LyricsWidgetSettings;
 }
 
 interface LyricsDisplayOptions {
-    alignment: 'left' | 'center' | 'right';
-    showTranslation: boolean;
-    textColor: string;
-    translationColor: string;
-    outlineColor: string;
-    progressColor: string;
-    fontFamily: string;
+    readonly alignment: 'left' | 'center' | 'right';
+    readonly showSongInfo: boolean;
+    readonly showTranslation: boolean;
+    readonly textColor: string;
+    readonly translationColor: string;
+    readonly outlineEnabled: boolean;
+    readonly outlineColor: string;
+    readonly shadowEnabled: boolean;
+    readonly fontFamily: string;
+    readonly mainFontSize: number;
+    readonly translationFontSize: number;
 }
 
-const defaultLyricsDisplayOptions: LyricsDisplayOptions = {
-    alignment: 'center',
-    showTranslation: true,
-    textColor: '#ffffff',
-    translationColor: 'rgba(255, 255, 255, 0.72)',
-    outlineColor: 'rgba(0, 0, 0, 0.95)',
-    progressColor: '#22d3ee',
-    fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+interface AdminConfigState {
+    readonly config?: Record<string, unknown>;
+    readonly [key: string]: unknown;
+}
+
+type LyricsToggleSettingKey = 'ShowSongInfo' | 'ShowTranslation' | 'OutlineEnabled' | 'ShadowEnabled';
+type LyricsColorSettingKey = 'MainColor' | 'TranslationColor' | 'OutlineColor';
+
+const defaultLyricsWidgetSettings: LyricsWidgetSettings = {
+    Alignment: 'center',
+    ShowSongInfo: true,
+    ShowTranslation: true,
+    MainColor: '#ffffff',
+    TranslationColor: '#d1d5db',
+    OutlineEnabled: true,
+    OutlineColor: '#000000',
+    ShadowEnabled: true,
+    FontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    MainFontSize: 56,
+    TranslationFontSize: 30
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -142,6 +175,25 @@ function readFiniteNumber(value: unknown): number | null {
     return null;
 }
 
+function readBoolean(value: unknown, fallback: boolean): boolean {
+    return typeof value === 'boolean' ? value : fallback;
+}
+
+function readColor(value: unknown, fallback: string): string {
+    if (typeof value !== 'string') return fallback;
+    return /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback;
+}
+
+function readBoundedNumber(value: unknown, fallback: number, min: number, max: number): number {
+    const parsed = readFiniteNumber(value);
+    if (parsed === null) return fallback;
+    return Math.max(min, Math.min(max, Math.round(parsed)));
+}
+
+function readLyricsAlignment(value: unknown): LyricsWidgetSettings['Alignment'] {
+    return value === 'left' || value === 'right' || value === 'center' ? value : defaultLyricsWidgetSettings.Alignment;
+}
+
 function readLyricLine(value: unknown): LyricLine | null {
     if (!isRecord(value)) return null;
 
@@ -154,6 +206,51 @@ function readLyricLine(value: unknown): LyricLine | null {
         time,
         text: readString(value.text),
         translation: readString(value.translation)
+    };
+}
+
+function readLyricLines(value: unknown): LyricLine[] {
+    if (!Array.isArray(value)) return [];
+
+    const lines: LyricLine[] = [];
+    for (const item of value) {
+        const line = readLyricLine(item);
+        if (line) lines.push(line);
+    }
+    return lines;
+}
+
+function readLyricsWidgetSettings(value: unknown): LyricsWidgetSettings {
+    if (!isRecord(value)) return defaultLyricsWidgetSettings;
+
+    return {
+        Alignment: readLyricsAlignment(value.Alignment),
+        ShowSongInfo: readBoolean(value.ShowSongInfo, defaultLyricsWidgetSettings.ShowSongInfo),
+        ShowTranslation: readBoolean(value.ShowTranslation, defaultLyricsWidgetSettings.ShowTranslation),
+        MainColor: readColor(value.MainColor, defaultLyricsWidgetSettings.MainColor),
+        TranslationColor: readColor(value.TranslationColor, defaultLyricsWidgetSettings.TranslationColor),
+        OutlineEnabled: readBoolean(value.OutlineEnabled, defaultLyricsWidgetSettings.OutlineEnabled),
+        OutlineColor: readColor(value.OutlineColor, defaultLyricsWidgetSettings.OutlineColor),
+        ShadowEnabled: readBoolean(value.ShadowEnabled, defaultLyricsWidgetSettings.ShadowEnabled),
+        FontFamily: readString(value.FontFamily) || defaultLyricsWidgetSettings.FontFamily,
+        MainFontSize: readBoundedNumber(value.MainFontSize, defaultLyricsWidgetSettings.MainFontSize, 24, 96),
+        TranslationFontSize: readBoundedNumber(value.TranslationFontSize, defaultLyricsWidgetSettings.TranslationFontSize, 14, 64)
+    };
+}
+
+function toLyricsDisplayOptions(settings: LyricsWidgetSettings): LyricsDisplayOptions {
+    return {
+        alignment: settings.Alignment,
+        showSongInfo: settings.ShowSongInfo,
+        showTranslation: settings.ShowTranslation,
+        textColor: settings.MainColor,
+        translationColor: settings.TranslationColor,
+        outlineEnabled: settings.OutlineEnabled,
+        outlineColor: settings.OutlineColor,
+        shadowEnabled: settings.ShadowEnabled,
+        fontFamily: settings.FontFamily,
+        mainFontSize: settings.MainFontSize,
+        translationFontSize: settings.TranslationFontSize
     };
 }
 
@@ -171,22 +268,92 @@ function readLyricsPayload(value: unknown): LyricsPayload | null {
         playedTime: readFiniteNumber(value.playedTime),
         duration: readFiniteNumber(value.duration),
         progress: Math.max(0, Math.min(1, progress)),
+        lines: readLyricLines(value.lines),
         current: readLyricLine(value.current),
         previous: readLyricLine(value.previous),
         next: readLyricLine(value.next),
         hasLyrics: value.hasLyrics === true,
         isLoading: value.isLoading === true,
+        isPlaying: value.isPlaying === true,
         updatedAt
     };
 }
 
 function readLyricsApiResponse(value: unknown): LyricsApiResponse {
-    if (!isRecord(value)) return { lyrics: null, cdpConnected: false };
+    if (!isRecord(value)) return { lyrics: null, cdpConnected: false, config: defaultLyricsWidgetSettings };
 
     return {
         lyrics: readLyricsPayload(value.lyrics),
-        cdpConnected: value.cdpConnected === true
+        cdpConnected: value.cdpConnected === true,
+        config: readLyricsWidgetSettings(value.config)
     };
+}
+
+function estimatePlayedTime(lyrics: LyricsPayload, now: number): number | null {
+    if (lyrics.playedTime === null) return null;
+    if (!lyrics.isPlaying) return lyrics.playedTime;
+
+    const elapsedSeconds = Math.max(0, (now - lyrics.updatedAt) / 1000);
+    const estimated = lyrics.playedTime + elapsedSeconds;
+    return lyrics.duration === null ? estimated : Math.min(lyrics.duration, estimated);
+}
+
+function findLyricLineIndex(lines: LyricLine[], playedTime: number | null): number {
+    if (playedTime === null) return -1;
+    for (let index = lines.length - 1; index >= 0; index--) {
+        if (playedTime >= lines[index].time) return index;
+    }
+    return -1;
+}
+
+function resolveLocalLyrics(lyrics: LyricsPayload | null, now: number): LyricsPayload | null {
+    if (!lyrics || lyrics.lines.length === 0) return lyrics;
+
+    const playedTime = estimatePlayedTime(lyrics, now);
+    const index = findLyricLineIndex(lyrics.lines, playedTime);
+    if (index < 0) return { ...lyrics, playedTime, current: null, previous: null, next: lyrics.lines[0] || null };
+
+    const current = lyrics.lines[index] || null;
+    const previous = index > 0 ? lyrics.lines[index - 1] || null : null;
+    const next = index + 1 < lyrics.lines.length ? lyrics.lines[index + 1] || null : null;
+    const progress = current && next && playedTime !== null && next.time > current.time
+        ? Math.max(0, Math.min(1, (playedTime - current.time) / (next.time - current.time)))
+        : 0;
+
+    return { ...lyrics, playedTime, progress, current, previous, next };
+}
+
+function getLyricsProbeDelay(lyrics: LyricsPayload | null): number {
+    if (!lyrics || lyrics.isLoading || !lyrics.hasLyrics) return 250;
+
+    const playedTime = estimatePlayedTime(lyrics, Date.now());
+    if (playedTime !== null && lyrics.duration !== null && lyrics.duration - playedTime < 2) return 200;
+    if (!lyrics.isPlaying) return 1200;
+
+    const localLyrics = resolveLocalLyrics(lyrics, Date.now());
+    if (localLyrics?.next && playedTime !== null) {
+        const nextLineDelay = (localLyrics.next.time - playedTime) * 1000;
+        if (nextLineDelay < 300) return 120;
+        if (nextLineDelay < 1500) return 250;
+        return Math.min(1400, Math.max(500, nextLineDelay - 300));
+    }
+
+    return 900;
+}
+
+function buildLyricsTextShadow(options: LyricsDisplayOptions): string | undefined {
+    const shadows: string[] = [];
+    if (options.outlineEnabled) {
+        shadows.push(
+            `0 0 3px ${options.outlineColor}`,
+            `1px 1px 2px ${options.outlineColor}`,
+            `-1px -1px 2px ${options.outlineColor}`
+        );
+    }
+    if (options.shadowEnabled) {
+        shadows.push('0 6px 24px rgba(0, 0, 0, 0.6)');
+    }
+    return shadows.length > 0 ? shadows.join(', ') : undefined;
 }
 
 // ==========================================
@@ -1358,6 +1525,52 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         }));
     };
 
+    const lyricsWidgetSettings = config?.config ? readLyricsWidgetSettings(config.config.LyricsWidget) : defaultLyricsWidgetSettings;
+    const updateLyricsWidgetSetting = <K extends keyof LyricsWidgetSettings>(key: K, value: LyricsWidgetSettings[K]) => {
+        setConfig((prev: AdminConfigState | null) => {
+            if (!prev?.config) return prev;
+            const current = readLyricsWidgetSettings(prev.config.LyricsWidget);
+            return {
+                ...prev,
+                config: {
+                    ...prev.config,
+                    LyricsWidget: {
+                        ...current,
+                        [key]: value
+                    }
+                }
+            };
+        });
+    };
+
+    const renderLyricsToggle = (key: LyricsToggleSettingKey, label: string) => {
+        const enabled = lyricsWidgetSettings[key];
+        return (
+            <button
+                key={key}
+                onClick={() => updateLyricsWidgetSetting(key, !enabled)}
+                className={`flex items-center justify-between rounded-lg border px-3 py-2.5 text-sm transition-colors ${enabled ? 'bg-cyan-500/15 border-cyan-400/40 text-cyan-100' : 'bg-black/30 border-white/10 text-gray-400'}`}
+            >
+                <span>{label}</span>
+                <span className={`h-5 w-9 rounded-full p-0.5 transition-colors ${enabled ? 'bg-cyan-500' : 'bg-gray-600'}`}>
+                    <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${enabled ? 'translate-x-4' : 'translate-x-0'}`}></span>
+                </span>
+            </button>
+        );
+    };
+
+    const renderLyricsColorInput = (key: LyricsColorSettingKey, label: string) => (
+        <label key={key} className="flex items-center gap-3 bg-black/30 border border-white/10 rounded-lg p-2.5">
+            <input
+                type="color"
+                value={lyricsWidgetSettings[key]}
+                onChange={e => updateLyricsWidgetSetting(key, readColor(e.target.value, lyricsWidgetSettings[key]))}
+                className="h-8 w-10 rounded bg-transparent cursor-pointer"
+            />
+            <span className="text-sm text-gray-300">{label}</span>
+        </label>
+    );
+
     const addSuperUser = () => {
         if(!superUserInput.trim()) return;
         const currentSu = config.config.SuperUsers || [];
@@ -1888,6 +2101,73 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                     </div>
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
+                                        <h3 className="text-sm font-bold text-cyan-400 uppercase tracking-widest border-b border-white/10 pb-3">歌词窗口样式</h3>
+
+                                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                            {renderLyricsToggle('ShowSongInfo', '显示歌名')}
+                                            {renderLyricsToggle('ShowTranslation', '显示翻译')}
+                                            {renderLyricsToggle('OutlineEnabled', '文字描边')}
+                                            {renderLyricsToggle('ShadowEnabled', '投影阴影')}
+                                        </div>
+
+                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">对齐方式</label>
+                                                <select
+                                                    value={lyricsWidgetSettings.Alignment}
+                                                    onChange={e => updateLyricsWidgetSetting('Alignment', readLyricsAlignment(e.target.value))}
+                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none"
+                                                >
+                                                    <option value="left">左对齐</option>
+                                                    <option value="center">居中</option>
+                                                    <option value="right">右对齐</option>
+                                                </select>
+                                            </div>
+
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">主歌词字号</label>
+                                                <input
+                                                    type="number"
+                                                    min="24"
+                                                    max="96"
+                                                    value={lyricsWidgetSettings.MainFontSize}
+                                                    onChange={e => updateLyricsWidgetSetting('MainFontSize', readBoundedNumber(e.target.value, defaultLyricsWidgetSettings.MainFontSize, 24, 96))}
+                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none"
+                                                />
+                                            </div>
+
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">翻译字号</label>
+                                                <input
+                                                    type="number"
+                                                    min="14"
+                                                    max="64"
+                                                    value={lyricsWidgetSettings.TranslationFontSize}
+                                                    onChange={e => updateLyricsWidgetSetting('TranslationFontSize', readBoundedNumber(e.target.value, defaultLyricsWidgetSettings.TranslationFontSize, 14, 64))}
+                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-xs text-gray-400 mb-2">字体</label>
+                                            <input
+                                                type="text"
+                                                value={lyricsWidgetSettings.FontFamily}
+                                                onChange={e => updateLyricsWidgetSetting('FontFamily', e.target.value)}
+                                                className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none"
+                                                placeholder="system-ui, sans-serif"
+                                            />
+                                        </div>
+
+                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                            {renderLyricsColorInput('MainColor', '主歌词颜色')}
+                                            {renderLyricsColorInput('TranslationColor', '翻译颜色')}
+                                            {renderLyricsColorInput('OutlineColor', '描边颜色')}
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
                                         <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3">⏱️ 点歌冷却设置 (秒)</h3>
                                         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                                             <div>
@@ -2102,18 +2382,17 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
 const LyricsWidget: React.FC = () => {
     const [lyrics, setLyrics] = useState<LyricsPayload | null>(null);
+    const [settings, setSettings] = useState<LyricsWidgetSettings>(defaultLyricsWidgetSettings);
     const [cdpConnected, setCdpConnected] = useState(false);
     const [requestFailed, setRequestFailed] = useState(false);
-    const options = defaultLyricsDisplayOptions;
-    const textShadow = [
-        `0 0 3px ${options.outlineColor}`,
-        `1px 1px 2px ${options.outlineColor}`,
-        `-1px -1px 2px ${options.outlineColor}`,
-        '0 6px 24px rgba(0, 0, 0, 0.6)'
-    ].join(', ');
+    const [clockNow, setClockNow] = useState(() => Date.now());
+    const options = toLyricsDisplayOptions(settings);
+    const displayedLyrics = resolveLocalLyrics(lyrics, clockNow);
+    const textShadow = buildLyricsTextShadow(options);
 
     useEffect(() => {
         let disposed = false;
+        let timer: number | null = null;
 
         const refreshLyrics = async () => {
             try {
@@ -2122,39 +2401,61 @@ const LyricsWidget: React.FC = () => {
                 const parsed = readLyricsApiResponse(body);
                 if (disposed) return;
                 setLyrics(parsed.lyrics);
+                setSettings(parsed.config);
                 setCdpConnected(parsed.cdpConnected);
                 setRequestFailed(false);
+                timer = window.setTimeout(refreshLyrics, getLyricsProbeDelay(parsed.lyrics));
             } catch {
                 if (disposed) return;
                 setLyrics(null);
                 setCdpConnected(false);
                 setRequestFailed(true);
+                timer = window.setTimeout(refreshLyrics, 300);
             }
         };
 
         refreshLyrics();
-        const timer = window.setInterval(refreshLyrics, 500);
         return () => {
             disposed = true;
-            window.clearInterval(timer);
+            if (timer !== null) window.clearTimeout(timer);
         };
     }, []);
 
-    const currentLine = lyrics?.current;
+    useEffect(() => {
+        const timer = window.setInterval(() => setClockNow(Date.now()), 80);
+        return () => window.clearInterval(timer);
+    }, []);
+
+    const currentLine = displayedLyrics?.current;
     const translation = options.showTranslation ? currentLine?.translation : '';
     const statusText = requestFailed
         ? '歌词服务未连接'
         : !cdpConnected
             ? '等待网易云连接'
-            : lyrics?.isLoading
+            : displayedLyrics?.isLoading
                 ? '歌词加载中'
-                : lyrics && !lyrics.hasLyrics
+                : displayedLyrics && !displayedLyrics.hasLyrics
                     ? '暂无歌词'
                     : '等待播放';
     const mainText = currentLine?.text || statusText;
-    const songLabel = lyrics?.songName
-        ? `${lyrics.songName}${lyrics.artistName ? ` - ${lyrics.artistName}` : ''}`
+    const songLabel = displayedLyrics?.songName
+        ? `${displayedLyrics.songName}${displayedLyrics.artistName ? ` - ${displayedLyrics.artistName}` : ''}`
         : '';
+    const alignItems = options.alignment === 'center' ? 'center' : options.alignment === 'right' ? 'flex-end' : 'flex-start';
+    const mainTextStyle: React.CSSProperties = {
+        color: options.textColor,
+        textShadow,
+        wordBreak: 'keep-all',
+        overflowWrap: 'anywhere',
+        fontSize: `clamp(24px, 8vw, ${options.mainFontSize}px)`
+    };
+    const translationStyle: React.CSSProperties = {
+        color: options.translationColor,
+        textShadow,
+        wordBreak: 'keep-all',
+        overflowWrap: 'anywhere',
+        fontSize: `clamp(18px, 5vw, ${options.translationFontSize}px)`
+    };
 
     return (
         <>
@@ -2165,9 +2466,9 @@ const LyricsWidget: React.FC = () => {
             >
                 <div
                     className="w-full max-w-5xl flex flex-col gap-4"
-                    style={{ textAlign: options.alignment, alignItems: options.alignment === 'center' ? 'center' : options.alignment === 'right' ? 'flex-end' : 'flex-start' }}
+                    style={{ textAlign: options.alignment, alignItems }}
                 >
-                    {songLabel && (
+                    {options.showSongInfo && songLabel && (
                         <div
                             className="max-w-full truncate text-xs sm:text-sm md:text-base font-medium tracking-normal"
                             style={{ color: options.translationColor, textShadow }}
@@ -2177,27 +2478,18 @@ const LyricsWidget: React.FC = () => {
                     )}
 
                     <div
-                        className="max-w-full whitespace-pre-wrap break-words text-2xl sm:text-5xl md:text-6xl font-bold leading-tight tracking-normal"
-                        style={{ color: options.textColor, textShadow, wordBreak: 'keep-all', overflowWrap: 'anywhere' }}
+                        className="max-w-full whitespace-pre-wrap break-words font-bold leading-tight tracking-normal"
+                        style={mainTextStyle}
                     >
                         {mainText}
                     </div>
 
                     {translation && (
                         <div
-                            className="max-w-full whitespace-pre-wrap break-words text-lg sm:text-2xl md:text-3xl font-semibold leading-snug tracking-normal"
-                            style={{ color: options.translationColor, textShadow, wordBreak: 'keep-all', overflowWrap: 'anywhere' }}
+                            className="max-w-full whitespace-pre-wrap break-words font-semibold leading-snug tracking-normal"
+                            style={translationStyle}
                         >
                             {translation}
-                        </div>
-                    )}
-
-                    {lyrics?.hasLyrics && cdpConnected && (
-                        <div className="h-1 w-full max-w-xl overflow-hidden rounded-full bg-white/20">
-                            <div
-                                className="h-full rounded-full transition-all duration-300"
-                                style={{ width: `${lyrics.progress * 100}%`, background: options.progressColor }}
-                            />
                         </div>
                     )}
                 </div>

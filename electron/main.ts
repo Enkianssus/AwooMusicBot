@@ -196,6 +196,36 @@ ipcMain.on('overlay-resize', (event, w, h) => {
 
 const CONFIG_PATH = path.join(app.getPath('userData'), 'bili_bot_config.json');
 
+type LyricsTextAlign = 'left' | 'center' | 'right';
+
+interface LyricsWidgetConfig {
+  Alignment: LyricsTextAlign;
+  ShowSongInfo: boolean;
+  ShowTranslation: boolean;
+  MainColor: string;
+  TranslationColor: string;
+  OutlineEnabled: boolean;
+  OutlineColor: string;
+  ShadowEnabled: boolean;
+  FontFamily: string;
+  MainFontSize: number;
+  TranslationFontSize: number;
+}
+
+const DEFAULT_LYRICS_WIDGET_CONFIG: LyricsWidgetConfig = {
+  Alignment: 'center',
+  ShowSongInfo: true,
+  ShowTranslation: true,
+  MainColor: '#ffffff',
+  TranslationColor: '#d1d5db',
+  OutlineEnabled: true,
+  OutlineColor: '#000000',
+  ShadowEnabled: true,
+  FontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+  MainFontSize: 56,
+  TranslationFontSize: 30
+};
+
 let appConfig: any = {
   roomId: 0,
   myRoomId: 0,
@@ -211,6 +241,7 @@ let appConfig: any = {
     IdleWaitNext: true,
     ShowAllDanmaku: false,
     SuperUsers: [],
+    LyricsWidget: DEFAULT_LYRICS_WIDGET_CONFIG,
     NcmExePath: ""
   }
 };
@@ -222,10 +253,11 @@ function loadConfig() {
       appConfig = { ...appConfig, ...saved };
 
       if (!appConfig.sysConfig) {
-        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', EnableCDP: true, CdpPort: 9222, Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], NcmExePath: "" };
+        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', EnableCDP: true, CdpPort: 9222, Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], LyricsWidget: DEFAULT_LYRICS_WIDGET_CONFIG, NcmExePath: "" };
       }
       if (!appConfig.sysConfig.PlayerType) appConfig.sysConfig.PlayerType = appConfig.sysConfig.EnableCDP === false ? 'None' : 'NCM';
       if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
+      appConfig.sysConfig.LyricsWidget = readLyricsWidgetConfig(appConfig.sysConfig.LyricsWidget);
 
       if (appConfig.sysConfig.CooldownMinutes !== undefined && !appConfig.sysConfig.Cooldowns) {
         const oldSecs = appConfig.sysConfig.CooldownMinutes * 60;
@@ -283,11 +315,13 @@ interface CurrentLyricsPayload {
   playedTime: number | null;
   duration: number | null;
   progress: number;
+  lines: CurrentLyricLine[];
   current: CurrentLyricLine | null;
   previous: CurrentLyricLine | null;
   next: CurrentLyricLine | null;
   hasLyrics: boolean;
   isLoading: boolean;
+  isPlaying: boolean;
   updatedAt: number;
 }
 
@@ -355,13 +389,59 @@ function readLyricsPayload(value: unknown): CurrentLyricsPayload | null {
     playedTime: readFiniteNumber(value.playedTime),
     duration: readFiniteNumber(value.duration),
     progress: Math.max(0, Math.min(1, progress)),
+    lines: [],
     current: readLyricLine(value.current),
     previous: readLyricLine(value.previous),
     next: readLyricLine(value.next),
     hasLyrics: value.hasLyrics === true,
     isLoading: value.isLoading === true,
+    isPlaying: value.isPlaying === true,
     updatedAt
   };
+}
+
+function readBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function readColor(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback;
+  return /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback;
+}
+
+function readBoundedNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = readFiniteNumber(value);
+  if (parsed === null) return fallback;
+  return Math.max(min, Math.min(max, Math.round(parsed)));
+}
+
+function readLyricsAlignment(value: unknown): LyricsTextAlign {
+  return value === 'left' || value === 'right' || value === 'center' ? value : DEFAULT_LYRICS_WIDGET_CONFIG.Alignment;
+}
+
+function readLyricsWidgetConfig(value: unknown): LyricsWidgetConfig {
+  if (!isRecord(value)) return DEFAULT_LYRICS_WIDGET_CONFIG;
+
+  return {
+    Alignment: readLyricsAlignment(value.Alignment),
+    ShowSongInfo: readBoolean(value.ShowSongInfo, DEFAULT_LYRICS_WIDGET_CONFIG.ShowSongInfo),
+    ShowTranslation: readBoolean(value.ShowTranslation, DEFAULT_LYRICS_WIDGET_CONFIG.ShowTranslation),
+    MainColor: readColor(value.MainColor, DEFAULT_LYRICS_WIDGET_CONFIG.MainColor),
+    TranslationColor: readColor(value.TranslationColor, DEFAULT_LYRICS_WIDGET_CONFIG.TranslationColor),
+    OutlineEnabled: readBoolean(value.OutlineEnabled, DEFAULT_LYRICS_WIDGET_CONFIG.OutlineEnabled),
+    OutlineColor: readColor(value.OutlineColor, DEFAULT_LYRICS_WIDGET_CONFIG.OutlineColor),
+    ShadowEnabled: readBoolean(value.ShadowEnabled, DEFAULT_LYRICS_WIDGET_CONFIG.ShadowEnabled),
+    FontFamily: readString(value.FontFamily) || DEFAULT_LYRICS_WIDGET_CONFIG.FontFamily,
+    MainFontSize: readBoundedNumber(value.MainFontSize, DEFAULT_LYRICS_WIDGET_CONFIG.MainFontSize, 24, 96),
+    TranslationFontSize: readBoundedNumber(value.TranslationFontSize, DEFAULT_LYRICS_WIDGET_CONFIG.TranslationFontSize, 14, 64)
+  };
+}
+
+function getLyricsWidgetConfig(): LyricsWidgetConfig {
+  const config = readLyricsWidgetConfig(appConfig.sysConfig?.LyricsWidget);
+  if (!appConfig.sysConfig) appConfig.sysConfig = {};
+  appConfig.sysConfig.LyricsWidget = config;
+  return config;
 }
 
 function parseLrcTimestamp(tag: string): number | null {
@@ -472,6 +552,15 @@ function buildLyricLine(trackLyrics: TrackLyrics, index: number): CurrentLyricLi
   };
 }
 
+function buildLyricsLines(trackLyrics: TrackLyrics): CurrentLyricLine[] {
+  const lines: CurrentLyricLine[] = [];
+  for (let index = 0; index < trackLyrics.lines.length; index++) {
+    const line = buildLyricLine(trackLyrics, index);
+    if (line) lines.push(line);
+  }
+  return lines;
+}
+
 function composeCurrentLyrics(snapshot: CurrentLyricsPayload, trackLyrics: TrackLyrics): CurrentLyricsPayload {
   const currentIndex = findCurrentLyricIndex(trackLyrics.lines, snapshot.playedTime);
   const current = currentIndex >= 0 ? buildLyricLine(trackLyrics, currentIndex) : null;
@@ -484,6 +573,7 @@ function composeCurrentLyrics(snapshot: CurrentLyricsPayload, trackLyrics: Track
   return {
     ...snapshot,
     progress,
+    lines: buildLyricsLines(trackLyrics),
     current,
     previous,
     next,
@@ -498,6 +588,7 @@ function setLyricsLoading(snapshot: CurrentLyricsPayload): void {
   currentLyrics = {
     ...snapshot,
     progress: 0,
+    lines: [],
     current: null,
     previous: null,
     next: null,
@@ -1245,7 +1336,7 @@ async function startCDPRadar() {
 
         const radarScript = FiberStoreExtractJs + `
           ;(function initRadar() {
-              const lyricsRadarVersion = 2;
+              const lyricsRadarVersion = 3;
               if (typeof window.__ncmRadarCallback !== 'function') { setTimeout(initRadar, 500); return; }
               window.__debug_store_log = []; 
               if (!_ensureStore()) { 
@@ -1364,11 +1455,13 @@ async function startCDPRadar() {
                           playedTime,
                           duration,
                           progress,
+                          lines: [],
                           current,
                           previous,
                           next,
                           hasLyrics: lines.length > 0,
                           isLoading: lines.length === 0 && Boolean(trackId),
+                          isPlaying: playing.playingState === 2,
                           updatedAt: Date.now()
                       };
 
@@ -1814,7 +1907,7 @@ function startBackendServer() {
 
     if (url.pathname === '/api/lyrics') {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ lyrics: currentLyrics, cdpConnected: isCdpConnected }));
+      res.end(JSON.stringify({ lyrics: currentLyrics, cdpConnected: isCdpConnected, config: getLyricsWidgetConfig(), serverTime: Date.now() }));
       return;
     }
 
@@ -1829,7 +1922,7 @@ function startBackendServer() {
         return;
       }
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ roomId: appConfig.roomId, myRoomId: appConfig.myRoomId || 0, biliLogin: !!biliCookie, uid: biliUid, currentUser: currentUserInfo, version: app.getVersion(), accepting: isAccepting, playing: isPlaying, widgetStyle: appConfig.widgetStyle, cdpConnected: isCdpConnected, config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 } } }));
+      res.end(JSON.stringify({ roomId: appConfig.roomId, myRoomId: appConfig.myRoomId || 0, biliLogin: !!biliCookie, uid: biliUid, currentUser: currentUserInfo, version: app.getVersion(), accepting: isAccepting, playing: isPlaying, widgetStyle: appConfig.widgetStyle, cdpConnected: isCdpConnected, config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, LyricsWidget: DEFAULT_LYRICS_WIDGET_CONFIG } }));
       return;
     }
 

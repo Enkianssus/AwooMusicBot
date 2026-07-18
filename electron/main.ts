@@ -143,9 +143,27 @@ function loadWindow(win: BrowserWindow, queryParams: string) {
   }
 }
 
+const DEFAULT_OVERLAY_SIZE = { width: 400, height: 580 };
+const MIN_OVERLAY_SIZE = { width: 280, height: 380 };
+
+function normalizeWindowDimension(value: unknown, fallback: number, minimum: number): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(minimum, Math.round(value))
+    : fallback;
+}
+
+function getSavedOverlaySize() {
+  const savedSize = appConfig.widgetStyle?.size;
+  return {
+    width: normalizeWindowDimension(savedSize?.w, DEFAULT_OVERLAY_SIZE.width, MIN_OVERLAY_SIZE.width),
+    height: normalizeWindowDimension(savedSize?.h, DEFAULT_OVERLAY_SIZE.height, MIN_OVERLAY_SIZE.height)
+  };
+}
+
 function createOverlayWindow() {
+  const { width, height } = getSavedOverlaySize();
   overlayWindow = new BrowserWindow({
-    width: 400, height: 580, minWidth: 280, minHeight: 380,
+    width, height, minWidth: MIN_OVERLAY_SIZE.width, minHeight: MIN_OVERLAY_SIZE.height,
     frame: false, transparent: true, hasShadow: false,
     backgroundColor: '#00000000', alwaysOnTop: true,
     resizable: false,
@@ -182,12 +200,17 @@ ipcMain.on('minimize-window', (event) => {
 });
 ipcMain.on('overlay-resize', (event, w, h) => {
   const win = BrowserWindow.fromWebContents(event.sender);
-  if (win) {
-    win.setBounds({ width: w, height: h });
-    if (!appConfig.widgetStyle) {
-      appConfig.widgetStyle = { theme: null, pos: { x: 50, y: 50 }, size: { w, h }, timestamp: Date.now() };
+  if (win && win === overlayWindow) {
+    const currentBounds = win.getBounds();
+    const width = normalizeWindowDimension(w, currentBounds.width, MIN_OVERLAY_SIZE.width);
+    const height = normalizeWindowDimension(h, currentBounds.height, MIN_OVERLAY_SIZE.height);
+    win.setBounds({ width, height });
+
+    const resizedBounds = win.getBounds();
+    if (!appConfig.widgetStyle || typeof appConfig.widgetStyle !== 'object') {
+      appConfig.widgetStyle = { theme: null, pos: { x: 50, y: 50 }, size: { w: resizedBounds.width, h: resizedBounds.height }, timestamp: Date.now() };
     } else {
-      appConfig.widgetStyle.size = { w, h };
+      appConfig.widgetStyle.size = { w: resizedBounds.width, h: resizedBounds.height };
       appConfig.widgetStyle.timestamp = Date.now();
     }
     saveConfig();
@@ -283,6 +306,41 @@ async function addReject(user: any, reason: string) {
 let currentBiliWs: any = null;
 let biliPingTimer: NodeJS.Timeout | null = null;
 
+interface BiliDanmuEndpoint {
+  host: string;
+  port: number;
+  url: string;
+}
+
+function getBiliDanmuEndpoints(danmuData: any): BiliDanmuEndpoint[] {
+  const data = danmuData?.data || {};
+  const rawHosts = [
+    ...(Array.isArray(data.host_list) ? data.host_list : []),
+    ...(Array.isArray(data.host_server_list) ? data.host_server_list : [])
+  ];
+  const endpoints: BiliDanmuEndpoint[] = [];
+  const seen = new Set<string>();
+
+  for (const item of rawHosts) {
+    const host = typeof item?.host === 'string' ? item.host.trim() : '';
+    const rawPort = Number(item?.wss_port);
+    const port = Number.isInteger(rawPort) && rawPort > 0 && rawPort <= 65535 ? rawPort : 443;
+    if (!host || !/^[a-z0-9.-]+$/i.test(host)) continue;
+
+    const key = `${host}:${port}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    endpoints.push({ host, port, url: `wss://${host}${port === 443 ? '' : `:${port}`}/sub` });
+  }
+
+  const fallbackHost = 'broadcastlv.chat.bilibili.com';
+  const fallbackKey = `${fallbackHost}:443`;
+  if (!seen.has(fallbackKey)) {
+    endpoints.push({ host: fallbackHost, port: 443, url: `wss://${fallbackHost}/sub` });
+  }
+  return endpoints;
+}
+
 async function connectToLiveRoom(shortRoomId: number): Promise<boolean> {
   try {
     const headers: any = { "User-Agent": "Mozilla/5.0", "Referer": `https://live.bilibili.com/${shortRoomId}` };
@@ -290,18 +348,33 @@ async function connectToLiveRoom(shortRoomId: number): Promise<boolean> {
 
     const initRes = await fetch(`https://api.live.bilibili.com/room/v1/Room/room_init?id=${shortRoomId}`, { headers });
     const initData: any = await initRes.json();
-    if (initData.code !== 0) return false;
+    if (initData.code !== 0) {
+      writeLog(`[Bilibili] 房间初始化失败，code=${initData.code}`, 'Yellow');
+      return false;
+    }
 
     const realRoomId = initData.data?.room_id || shortRoomId;
     let danmuRes = await fetch(`https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=${realRoomId}&type=0`, { headers });
     let danmuData: any = await danmuRes.json();
 
     if (JSON.stringify(danmuData).includes("-352") || danmuData.code !== 0) {
+      writeLog(`[Bilibili] 新版弹幕接口不可用，code=${danmuData.code}，尝试兼容接口`, 'Yellow');
       const fallbackRes = await fetch(`https://api.live.bilibili.com/room/v1/Danmu/getConf?room_id=${realRoomId}&platform=pc&player=web`, { headers });
       danmuData = await fallbackRes.json();
     }
 
     const token = danmuData.data?.token || "";
+    if (danmuData.code !== 0 || !token) {
+      writeLog(`[Bilibili] 无法获取弹幕鉴权信息，code=${danmuData.code}`, 'Red');
+      return false;
+    }
+
+    const endpoints = getBiliDanmuEndpoints(danmuData);
+    if (endpoints.length === 0) {
+      writeLog('[Bilibili] 接口未返回可用的弹幕节点', 'Red');
+      return false;
+    }
+
     let finalBuvid = "999E9060-EA3F-0F79-7BDC-A14879D11DCB95434infoc";
     const b3Match = biliCookie.match(/buvid3=([^;]+)/);
     if (b3Match) finalBuvid = b3Match[1];
@@ -309,38 +382,90 @@ async function connectToLiveRoom(shortRoomId: number): Promise<boolean> {
     appConfig.roomId = shortRoomId;
     saveConfig();
 
-    startBiliWebSocket({ uid: biliUid || 0, roomid: realRoomId, protover: 3, buvid: finalBuvid, support_ack: true, type: 2, key: token });
+    startBiliWebSocket(
+      { uid: biliUid || 0, roomid: realRoomId, protover: 3, buvid: finalBuvid, support_ack: true, type: 2, key: token },
+      endpoints
+    );
     return true;
-  } catch { return false; }
+  } catch (err: any) {
+    writeLog(`[Bilibili] 连接直播间失败：${err?.message || err}`, 'Red');
+    return false;
+  }
 }
 
-function startBiliWebSocket(authObj: any) {
-  if (currentBiliWs) { try { currentBiliWs.close(); } catch {} }
-  if (biliPingTimer) clearInterval(biliPingTimer);
+function readBiliAuthReply(buffer: Buffer): { code: number, message?: string } | null {
+  let offset = 0;
+  while (offset + 16 <= buffer.length) {
+    const packetLen = buffer.readInt32BE(offset);
+    const headerLen = buffer.readInt16BE(offset + 4);
+    const op = buffer.readInt32BE(offset + 8);
+    if (packetLen < 16 || offset + packetLen > buffer.length) break;
+
+    if (op === 8) {
+      try {
+        const reply = JSON.parse(buffer.subarray(offset + headerLen, offset + packetLen).toString('utf-8'));
+        return { code: Number(reply?.code), message: reply?.message };
+      } catch {
+        return { code: -1, message: 'invalid auth reply' };
+      }
+    }
+    offset += packetLen;
+  }
+  return null;
+}
+
+function startBiliWebSocket(authObj: any, endpoints: BiliDanmuEndpoint[], endpointIndex: number = 0) {
+  if (currentBiliWs) {
+    const previousWs = currentBiliWs;
+    currentBiliWs = null;
+    try { previousWs.close(); } catch {}
+  }
+  if (biliPingTimer) {
+    clearInterval(biliPingTimer);
+    biliPingTimer = null;
+  }
 
   const WebSocketClient = getWebSocketClient();
-  if (!WebSocketClient) return;
+  if (!WebSocketClient || endpoints.length === 0) return;
 
   const isNodeWs = typeof WebSocketClient.prototype?.on === 'function';
   const wsOptions = isNodeWs ? { headers: { "User-Agent": "Mozilla/5.0" } } : undefined;
+  const normalizedIndex = endpointIndex % endpoints.length;
+  const endpoint = endpoints[normalizedIndex];
 
-  const ws = new WebSocketClient("wss://broadcastlv.chat.bilibili.com/sub", wsOptions);
+  writeLog(`[Bilibili] 正在连接弹幕节点 ${endpoint.host}:${endpoint.port}`, 'Gray');
+  const ws = new WebSocketClient(endpoint.url, wsOptions);
   currentBiliWs = ws;
+  let authenticated = false;
+  let reconnectScheduled = false;
+
+  const scheduleReconnect = (reason: string) => {
+    if (reconnectScheduled || currentBiliWs !== ws) return;
+    reconnectScheduled = true;
+    clearTimeout(connectionTimer);
+    if (biliPingTimer) {
+      clearInterval(biliPingTimer);
+      biliPingTimer = null;
+    }
+    writeLog(`[Bilibili] 节点 ${endpoint.host} ${reason}，切换下一个节点`, 'Yellow');
+    setTimeout(() => {
+      if (currentBiliWs === ws) startBiliWebSocket(authObj, endpoints, normalizedIndex + 1);
+    }, 1500);
+  };
+
+  const connectionTimer = setTimeout(() => {
+    scheduleReconnect(authenticated ? '连接中断' : '连接或鉴权超时');
+    try {
+      if (typeof ws.terminate === 'function') ws.terminate();
+      else ws.close();
+    } catch {}
+  }, 10000);
 
   const onOpen = () => {
-    writeLog("✅ 直播间已连接，弹幕监控启动！", 'Green');
     const authPayload = Buffer.from(JSON.stringify(authObj), 'utf-8');
     const packet = Buffer.alloc(16 + authPayload.length);
     packet.writeInt32BE(packet.length, 0); packet.writeInt16BE(16, 4); packet.writeInt16BE(1, 6); packet.writeInt32BE(7, 8); packet.writeInt32BE(1, 12);
     authPayload.copy(packet, 16); ws.send(packet);
-
-    biliPingTimer = setInterval(() => {
-      if (ws.readyState === 1) {
-        const hb = Buffer.alloc(31);
-        hb.writeInt32BE(hb.length, 0); hb.writeInt16BE(16, 4); hb.writeInt16BE(1, 6); hb.writeInt32BE(2, 8); hb.writeInt32BE(1, 12);
-        Buffer.from("[object Object]", "utf-8").copy(hb, 16); ws.send(hb);
-      }
-    }, 30000);
   };
 
   const onMessage = async (data: any) => {
@@ -349,13 +474,40 @@ function startBiliWebSocket(authObj: any) {
     else if (data instanceof ArrayBuffer) buffer = Buffer.from(data);
     else if (typeof Blob !== 'undefined' && data instanceof Blob) buffer = Buffer.from(await data.arrayBuffer());
     else buffer = Buffer.from(data);
+
+    if (!authenticated) {
+      const authReply = readBiliAuthReply(buffer);
+      if (authReply) {
+        if (authReply.code !== 0) {
+          scheduleReconnect(`鉴权失败 code=${authReply.code}`);
+          try { ws.close(); } catch {}
+          return;
+        }
+
+        authenticated = true;
+        clearTimeout(connectionTimer);
+        writeLog(`✅ [Bilibili] 弹幕节点已鉴权：${endpoint.host}`, 'Green');
+        biliPingTimer = setInterval(() => {
+          if (ws.readyState === 1) {
+            const hb = Buffer.alloc(31);
+            hb.writeInt32BE(hb.length, 0); hb.writeInt16BE(16, 4); hb.writeInt16BE(1, 6); hb.writeInt32BE(2, 8); hb.writeInt32BE(1, 12);
+            Buffer.from("[object Object]", "utf-8").copy(hb, 16); ws.send(hb);
+          }
+        }, 30000);
+      }
+    }
     parseBiliPacket(buffer);
   };
 
-  const onClose = () => { setTimeout(() => { if (currentBiliWs === ws) startBiliWebSocket(authObj); }, 5000); };
+  const onClose = () => scheduleReconnect(authenticated ? '连接断开' : '连接失败');
+  const onError = (err?: any) => {
+    const message = err?.message || err?.code || '网络错误';
+    writeLog(`[Bilibili] 节点 ${endpoint.host} 错误：${message}`, 'Yellow');
+    scheduleReconnect('连接错误');
+  };
 
-  if (typeof ws.on === 'function') { ws.on('open', onOpen); ws.on('message', onMessage); ws.on('close', onClose); ws.on('error', () => {}); }
-  else { ws.onopen = onOpen; ws.onmessage = (e: any) => onMessage(e.data); ws.onclose = onClose; ws.onerror = () => {}; }
+  if (typeof ws.on === 'function') { ws.on('open', onOpen); ws.on('message', onMessage); ws.on('close', onClose); ws.on('error', onError); }
+  else { ws.onopen = onOpen; ws.onmessage = (e: any) => onMessage(e.data); ws.onclose = onClose; ws.onerror = onError; }
 }
 
 function parseBiliPacket(buffer: Buffer) {

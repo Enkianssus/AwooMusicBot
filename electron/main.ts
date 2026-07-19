@@ -219,6 +219,49 @@ ipcMain.on('overlay-resize', (event, w, h) => {
 
 const CONFIG_PATH = path.join(app.getPath('userData'), 'bili_bot_config.json');
 
+type LyricsTextAlign = 'left' | 'center' | 'right';
+
+interface LyricsWidgetConfig {
+  Alignment: LyricsTextAlign;
+  ShowSongInfo: boolean;
+  ShowTranslation: boolean;
+  MainColor: string;
+  TranslationColor: string;
+  OutlineEnabled: boolean;
+  OutlineColor: string;
+  OutlineSize: number;
+  ShadowEnabled: boolean;
+  ShadowSize: number;
+  FontFamily: string;
+  MainFontSize: number;
+  TranslationFontSize: number;
+}
+
+const DEFAULT_LYRICS_WIDGET_CONFIG: LyricsWidgetConfig = {
+  Alignment: 'center',
+  ShowSongInfo: false,
+  ShowTranslation: true,
+  MainColor: '#ffffff',
+  TranslationColor: '#d1d5db',
+  OutlineEnabled: true,
+  OutlineColor: '#000000',
+  OutlineSize: 2,
+  ShadowEnabled: true,
+  ShadowSize: 24,
+  FontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+  MainFontSize: 56,
+  TranslationFontSize: 30
+};
+
+const FALLBACK_FONT_FAMILIES = [
+  'system-ui',
+  'sans-serif',
+  'serif',
+  'monospace'
+];
+
+let cachedFontFamilies: string[] | null = null;
+
 let appConfig: any = {
   roomId: 0,
   myRoomId: 0,
@@ -234,6 +277,7 @@ let appConfig: any = {
     IdleWaitNext: true,
     ShowAllDanmaku: false,
     SuperUsers: [],
+    LyricsWidget: DEFAULT_LYRICS_WIDGET_CONFIG,
     NcmExePath: ""
   }
 };
@@ -245,10 +289,11 @@ function loadConfig() {
       appConfig = { ...appConfig, ...saved };
 
       if (!appConfig.sysConfig) {
-        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', EnableCDP: true, CdpPort: 9222, Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], NcmExePath: "" };
+        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', EnableCDP: true, CdpPort: 9222, Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], LyricsWidget: DEFAULT_LYRICS_WIDGET_CONFIG, NcmExePath: "" };
       }
       if (!appConfig.sysConfig.PlayerType) appConfig.sysConfig.PlayerType = appConfig.sysConfig.EnableCDP === false ? 'None' : 'NCM';
       if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
+      appConfig.sysConfig.LyricsWidget = readLyricsWidgetConfig(appConfig.sysConfig.LyricsWidget);
 
       if (appConfig.sysConfig.CooldownMinutes !== undefined && !appConfig.sysConfig.Cooldowns) {
         const oldSecs = appConfig.sysConfig.CooldownMinutes * 60;
@@ -291,6 +336,376 @@ let lastQueueActionTime = 0; // 全局队列操作防抖冷却时间
 
 const userCooldowns = new Map<string, number>();
 let recentRejects: { id: number, user: any, reason: string }[] = [];
+
+interface CurrentLyricLine {
+  index: number;
+  time: number;
+  text: string;
+  translation: string;
+}
+
+interface CurrentLyricsPayload {
+  trackId: string;
+  songName: string;
+  artistName: string;
+  playedTime: number | null;
+  duration: number | null;
+  progress: number;
+  lines: CurrentLyricLine[];
+  current: CurrentLyricLine | null;
+  previous: CurrentLyricLine | null;
+  next: CurrentLyricLine | null;
+  hasLyrics: boolean;
+  isLoading: boolean;
+  isPlaying: boolean;
+  updatedAt: number;
+}
+
+interface ParsedLyricsLine {
+  time: number;
+  text: string;
+}
+
+interface TrackLyrics {
+  trackId: string;
+  lines: ParsedLyricsLine[];
+  translatedLines: ParsedLyricsLine[];
+  fetchedAt: number;
+}
+
+let currentLyrics: CurrentLyricsPayload | null = null;
+let latestLyricsSnapshot: CurrentLyricsPayload | null = null;
+const fetchedTrackLyrics = new Map<string, TrackLyrics>();
+const fetchingTrackLyrics = new Map<string, Promise<void>>();
+const failedTrackLyrics = new Map<string, string>();
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function readString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function readFiniteNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function readLyricLine(value: unknown): CurrentLyricLine | null {
+  if (!isRecord(value)) return null;
+
+  const index = readFiniteNumber(value.index);
+  const time = readFiniteNumber(value.time);
+  if (index === null || time === null) return null;
+
+  return {
+    index,
+    time,
+    text: readString(value.text),
+    translation: readString(value.translation)
+  };
+}
+
+function readLyricsPayload(value: unknown): CurrentLyricsPayload | null {
+  if (!isRecord(value)) return null;
+
+  const progress = readFiniteNumber(value.progress);
+  const updatedAt = readFiniteNumber(value.updatedAt);
+  if (progress === null || updatedAt === null) return null;
+
+  return {
+    trackId: readString(value.trackId),
+    songName: readString(value.songName),
+    artistName: readString(value.artistName),
+    playedTime: readFiniteNumber(value.playedTime),
+    duration: readFiniteNumber(value.duration),
+    progress: Math.max(0, Math.min(1, progress)),
+    lines: [],
+    current: readLyricLine(value.current),
+    previous: readLyricLine(value.previous),
+    next: readLyricLine(value.next),
+    hasLyrics: value.hasLyrics === true,
+    isLoading: value.isLoading === true,
+    isPlaying: value.isPlaying === true,
+    updatedAt
+  };
+}
+
+function readBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function readColor(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback;
+  return /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback;
+}
+
+function readBoundedNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = readFiniteNumber(value);
+  if (parsed === null) return fallback;
+  return Math.max(min, Math.min(max, Math.round(parsed)));
+}
+
+function readLyricsAlignment(value: unknown): LyricsTextAlign {
+  return value === 'left' || value === 'right' || value === 'center' ? value : DEFAULT_LYRICS_WIDGET_CONFIG.Alignment;
+}
+
+function readLyricsWidgetConfig(value: unknown): LyricsWidgetConfig {
+  if (!isRecord(value)) return DEFAULT_LYRICS_WIDGET_CONFIG;
+
+  return {
+    Alignment: readLyricsAlignment(value.Alignment),
+    ShowSongInfo: readBoolean(value.ShowSongInfo, DEFAULT_LYRICS_WIDGET_CONFIG.ShowSongInfo),
+    ShowTranslation: readBoolean(value.ShowTranslation, DEFAULT_LYRICS_WIDGET_CONFIG.ShowTranslation),
+    MainColor: readColor(value.MainColor, DEFAULT_LYRICS_WIDGET_CONFIG.MainColor),
+    TranslationColor: readColor(value.TranslationColor, DEFAULT_LYRICS_WIDGET_CONFIG.TranslationColor),
+    OutlineEnabled: readBoolean(value.OutlineEnabled, DEFAULT_LYRICS_WIDGET_CONFIG.OutlineEnabled),
+    OutlineColor: readColor(value.OutlineColor, DEFAULT_LYRICS_WIDGET_CONFIG.OutlineColor),
+    OutlineSize: readBoundedNumber(value.OutlineSize, DEFAULT_LYRICS_WIDGET_CONFIG.OutlineSize, 0, 8),
+    ShadowEnabled: readBoolean(value.ShadowEnabled, DEFAULT_LYRICS_WIDGET_CONFIG.ShadowEnabled),
+    ShadowSize: readBoundedNumber(value.ShadowSize, DEFAULT_LYRICS_WIDGET_CONFIG.ShadowSize, 0, 80),
+    FontFamily: readString(value.FontFamily) || DEFAULT_LYRICS_WIDGET_CONFIG.FontFamily,
+    MainFontSize: readBoundedNumber(value.MainFontSize, DEFAULT_LYRICS_WIDGET_CONFIG.MainFontSize, 24, 96),
+    TranslationFontSize: readBoundedNumber(value.TranslationFontSize, DEFAULT_LYRICS_WIDGET_CONFIG.TranslationFontSize, 14, 64)
+  };
+}
+
+function getLyricsWidgetConfig(): LyricsWidgetConfig {
+  const config = readLyricsWidgetConfig(appConfig.sysConfig?.LyricsWidget);
+  if (!appConfig.sysConfig) appConfig.sysConfig = {};
+  appConfig.sysConfig.LyricsWidget = config;
+  return config;
+}
+
+function normalizeFontFamilyName(value: string): string {
+  return value.trim().replace(/^["']|["']$/g, '');
+}
+
+function parseFontFamilies(output: string): string[] {
+  const names = new Set<string>(FALLBACK_FONT_FAMILIES);
+  for (const line of output.split(/\r?\n/)) {
+    for (const item of line.split(',')) {
+      const name = normalizeFontFamilyName(item);
+      if (name && !name.startsWith('.')) names.add(name);
+    }
+  }
+  return [...names].sort((left, right) => left.localeCompare(right, 'zh-Hans'));
+}
+
+async function getSystemFontFamilies(): Promise<string[]> {
+  if (cachedFontFamilies) return cachedFontFamilies;
+
+  try {
+    const { stdout } = await execAsync('fc-list --format="%{family}\\n"', { timeout: 3000, maxBuffer: 1024 * 1024 });
+    cachedFontFamilies = parseFontFamilies(stdout);
+  } catch {
+    cachedFontFamilies = [...FALLBACK_FONT_FAMILIES];
+  }
+  return cachedFontFamilies;
+}
+
+function parseLrcTimestamp(tag: string): number | null {
+  const match = tag.match(/^\[(\d+)[:.'](\d+)(?:[:.'](\d+))?\]$/);
+  if (!match) return null;
+
+  const minutes = Number.parseInt(match[1], 10);
+  const seconds = Number.parseInt(match[2], 10);
+  if (!Number.isFinite(minutes) || !Number.isFinite(seconds)) return null;
+
+  let time = minutes * 60 + seconds;
+  const frac = match[3];
+  if (frac !== undefined) {
+    const value = Number.parseInt(frac, 10);
+    if (!Number.isFinite(value)) return null;
+    time += frac.length <= 2 ? value / 100 : value / 1000;
+  }
+  return time;
+}
+
+function parseLrcLines(lrc: string): ParsedLyricsLine[] {
+  const entries: ParsedLyricsLine[] = [];
+  const tagPattern = /\[([^\]]*)\]/g;
+
+  for (const raw of lrc.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    const times: number[] = [];
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    tagPattern.lastIndex = 0;
+
+    while ((match = tagPattern.exec(line)) !== null && match.index === lastIndex) {
+      const time = parseLrcTimestamp(match[0]);
+      if (time !== null) times.push(time);
+      lastIndex = tagPattern.lastIndex;
+    }
+
+    const text = line.slice(lastIndex).trim();
+    if (times.length === 0 || !text) continue;
+    for (const time of times) entries.push({ time, text });
+  }
+
+  return entries.sort((a, b) => a.time - b.time);
+}
+
+function readLyricText(value: unknown, key: string): string {
+  if (!isRecord(value)) return '';
+  const section = value[key];
+  if (!isRecord(section)) return '';
+  return readString(section.lyric);
+}
+
+async function fetchTrackLyrics(trackId: string): Promise<TrackLyrics> {
+  const url = `https://music.163.com/api/song/lyric?os=pc&id=${encodeURIComponent(trackId)}&lv=-1&kv=-1&tv=-1`;
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': 'https://music.163.com/',
+      'Cookie': 'os=pc; appver=2.9.8;',
+      ...getChinaBypassHeaders()
+    }
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const body: unknown = await res.json();
+  return {
+    trackId,
+    lines: parseLrcLines(readLyricText(body, 'lrc')),
+    translatedLines: parseLrcLines(readLyricText(body, 'tlyric')),
+    fetchedAt: Date.now()
+  };
+}
+
+function findCurrentLyricIndex(lines: ParsedLyricsLine[], playedTime: number | null): number {
+  if (playedTime === null) return -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (playedTime >= lines[i].time) return i;
+  }
+  return -1;
+}
+
+function findTranslation(translatedLines: ParsedLyricsLine[], time: number): string {
+  let closest: ParsedLyricsLine | null = null;
+  let closestDelta = Number.POSITIVE_INFINITY;
+
+  for (const line of translatedLines) {
+    const delta = Math.abs(line.time - time);
+    if (delta < closestDelta) {
+      closest = line;
+      closestDelta = delta;
+    }
+  }
+
+  return closest && closestDelta <= 0.5 ? closest.text : '';
+}
+
+function buildLyricLine(trackLyrics: TrackLyrics, index: number): CurrentLyricLine | null {
+  const line = trackLyrics.lines[index];
+  if (!line) return null;
+
+  return {
+    index,
+    time: line.time,
+    text: line.text,
+    translation: findTranslation(trackLyrics.translatedLines, line.time)
+  };
+}
+
+function buildLyricsLines(trackLyrics: TrackLyrics): CurrentLyricLine[] {
+  const lines: CurrentLyricLine[] = [];
+  for (let index = 0; index < trackLyrics.lines.length; index++) {
+    const line = buildLyricLine(trackLyrics, index);
+    if (line) lines.push(line);
+  }
+  return lines;
+}
+
+function composeCurrentLyrics(snapshot: CurrentLyricsPayload, trackLyrics: TrackLyrics): CurrentLyricsPayload {
+  const currentIndex = findCurrentLyricIndex(trackLyrics.lines, snapshot.playedTime);
+  const current = currentIndex >= 0 ? buildLyricLine(trackLyrics, currentIndex) : null;
+  const previous = currentIndex > 0 ? buildLyricLine(trackLyrics, currentIndex - 1) : null;
+  const next = currentIndex >= 0 && currentIndex + 1 < trackLyrics.lines.length ? buildLyricLine(trackLyrics, currentIndex + 1) : null;
+  const progress = current && next && snapshot.playedTime !== null && next.time > current.time
+    ? Math.max(0, Math.min(1, (snapshot.playedTime - current.time) / (next.time - current.time)))
+    : 0;
+
+  return {
+    ...snapshot,
+    progress,
+    lines: buildLyricsLines(trackLyrics),
+    current,
+    previous,
+    next,
+    hasLyrics: trackLyrics.lines.length > 0,
+    isLoading: false,
+    updatedAt: Date.now()
+  };
+}
+
+function setLyricsLoading(snapshot: CurrentLyricsPayload): void {
+  const failedReason = failedTrackLyrics.get(snapshot.trackId);
+  currentLyrics = {
+    ...snapshot,
+    progress: 0,
+    lines: [],
+    current: null,
+    previous: null,
+    next: null,
+    hasLyrics: false,
+    isLoading: !failedReason,
+    updatedAt: Date.now()
+  };
+}
+
+function refreshCurrentLyricsFromCache(): void {
+  if (!latestLyricsSnapshot) return;
+
+  const trackLyrics = fetchedTrackLyrics.get(latestLyricsSnapshot.trackId);
+  if (trackLyrics) {
+    currentLyrics = composeCurrentLyrics(latestLyricsSnapshot, trackLyrics);
+    return;
+  }
+  setLyricsLoading(latestLyricsSnapshot);
+}
+
+function ensureTrackLyrics(trackId: string): void {
+  if (!/^\d+$/.test(trackId)) return;
+  if (fetchedTrackLyrics.has(trackId) || fetchingTrackLyrics.has(trackId) || failedTrackLyrics.has(trackId)) return;
+
+  const task = fetchTrackLyrics(trackId)
+    .then((lyrics) => {
+      fetchedTrackLyrics.set(trackId, lyrics);
+      if (latestLyricsSnapshot?.trackId === trackId) refreshCurrentLyricsFromCache();
+    })
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      failedTrackLyrics.set(trackId, message);
+      writeLog(`⚠️ [歌词] 获取网易云歌词失败: ${trackId} (${message})`, 'Yellow');
+      if (latestLyricsSnapshot?.trackId === trackId) refreshCurrentLyricsFromCache();
+    })
+    .finally(() => {
+      fetchingTrackLyrics.delete(trackId);
+    });
+
+  fetchingTrackLyrics.set(trackId, task);
+}
+
+function updateCurrentLyrics(snapshot: CurrentLyricsPayload | null): void {
+  latestLyricsSnapshot = snapshot;
+  if (!snapshot || !snapshot.trackId) {
+    currentLyrics = snapshot;
+    return;
+  }
+
+  ensureTrackLyrics(snapshot.trackId);
+  refreshCurrentLyricsFromCache();
+}
 
 async function addReject(user: any, reason: string) {
   const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
@@ -1115,17 +1530,20 @@ async function startCDPRadar() {
 
         const radarScript = FiberStoreExtractJs + `
           ;(function initRadar() {
+              const lyricsRadarVersion = 3;
               if (typeof window.__ncmRadarCallback !== 'function') { setTimeout(initRadar, 500); return; }
               window.__debug_store_log = []; 
               if (!_ensureStore()) { 
                   try { window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_INIT_RETRYING', reason: 'not_ready', debugLog: window.__debug_store_log.join(' | ') })); } catch {}
                   setTimeout(initRadar, 1500); return; 
               }
-              if (window.__radarDeployed && window.__radarSubscribeAlive) {
+              if (window.__radarDeployed && window.__radarSubscribeAlive && window.__lyricsRadarVersion === lyricsRadarVersion && typeof window.__emitLyricsSnapshot === 'function') {
+                  window.__emitLyricsSnapshot();
                   window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_ALREADY_DEPLOYED' }));
                   return;
               }
               window.__radarDeployed = true; window.__radarSubscribeAlive = true;
+              window.__lyricsRadarVersion = lyricsRadarVersion;
 
               const extractSongInfo = (id, list) => {
                   if (!id) return null;
@@ -1134,10 +1552,132 @@ async function startCDPRadar() {
                   return { id: String(song.id), name: song.track?.name || '未知歌曲', artist: song.track?.artists?.map(a => a.name).join('/') || '未知歌手' };
               };
 
+              const toFiniteNumber = (value) => {
+                  const parsed = Number(value);
+                  return Number.isFinite(parsed) ? parsed : null;
+              };
+
+              const getLineText = (line) => {
+                  if (!line) return '';
+                  return typeof line.lyric === 'string' ? line.lyric : '';
+              };
+
+              const getArtistName = (playing) => {
+                  const artists = playing.curTrack?.artists || playing.resourceArtists || [];
+                  if (Array.isArray(artists) && artists.length > 0) {
+                      return artists.map(item => item?.name).filter(Boolean).join('/');
+                  }
+                  return '';
+              };
+
+              const normalizeLyricLine = (line, translationLine, index) => {
+                  if (!line) return null;
+                  const time = toFiniteNumber(line.time);
+                  return { index, time: time ?? 0, text: getLineText(line), translation: getLineText(translationLine) };
+              };
+
+              const getPlayedTime = (playId) => new Promise((resolve) => {
+                  if (!window.channel || typeof window.channel.call !== 'function') {
+                      resolve(null);
+                      return;
+                  }
+
+                  let finished = false;
+                  const finish = (value) => {
+                      if (finished) return;
+                      finished = true;
+                      resolve(value || null);
+                  };
+
+                  try {
+                      window.channel.call('audioplayer.getPlayedTime', finish, playId ? [{ playId }] : []);
+                      setTimeout(() => finish(null), 700);
+                  } catch {
+                      finish(null);
+                  }
+              });
+
+              let lyricsInFlight = false;
+              let lastLyricsSignature = '';
+              const emitLyricsSnapshot = async () => {
+                  if (lyricsInFlight) return;
+                  lyricsInFlight = true;
+
+                  try {
+                      const snapshotState = window._reduxStore.getState();
+                      const playing = snapshotState.playing || {};
+                      const lyricState = snapshotState['async:lyric'] || {};
+                      const lines = Array.isArray(lyricState.lyricLines) ? lyricState.lyricLines : [];
+                      const translatedLines = Array.isArray(lyricState.tlyricLines) ? lyricState.tlyricLines : [];
+                      const trackId = String(playing.resourceTrackId || playing.onlineResourceId || playing.playId || '');
+                      const playId = playing.playId || trackId;
+                      const playedResult = await getPlayedTime(playId);
+                      const playedTime = toFiniteNumber(playedResult && (playedResult.playedTime ?? playedResult.playedAudioTime));
+                      const adjustedTime = playedTime === null ? null : playedTime + (toFiniteNumber(lyricState.offset) || 0);
+
+                      let currentIndex = -1;
+                      if (adjustedTime !== null) {
+                          for (let i = lines.length - 1; i >= 0; i--) {
+                              const lineTime = toFiniteNumber(lines[i]?.time);
+                              if (lineTime !== null && adjustedTime >= lineTime) {
+                                  currentIndex = i;
+                                  break;
+                              }
+                          }
+                      }
+
+                      if (currentIndex < 0) {
+                          const fallbackIndex = toFiniteNumber(playing.playingLyricLineNumber);
+                          if (fallbackIndex !== null && fallbackIndex >= 0 && fallbackIndex < lines.length) {
+                              currentIndex = Math.floor(fallbackIndex);
+                          }
+                      }
+
+                      const current = currentIndex >= 0 ? normalizeLyricLine(lines[currentIndex], translatedLines[currentIndex], currentIndex) : null;
+                      const previous = currentIndex > 0 ? normalizeLyricLine(lines[currentIndex - 1], translatedLines[currentIndex - 1], currentIndex - 1) : null;
+                      const next = currentIndex >= 0 && currentIndex + 1 < lines.length ? normalizeLyricLine(lines[currentIndex + 1], translatedLines[currentIndex + 1], currentIndex + 1) : null;
+                      const progress = current && next && adjustedTime !== null && next.time > current.time
+                          ? Math.max(0, Math.min(1, (adjustedTime - current.time) / (next.time - current.time)))
+                          : 0;
+                      const rawDuration = toFiniteNumber(playing.curTrack?.duration) || toFiniteNumber(playing.resourceDuration);
+                      const duration = rawDuration === null ? null : rawDuration > 10000 ? rawDuration / 1000 : rawDuration;
+
+                      const lyrics = {
+                          trackId,
+                          songName: playing.curTrack?.name || playing.resourceName || '',
+                          artistName: getArtistName(playing),
+                          playedTime,
+                          duration,
+                          progress,
+                          lines: [],
+                          current,
+                          previous,
+                          next,
+                          hasLyrics: lines.length > 0,
+                          isLoading: lines.length === 0 && Boolean(trackId),
+                          isPlaying: playing.playingState === 2,
+                          updatedAt: Date.now()
+                      };
+
+                      const timeBucket = playedTime === null ? 'x' : String(Math.floor(playedTime * 2) / 2);
+                      const signature = [trackId, currentIndex, current?.text || '', timeBucket, lines.length].join('|');
+                      if (signature === lastLyricsSignature) return;
+                      lastLyricsSignature = signature;
+                      try { window.__ncmRadarCallback(JSON.stringify({ event: 'LYRICS_UPDATE', lyrics })); } catch {}
+                  } catch {
+                  } finally {
+                      lyricsInFlight = false;
+                  }
+              };
+
               let state = window._reduxStore.getState();
               let localLastId = state.playing?.resourceTrackId || state.playing?.onlineResourceId;
 
+              window.__emitLyricsSnapshot = emitLyricsSnapshot;
+              if (window.__lyricsRadarTimer) clearInterval(window.__lyricsRadarTimer);
+              window.__lyricsRadarTimer = setInterval(() => { window.__emitLyricsSnapshot(); }, 700);
               window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_INIT_OK', currentId: localLastId ? String(localLastId) : null }));
+              window.__emitLyricsSnapshot();
 
               window._reduxStore.subscribe(() => {
                   try {
@@ -1157,6 +1697,7 @@ async function startCDPRadar() {
                           try { window.__ncmRadarCallback(JSON.stringify({ event: 'TRACK_CHANGED', timestamp: Date.now(), previous: prevSong, current: currSong, next: nextSong })); } catch {}
                           localLastId = currentTrackId;
                       }
+                      window.__emitLyricsSnapshot();
                   } catch { }
               });
           })();
@@ -1190,6 +1731,9 @@ async function startCDPRadar() {
                 syncTrackChangeLogic('', '播放停止', null, '无');
                 lastTrackId = null;
               }
+            }
+            else if (payload.event === 'LYRICS_UPDATE') {
+              updateCurrentLyrics(readLyricsPayload(payload.lyrics));
             }
           }
         } catch (e: any) { writeLog(`❌ CDP 解析异常: ${e.message}`, 'Red'); }
@@ -1555,18 +2099,33 @@ function startBackendServer() {
       return;
     }
 
+    if (url.pathname === '/api/lyrics') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ lyrics: currentLyrics, cdpConnected: isCdpConnected, config: getLyricsWidgetConfig(), serverTime: Date.now() }));
+      return;
+    }
+
+    if (url.pathname === '/api/system/fonts') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ fonts: await getSystemFontFamilies() }));
+      return;
+    }
+
     if (url.pathname === '/api/config') {
       if (req.method === 'POST') {
         const body = JSON.parse(await readRequestBody(req));
         if (body.roomId !== undefined) appConfig.roomId = body.roomId;
         if (body.widgetStyle !== undefined) appConfig.widgetStyle = body.widgetStyle;
-        if (body.sysConfig !== undefined) appConfig.sysConfig = { ...appConfig.sysConfig, ...body.sysConfig };
+        if (body.sysConfig !== undefined) {
+          appConfig.sysConfig = { ...appConfig.sysConfig, ...body.sysConfig };
+          appConfig.sysConfig.LyricsWidget = readLyricsWidgetConfig(appConfig.sysConfig.LyricsWidget);
+        }
         saveConfig();
         res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true }));
         return;
       }
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ roomId: appConfig.roomId, myRoomId: appConfig.myRoomId || 0, biliLogin: !!biliCookie, uid: biliUid, currentUser: currentUserInfo, version: app.getVersion(), accepting: isAccepting, playing: isPlaying, widgetStyle: appConfig.widgetStyle, cdpConnected: isCdpConnected, config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 } } }));
+      res.end(JSON.stringify({ roomId: appConfig.roomId, myRoomId: appConfig.myRoomId || 0, biliLogin: !!biliCookie, uid: biliUid, currentUser: currentUserInfo, version: app.getVersion(), accepting: isAccepting, playing: isPlaying, widgetStyle: appConfig.widgetStyle, cdpConnected: isCdpConnected, config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, LyricsWidget: DEFAULT_LYRICS_WIDGET_CONFIG } }));
       return;
     }
 

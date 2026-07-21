@@ -36,9 +36,45 @@ interface SongInfo {
     ArtistName: string;
     OrderedByUid: string;
     OrderedByAvatar: string;
+    CoverUrl?: string;
     OrderedBy: string;
     GuardLevel?: number;
 }
+
+type RequestedSongArtwork = 'bili_avatar' | 'song_cover';
+
+interface SongArtworkImageProps {
+    song: SongInfo;
+    source: 'avatar' | 'cover';
+    className?: string;
+}
+
+const SongArtworkImage: React.FC<SongArtworkImageProps> = ({ song, source, className = '' }) => {
+    const primaryUrl = source === 'cover' ? song.CoverUrl || '' : song.OrderedByAvatar || '';
+    const avatarFallback = source === 'avatar' && song.OrderedByUid
+        ? `https://api.dicebear.com/7.x/identicon/svg?seed=${encodeURIComponent(song.OrderedByUid)}`
+        : '';
+    const [imageUrl, setImageUrl] = useState(primaryUrl || avatarFallback);
+
+    useEffect(() => {
+        setImageUrl(primaryUrl || avatarFallback);
+    }, [primaryUrl, avatarFallback]);
+
+    if (!imageUrl) return <span className="w-full h-full flex items-center justify-center text-lg" aria-label="暂无歌曲封面">🎵</span>;
+
+    return (
+        <img
+            src={imageUrl}
+            alt={source === 'cover' ? `${song.SongName} 封面` : `${song.OrderedBy} 头像`}
+            referrerPolicy="no-referrer"
+            className={`w-full h-full object-cover ${className}`}
+            onError={() => {
+                if (source === 'avatar' && avatarFallback && imageUrl !== avatarFallback) setImageUrl(avatarFallback);
+                else setImageUrl('');
+            }}
+        />
+    );
+};
 
 interface ToastInfo {
     id: number;
@@ -157,7 +193,7 @@ interface OverlayWidgetProps {
 }
 
 const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
-    const [data, setData] = useState<{ current: SongInfo | null; queue: SongInfo[]; status: string }>({ current: null, queue: [], status: '' });
+    const [data, setData] = useState<{ current: SongInfo | null; currentIsRequested: boolean; playerPausedAfterRequests: boolean; requestedSongArtwork: RequestedSongArtwork; queue: SongInfo[]; status: string }>({ current: null, currentIsRequested: false, playerPausedAfterRequests: false, requestedSongArtwork: 'bili_avatar', queue: [], status: '' });
     const [isConnected, setIsConnected] = useState<boolean>(true);
     const [isCdpConnected, setIsCdpConnected] = useState<boolean>(true);
     const [accepting, setAccepting] = useState<boolean>(true);
@@ -310,7 +346,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                     return safeQueue;
                 });
 
-                setData({ current: json.current || null, queue: safeQueue, status: json.status || '' });
+                setData({ current: json.current || null, currentIsRequested: json.currentIsRequested === true, playerPausedAfterRequests: json.playerPausedAfterRequests === true, requestedSongArtwork: json.requestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar', queue: safeQueue, status: json.status || '' });
                 setAccepting(json.accepting ?? true);
                 setPlaying(json.playing ?? true);
                 setIsConnected(true);
@@ -632,8 +668,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                         </div>
                     ) : (
                         <>
-                            <div className="w-8 h-8 rounded-full overflow-hidden shrink-0 border border-white/20">
-                                <img src={dragInfo.item.OrderedByAvatar} alt="avatar" className="w-full h-full object-cover" />
+                            <div className={`w-8 h-8 ${data.requestedSongArtwork === 'song_cover' ? 'rounded-md' : 'rounded-full'} overflow-hidden shrink-0 border border-white/20 bg-slate-800 flex items-center justify-center`}>
+                                <SongArtworkImage song={dragInfo.item} source={data.requestedSongArtwork === 'song_cover' ? 'cover' : 'avatar'} />
                             </div>
                             <div className="flex flex-col min-w-0 flex-1">
                                 <div className="text-[13px] font-bold truncate text-white">{dragInfo.item.SongName}</div>
@@ -718,26 +754,41 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 <div className="flex-1 flex flex-col p-4 overflow-hidden z-10 gap-4 custom-scrollbar relative">
                     {data.current ? (
                         <div
-                            className={`${isElectron ? 'no-drag cursor-move' : ''} current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 transition-opacity ${dragInfo?.type === 'current' ? 'opacity-30' : ''} ${actionLock ? 'pointer-events-none' : ''}`}
+                            className={`${isElectron && data.currentIsRequested ? 'no-drag cursor-move' : ''} current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 transition-all duration-300 ${data.currentIsRequested ? 'ring-1 ring-green-400/30 shadow-[0_0_24px_rgba(74,222,128,0.18)]' : 'opacity-75 border-sky-300/20 bg-sky-950/20 shadow-[0_0_22px_rgba(125,211,252,0.12)]'} ${dragInfo?.type === 'current' ? 'opacity-30' : ''} ${actionLock ? 'pointer-events-none' : ''}`}
                             style={{ touchAction: 'none' }}
-                            onPointerDown={isElectron && !actionLock ? (e) => handlePointerDown(e, 'current', -1, data.current as SongInfo) : undefined}
+                            onPointerDown={isElectron && data.currentIsRequested && !actionLock ? (e) => handlePointerDown(e, 'current', -1, data.current as SongInfo) : undefined}
                         >
-                            <div className="absolute right-[-10px] top-[-10px] opacity-5 text-7xl select-none pointer-events-none">🎵</div>
-                            <div className={`w-12 h-12 rounded-full overflow-hidden border-[3px] ${playing ? getGuardStyle(data.current.GuardLevel).border || 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.2)]' : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} shrink-0 relative pointer-events-none`}>
-                                <img src={data.current.OrderedByAvatar} alt="avatar" referrerPolicy="no-referrer" className={`w-full h-full object-cover ${!playing ? 'grayscale opacity-80' : ''}`} onError={(e)=>{(e.target as HTMLImageElement).src=`https://api.dicebear.com/7.x/identicon/svg?seed=${(data.current as SongInfo).OrderedByUid}`}} />
-                            </div>
+                            <div className={`absolute inset-0 pointer-events-none ${data.currentIsRequested ? 'bg-gradient-to-r from-green-500/10 via-transparent to-cyan-500/5' : 'bg-gradient-to-r from-sky-400/10 via-sky-950/5 to-transparent'}`}></div>
+                            <div className="absolute right-[-10px] top-[-10px] opacity-5 text-7xl select-none pointer-events-none">{data.currentIsRequested ? '✨' : '🎵'}</div>
+                            {data.currentIsRequested ? (
+                                <div className={`w-12 h-12 ${data.requestedSongArtwork === 'song_cover' ? 'rounded-lg' : 'rounded-full'} overflow-hidden border-[3px] ${playing ? (data.requestedSongArtwork === 'song_cover' ? 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.25)]' : getGuardStyle(data.current.GuardLevel).border || 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.2)]') : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} bg-slate-800 flex items-center justify-center shrink-0 relative pointer-events-none`}>
+                                    <SongArtworkImage song={data.current} source={data.requestedSongArtwork === 'song_cover' ? 'cover' : 'avatar'} className={!playing ? 'grayscale opacity-80' : ''} />
+                                </div>
+                            ) : (
+                                <div className="w-12 h-12 rounded-lg overflow-hidden border-[3px] border-sky-300/35 bg-sky-950/60 shadow-[0_0_14px_rgba(125,211,252,0.16)] flex items-center justify-center text-sky-200 shrink-0 relative pointer-events-none">
+                                    <SongArtworkImage song={data.current} source="cover" />
+                                </div>
+                            )}
                             <div className="flex flex-col min-w-0 pointer-events-none">
-                                {playing ? (
-                                    <div className="text-green-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span> 正在播放</div>
-                                ) : (
+                                {!playing ? (
                                     <div className="text-yellow-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-yellow-400 rounded-full"></span> 自动播放已暂停</div>
+                                ) : data.currentIsRequested ? (
+                                    <div className="text-green-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse shadow-[0_0_8px_rgba(74,222,128,0.9)]"></span> 点歌播放中</div>
+                                ) : data.playerPausedAfterRequests ? (
+                                    <div className="text-amber-400/80 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-amber-400/80 rounded-full"></span> 点歌播完 · 播放器已暂停</div>
+                                ) : (
+                                    <div className="text-sky-300 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-sky-300 rounded-full animate-pulse shadow-[0_0_8px_rgba(125,211,252,0.9)]"></span> 主播歌单正在播放</div>
                                 )}
                                 <div className="text-[15px] font-bold truncate drop-shadow-md" style={{ color: theme.textColor }}>{data.current.SongName}</div>
                                 <div className="text-xs truncate mt-0.5" style={{ color: theme.subTextColor }}>{data.current.ArtistName}</div>
-                                <div className="text-[11px] mt-1 flex items-center gap-1.5" style={{ color: theme.subTextColor }}>
-                                    <span className="truncate">由 <span style={{ color: theme.titleColor, opacity: 0.9 }}>{data.current.OrderedBy}</span> 点播</span>
-                                    {getGuardStyle(data.current.GuardLevel).label && <span className={`text-[9px] px-1 rounded-sm font-bold tracking-wider leading-none py-0.5 shadow-sm ${getGuardStyle(data.current.GuardLevel).tag}`}>{getGuardStyle(data.current.GuardLevel).label}</span>}
-                                </div>
+                                {data.currentIsRequested && (
+                                    <div className="text-[11px] mt-1 flex items-center gap-1.5" style={{ color: theme.subTextColor }}>
+                                        <>
+                                            <span className="truncate">由 <span style={{ color: theme.titleColor, opacity: 0.9 }}>{data.current.OrderedBy}</span> 点播</span>
+                                            {getGuardStyle(data.current.GuardLevel).label && <span className={`text-[9px] px-1 rounded-sm font-bold tracking-wider leading-none py-0.5 shadow-sm ${getGuardStyle(data.current.GuardLevel).tag}`}>{getGuardStyle(data.current.GuardLevel).label}</span>}
+                                        </>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     ) : (
@@ -833,8 +884,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                                     ) : (
                                         <>
                                             <div className="text-[11px] font-bold w-4 text-center shrink-0 pointer-events-none" style={{ color: theme.subTextColor }}>{index + 1}</div>
-                                            <div className={`w-8 h-8 rounded-full overflow-hidden shrink-0 bg-black/30 border-2 ${itemGuardStyle.label ? itemGuardStyle.border : 'border-white/10'} pointer-events-none`}>
-                                                <img src={song.OrderedByAvatar} alt="avatar" referrerPolicy="no-referrer" className="w-full h-full object-cover" onError={(e)=>{(e.target as HTMLImageElement).src=`https://api.dicebear.com/7.x/identicon/svg?seed=${song.OrderedByUid}`}} />
+                                            <div className={`w-8 h-8 ${data.requestedSongArtwork === 'song_cover' ? 'rounded-md' : 'rounded-full'} overflow-hidden shrink-0 bg-black/30 border-2 ${data.requestedSongArtwork === 'song_cover' ? 'border-green-400/30' : (itemGuardStyle.label ? itemGuardStyle.border : 'border-white/10')} flex items-center justify-center pointer-events-none`}>
+                                                <SongArtworkImage song={song} source={data.requestedSongArtwork === 'song_cover' ? 'cover' : 'avatar'} />
                                             </div>
                                             <div className="flex flex-col min-w-0 flex-1 pointer-events-none">
                                                 <div className="text-[13px] font-bold truncate drop-shadow-sm pr-16" style={{ color: theme.textColor }}>{song.SongName}</div>
@@ -1177,6 +1228,20 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const startQrLogin = async () => {
         setQrState(prev => ({ ...prev, loading: true, base64: '' }));
         await fetch('http://localhost:5555/api/bili/qrstart', { method: 'POST' });
+    };
+
+    const logoutBili = async () => {
+        if (!window.confirm('确定退出当前 B站账号吗？本地保存的登录凭据将被清除。')) return;
+        try {
+            const res = await fetch('http://localhost:5555/api/bili/logout', { method: 'POST' });
+            const result = await res.json();
+            if (!res.ok || !result.success) throw new Error('logout failed');
+            setConfig((prev: any) => ({ ...prev, biliLogin: false, uid: 0, currentUser: null }));
+            setQrState({ loading: false, base64: '', message: '已退出登录，可重新扫码绑定账号' });
+            showAdminToast('✅ 已退出 B站账号并清除本地登录凭据');
+        } catch {
+            showAdminToast('❌ 退出登录失败，请检查后端连接');
+        }
     };
 
     const toggleAccepting = async () => {
@@ -1800,7 +1865,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
                                         <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3">⚙️ 常规参数</h3>
-                                        <div className="grid grid-cols-2 gap-6">
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                             <div>
                                                 <label className="block text-xs text-gray-400 mb-2">空闲时点歌行为</label>
                                                 <select
@@ -1811,6 +1876,43 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                     <option value="true">加入网易云/Folia下一首 (等当前播完)</option>
                                                     <option value="false">立即强行切歌播放</option>
                                                 </select>
+                                            </div>
+
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">点歌全部播完后</label>
+                                                <select
+                                                    value={config.config.PauseAfterRequests === true ? 'pause' : 'continue'}
+                                                    onChange={e => setConfig({...config, config: {...config.config, PauseAfterRequests: e.target.value === 'pause'}})}
+                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none cursor-pointer"
+                                                >
+                                                    <option value="continue">继续播放主播歌单（默认）</option>
+                                                    <option value="pause">最后一首点歌结束后暂停播放器</option>
+                                                </select>
+                                            </div>
+
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">点歌图片显示</label>
+                                                <select
+                                                    value={config.config.RequestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar'}
+                                                    onChange={e => setConfig({...config, config: {...config.config, RequestedSongArtwork: e.target.value}})}
+                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none cursor-pointer"
+                                                >
+                                                    <option value="bili_avatar">B站点歌人头像（默认）</option>
+                                                    <option value="song_cover">网易云音乐歌曲封面</option>
+                                                </select>
+                                                <span className="text-xs text-gray-500 block mt-1.5">主播歌单始终显示歌曲封面</span>
+                                            </div>
+
+                                            <div className="flex flex-col justify-center pt-3">
+                                                <div className="flex justify-between items-center gap-4 bg-black/30 border border-white/10 rounded-lg p-3">
+                                                    <div>
+                                                        <label className="block text-sm text-white font-medium">显示播放器当前歌曲</label>
+                                                        <span className="text-xs text-gray-500 block mt-1">没有点歌时，以淡蓝色卡片显示主播歌单歌曲</span>
+                                                    </div>
+                                                    <button onClick={() => setConfig({...config, config: {...config.config, ShowPlayerCurrentTrack: !config.config.ShowPlayerCurrentTrack}})} className={`w-10 h-6 rounded-full p-1 transition-colors shrink-0 ${config.config.ShowPlayerCurrentTrack ? 'bg-blue-600' : 'bg-gray-600'}`}>
+                                                        <div className={`w-4 h-4 rounded-full bg-white transition-transform ${config.config.ShowPlayerCurrentTrack ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                                                    </button>
+                                                </div>
                                             </div>
 
                                             <div className="flex flex-col justify-center pt-3">
@@ -1930,9 +2032,16 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                         )}
 
                                         <h3 className="text-md text-white font-bold mb-5">{qrState.message}</h3>
-                                        <button onClick={startQrLogin} disabled={qrState.loading} className="px-6 py-3 bg-[#fb7299] hover:bg-[#ff85a8] text-white text-md rounded-xl font-bold shadow-lg disabled:opacity-50 transition-colors w-full">
-                                            {config.biliLogin ? '我要换号 (重新获取二维码)' : (qrState.loading ? '正在获取...' : '点击获取登录二维码')}
-                                        </button>
+                                        <div className={`grid gap-3 w-full ${config.biliLogin ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                                            <button onClick={startQrLogin} disabled={qrState.loading} className="px-5 py-3 bg-[#fb7299] hover:bg-[#ff85a8] text-white text-sm rounded-xl font-bold shadow-lg disabled:opacity-50 transition-colors w-full">
+                                                {config.biliLogin ? '扫码更换账号' : (qrState.loading ? '正在获取...' : '点击获取登录二维码')}
+                                            </button>
+                                            {config.biliLogin && (
+                                                <button onClick={logoutBili} className="px-5 py-3 bg-red-600/20 hover:bg-red-600/35 border border-red-500/40 text-red-300 text-sm rounded-xl font-bold shadow-lg transition-colors w-full">
+                                                    退出当前账号
+                                                </button>
+                                            )}
+                                        </div>
 
                                         <p className="text-xs text-gray-500 mt-4 leading-relaxed">
                                             完全在本地完成登录。⚠️ 请注意：只需扫码登录<strong className="text-pink-400">任意普通B站账号</strong>即可获取弹幕，不需要必须是主播的账号！

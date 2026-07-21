@@ -232,6 +232,9 @@ let appConfig: any = {
     CdpPort: 9222,
     Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 },
     IdleWaitNext: true,
+    ShowPlayerCurrentTrack: false,
+    PauseAfterRequests: false,
+    RequestedSongArtwork: 'bili_avatar',
     ShowAllDanmaku: false,
     SuperUsers: [],
     NcmExePath: ""
@@ -245,10 +248,13 @@ function loadConfig() {
       appConfig = { ...appConfig, ...saved };
 
       if (!appConfig.sysConfig) {
-        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', EnableCDP: true, CdpPort: 9222, Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], NcmExePath: "" };
+        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', EnableCDP: true, CdpPort: 9222, Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowPlayerCurrentTrack: false, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], NcmExePath: "" };
       }
       if (!appConfig.sysConfig.PlayerType) appConfig.sysConfig.PlayerType = appConfig.sysConfig.EnableCDP === false ? 'None' : 'NCM';
       if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
+      if (appConfig.sysConfig.ShowPlayerCurrentTrack === undefined) appConfig.sysConfig.ShowPlayerCurrentTrack = false;
+      if (appConfig.sysConfig.PauseAfterRequests === undefined) appConfig.sysConfig.PauseAfterRequests = false;
+      if (!['bili_avatar', 'song_cover'].includes(appConfig.sysConfig.RequestedSongArtwork)) appConfig.sysConfig.RequestedSongArtwork = 'bili_avatar';
 
       if (appConfig.sysConfig.CooldownMinutes !== undefined && !appConfig.sysConfig.Cooldowns) {
         const oldSecs = appConfig.sysConfig.CooldownMinutes * 60;
@@ -277,7 +283,11 @@ let skipForcePlayOnce = false;
 let biliCookie = "";
 let biliUid = 0;
 
-let currentUserInfo: any = { uid: 0, uname: '', face: '', level: 0, myRoomId: 0, followerCount: 0, guardCount: 0, fanClubCount: 0 };
+function createEmptyBiliUserInfo() {
+  return { uid: 0, uname: '', face: '', level: 0, myRoomId: 0, followerCount: 0, guardCount: 0, fanClubCount: 0 };
+}
+
+let currentUserInfo: any = createEmptyBiliUserInfo();
 
 let qrCodeBase64 = "";
 let qrLoginStatus = "等待获取二维码...";
@@ -286,6 +296,8 @@ let qrPollTimer: NodeJS.Timeout | null = null;
 
 let targetQueue: any[] = [];
 let currentPlayingSong: any = null;
+let playerCurrentTrack: any = null;
+let playerPausedAfterRequests = false;
 let lastTrackId: string | null = null;
 let lastQueueActionTime = 0; // 全局队列操作防抖冷却时间
 
@@ -305,6 +317,32 @@ async function addReject(user: any, reason: string) {
 // ==========================================
 let currentBiliWs: any = null;
 let biliPingTimer: NodeJS.Timeout | null = null;
+
+function logoutBiliAccount() {
+  if (qrPollTimer) {
+    clearInterval(qrPollTimer);
+    qrPollTimer = null;
+  }
+  isQrLoggingIn = false;
+  qrCodeBase64 = '';
+  qrLoginStatus = '已退出登录，可重新扫码绑定账号';
+
+  if (currentBiliWs) {
+    const ws = currentBiliWs;
+    currentBiliWs = null;
+    try { ws.close(); } catch {}
+  }
+  if (biliPingTimer) {
+    clearInterval(biliPingTimer);
+    biliPingTimer = null;
+  }
+
+  biliCookie = '';
+  biliUid = 0;
+  currentUserInfo = createEmptyBiliUserInfo();
+  saveConfig();
+  writeLog('[Bilibili] 已退出登录并清除本地账号凭据', 'Green');
+}
 
 interface BiliDanmuEndpoint {
   host: string;
@@ -572,7 +610,74 @@ function handleRawDanmaku(doc: any) {
 // ==========================================
 // 播放器状态核心同步逻辑 (NCM/Folia 共享)
 // ==========================================
-function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string) {
+const songCoverCache = new Map<string, string>();
+
+function extractSongCoverUrl(song: any): string {
+  return song?.album?.picUrl
+    || song?.al?.picUrl
+    || song?.album?.coverUrl
+    || song?.coverUrl
+    || song?.cover
+    || song?.picUrl
+    || '';
+}
+
+async function getNcmSongCover(songId: string): Promise<string> {
+  const normalizedId = String(songId || '');
+  if (!normalizedId) return '';
+  if (songCoverCache.has(normalizedId)) return songCoverCache.get(normalizedId) || '';
+
+  try {
+    const res = await fetch(`https://music.163.com/api/song/detail/?id=${normalizedId}&ids=%5B${normalizedId}%5D`, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Cookie': 'os=pc; appver=2.9.8;',
+        ...getChinaBypassHeaders()
+      }
+    });
+    if (!res.ok) return '';
+    const songs = (await res.json())?.songs || [];
+    const coverUrl = extractSongCoverUrl(songs[0]);
+    if (coverUrl) songCoverCache.set(normalizedId, coverUrl);
+    return coverUrl;
+  } catch {
+    return '';
+  }
+}
+
+function updatePlayerCurrentTrack(trackId: string, songName: string, artistName: string = '', coverUrl: string = '') {
+  if (!trackId) {
+    playerCurrentTrack = null;
+    return;
+  }
+
+  const normalizedId = String(trackId);
+  const knownCoverUrl = coverUrl || songCoverCache.get(normalizedId) || '';
+  if (knownCoverUrl) songCoverCache.set(normalizedId, knownCoverUrl);
+
+  playerCurrentTrack = {
+    Id: normalizedId,
+    SongName: songName || '未知歌曲',
+    ArtistName: artistName || '未知歌手',
+    OrderedByUid: '',
+    OrderedByAvatar: '',
+    CoverUrl: knownCoverUrl,
+    OrderedBy: '主播歌单'
+  };
+
+  if (!knownCoverUrl) {
+    void getNcmSongCover(normalizedId).then(resolvedCoverUrl => {
+      if (resolvedCoverUrl && playerCurrentTrack?.Id === normalizedId && !playerCurrentTrack.CoverUrl) {
+        playerCurrentTrack = { ...playerCurrentTrack, CoverUrl: resolvedCoverUrl };
+      }
+    });
+  }
+}
+
+function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string, currArtist: string = '', currCoverUrl: string = '') {
+  playerPausedAfterRequests = false;
+  updatePlayerCurrentTrack(currId, currName, currArtist, currCoverUrl);
   writeLog(`[状态同步] 🎵 播放器切歌信号: ${currName} (${currId}) | 下一首预告: ${nextName}`, 'Magenta');
   let stateChanged = false;
 
@@ -606,9 +711,12 @@ function syncTrackChangeLogic(currId: string, currName: string, nextId: string |
           stateChanged = true;
         }
       } else {
-        writeLog(`[状态同步] 点播列表已空，放行原歌单曲目`, 'DarkGray');
+        writeLog(`[状态同步] 点播列表已空，放行主播歌单曲目`, 'DarkGray');
         currentPlayingSong = null;
         stateChanged = true;
+        if (appConfig.sysConfig?.PauseAfterRequests === true && currId) {
+          void pausePlayerAfterRequests();
+        }
       }
     } else if (!currentPlayingSong && targetQueue.length > 0) {
       if (currId === targetQueue[0]?.Id) {
@@ -641,8 +749,45 @@ function syncTrackChangeLogic(currId: string, currName: string, nextId: string |
 const FOLIA_HTTP_PORT = 32107;
 
 let isFoliaHandlingAction = false;
+let isPausingAfterRequests = false;
+
+async function pausePlayerAfterRequests(): Promise<void> {
+  if (isPausingAfterRequests) return;
+  isPausingAfterRequests = true;
+
+  try {
+    let success = false;
+    if (appConfig.sysConfig?.PlayerType === 'Folia') {
+      const token = appConfig.sysConfig?.FoliaToken?.trim();
+      if (token) {
+        const res = await fetch(`http://127.0.0.1:${FOLIA_HTTP_PORT}/stage/player/control`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'pause' })
+        });
+        success = res.ok;
+      }
+    } else {
+      const script = FiberStoreExtractJs + `;if (_ensureStore()) { window._reduxStore.dispatch({ type: 'async:action/doAction', payload: { actionId: 'pause', data: { eventType: 'click' } } }); }`;
+      success = await sendCDPCommand(script);
+    }
+
+    if (success) {
+      playerPausedAfterRequests = true;
+      writeLog('[播放策略] 最后一首点歌已结束，播放器已自动暂停', 'Green');
+      setGlobalStatus('点歌已播完，播放器已暂停');
+    } else {
+      writeLog('[播放策略] 点歌结束后自动暂停失败，请检查播放器连接', 'Yellow');
+    }
+  } catch (err: any) {
+    writeLog(`[播放策略] 点歌结束后自动暂停异常: ${err?.message || err}`, 'Red');
+  } finally {
+    isPausingAfterRequests = false;
+  }
+}
 
 async function playNextSong(): Promise<boolean> {
+  playerPausedAfterRequests = false;
   if (appConfig.sysConfig?.PlayerType === 'Folia') {
     if (isFoliaHandlingAction) {
       writeLog(`[防抖] 当前 Folia 正在执行强控连招，已忽略本次顺延切歌请求...`, 'Yellow');
@@ -722,6 +867,7 @@ async function insertNextSongViaCDP(songId: string) {
 
 async function forcePlaySongAsync(songInfo: any) {
   if (!songInfo) return;
+  playerPausedAfterRequests = false;
 
   if (appConfig.sysConfig?.PlayerType === 'Folia') {
     if (isFoliaHandlingAction) {
@@ -835,9 +981,13 @@ async function startFoliaRadar() {
           const track = payload.track || payload.current || payload.data?.track || (payload.id || payload.songId ? payload : null);
           const currentId = track?.id || track?.songId ? String(track.id || track.songId) : null;
           const songName = track?.title || track?.name || '未知曲目';
+          const artistName = Array.isArray(track?.artists)
+            ? track.artists.map((artist: any) => typeof artist === 'string' ? artist : artist?.name).filter(Boolean).join('/')
+            : (typeof track?.artist === 'string' ? track.artist : track?.artist?.name || '');
+          const coverUrl = extractSongCoverUrl(track);
 
           if (currentId && currentId !== lastTrackId) {
-            syncTrackChangeLogic(currentId, songName, null, '未知');
+            syncTrackChangeLogic(currentId, songName, null, '未知', artistName, coverUrl);
             lastTrackId = currentId;
           } else if (!currentId && lastTrackId && eventName === 'TRACK_CHANGED') {
             syncTrackChangeLogic('', '播放已停止', null, '无');
@@ -1122,7 +1272,17 @@ async function startCDPRadar() {
                   setTimeout(initRadar, 1500); return; 
               }
               if (window.__radarDeployed && window.__radarSubscribeAlive) {
-                  window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_ALREADY_DEPLOYED' }));
+                  const existingState = window._reduxStore.getState();
+                  const existingId = existingState.playing?.resourceTrackId || existingState.playing?.onlineResourceId;
+                  const existingList = existingState.playingList?.curPlayingList || [];
+                  const existingItem = existingList.find(item => String(item.id) === String(existingId));
+                  const existingSong = existingId ? {
+                      id: String(existingId),
+                      name: existingItem?.track?.name || '(列表外)',
+                      artist: existingItem?.track?.artists?.map(a => a.name).join('/') || '',
+                      coverUrl: existingItem?.track?.album?.picUrl || existingItem?.track?.al?.picUrl || existingItem?.track?.album?.coverUrl || existingItem?.track?.coverUrl || existingItem?.coverUrl || ''
+                  } : null;
+                  window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_ALREADY_DEPLOYED', currentId: existingId ? String(existingId) : null, current: existingSong }));
                   return;
               }
               window.__radarDeployed = true; window.__radarSubscribeAlive = true;
@@ -1131,13 +1291,20 @@ async function startCDPRadar() {
                   if (!id) return null;
                   const song = list.find(item => String(item.id) === String(id));
                   if (!song) return null;
-                  return { id: String(song.id), name: song.track?.name || '未知歌曲', artist: song.track?.artists?.map(a => a.name).join('/') || '未知歌手' };
+                  return {
+                      id: String(song.id),
+                      name: song.track?.name || '未知歌曲',
+                      artist: song.track?.artists?.map(a => a.name).join('/') || '未知歌手',
+                      coverUrl: song.track?.album?.picUrl || song.track?.al?.picUrl || song.track?.album?.coverUrl || song.track?.coverUrl || song.coverUrl || ''
+                  };
               };
 
               let state = window._reduxStore.getState();
               let localLastId = state.playing?.resourceTrackId || state.playing?.onlineResourceId;
+              const initialList = state.playingList?.curPlayingList || [];
+              const initialSong = extractSongInfo(localLastId, initialList) || (localLastId ? { id: String(localLastId), name: '(列表外)', artist: '' } : null);
 
-              window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_INIT_OK', currentId: localLastId ? String(localLastId) : null }));
+              window.__ncmRadarCallback(JSON.stringify({ event: 'RADAR_INIT_OK', currentId: localLastId ? String(localLastId) : null, current: initialSong }));
 
               window._reduxStore.subscribe(() => {
                   try {
@@ -1175,16 +1342,42 @@ async function startCDPRadar() {
               writeLog(`✅ CDP 常驻雷达注入成功!`, 'Green');
               setGlobalStatus('点歌就绪');
               isCdpConnected = true;
+              const initialId = payload.current?.id || payload.currentId;
+              if (initialId) {
+                const normalizedId = String(initialId);
+                if (normalizedId !== lastTrackId) {
+                  syncTrackChangeLogic(normalizedId, payload.current?.name || '未知歌曲', null, '未知', payload.current?.artist || '', payload.current?.coverUrl || '');
+                  lastTrackId = normalizedId;
+                } else {
+                  updatePlayerCurrentTrack(normalizedId, payload.current?.name || '未知歌曲', payload.current?.artist || '', payload.current?.coverUrl || '');
+                }
+              } else {
+                updatePlayerCurrentTrack('', '', '');
+                lastTrackId = null;
+              }
             }
-            else if (payload.event === 'RADAR_ALREADY_DEPLOYED') isCdpConnected = true;
+            else if (payload.event === 'RADAR_ALREADY_DEPLOYED') {
+              isCdpConnected = true;
+              const currentId = payload.current?.id || payload.currentId;
+              if (currentId) {
+                const normalizedId = String(currentId);
+                updatePlayerCurrentTrack(normalizedId, payload.current?.name || '未知歌曲', payload.current?.artist || '', payload.current?.coverUrl || '');
+                lastTrackId = normalizedId;
+              } else {
+                updatePlayerCurrentTrack('', '', '');
+                lastTrackId = null;
+              }
+            }
             else if (payload.event === 'TRACK_CHANGED') {
               const currId = payload.current?.id;
               const currName = payload.current?.name;
+              const currArtist = payload.current?.artist || '';
+              const currCoverUrl = payload.current?.coverUrl || '';
               const nextId = payload.next?.id;
               const nextName = payload.next?.name || '无';
 
               if (currId && currId !== lastTrackId) {
-                syncTrackChangeLogic(currId, currName, nextId, nextName);
+                syncTrackChangeLogic(currId, currName, nextId, nextName, currArtist, currCoverUrl);
                 lastTrackId = currId;
               } else if (!currId && lastTrackId) {
                 syncTrackChangeLogic('', '播放停止', null, '无');
@@ -1313,7 +1506,11 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
             const data = await res.json().catch(() => null);
             const songs = data?.songs || [];
             if (songs.length > 0) {
-              displaySong = { name: songs[0].name, artist: songs[0].artists?.map((a: any) => a.name).join('/') || songs[0].ar?.map((a: any) => a.name).join('/') || '未知歌手' };
+              displaySong = {
+                name: songs[0].name,
+                artist: songs[0].artists?.map((a: any) => a.name).join('/') || songs[0].ar?.map((a: any) => a.name).join('/') || '未知歌手',
+                coverUrl: extractSongCoverUrl(songs[0])
+              };
             }
           }
         } catch { /* 忽略网络异常，保留兜底数据 */ }
@@ -1341,7 +1538,8 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
 
           displaySong = {
             name: fsong.title || fsong.name || keyword,
-            artist: artistStr
+            artist: artistStr,
+            coverUrl: extractSongCoverUrl(fsong)
           };
         }
       }
@@ -1361,7 +1559,11 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
         const songs = (await res.json()).songs || [];
         if (songs.length > 0) {
           playSongId = String(songs[0].id);
-          displaySong = { name: songs[0].name, artist: songs[0].artists?.map((a: any) => a.name).join('/') || songs[0].ar?.map((a: any) => a.name).join('/') || '未知歌手' };
+          displaySong = {
+            name: songs[0].name,
+            artist: songs[0].artists?.map((a: any) => a.name).join('/') || songs[0].ar?.map((a: any) => a.name).join('/') || '未知歌手',
+            coverUrl: extractSongCoverUrl(songs[0])
+          };
         }
       } else {
         const res = await fetch(`https://music.163.com/api/search/get/web`, {
@@ -1378,14 +1580,19 @@ async function tryRequestSong(user: any, keyword: string, mode: 'normal' | 'top'
         const songs = (await res.json()).result?.songs || [];
         if (songs.length > 0) {
           playSongId = String(songs[0].id);
-          displaySong = { name: songs[0].name, artist: songs[0].artists?.map((a: any) => a.name).join('/') || songs[0].ar?.map((a: any) => a.name).join('/') || '未知歌手' };
+          displaySong = {
+            name: songs[0].name,
+            artist: songs[0].artists?.map((a: any) => a.name).join('/') || songs[0].ar?.map((a: any) => a.name).join('/') || '未知歌手',
+            coverUrl: extractSongCoverUrl(songs[0])
+          };
         }
       }
     }
 
     if (playSongId && displaySong) {
       const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
-      const newSong = { Id: playSongId, SongName: displaySong.name, ArtistName: displaySong.artist, OrderedBy: user.name || user.uname, OrderedByUid: user.uid, OrderedByAvatar: avatarUrl, GuardLevel: user.guardLevel };
+      const coverUrl = displaySong.coverUrl || await getNcmSongCover(playSongId);
+      const newSong = { Id: playSongId, SongName: displaySong.name, ArtistName: displaySong.artist, OrderedBy: user.name || user.uname, OrderedByUid: user.uid, OrderedByAvatar: avatarUrl, CoverUrl: coverUrl, GuardLevel: user.guardLevel };
 
       if (mode === 'interrupt') {
         if (currentPlayingSong) targetQueue.unshift(currentPlayingSong);
@@ -1550,8 +1757,11 @@ function startBackendServer() {
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
     if (url.pathname === '/data') {
+      const showPlayerCurrentTrack = appConfig.sysConfig?.ShowPlayerCurrentTrack === true;
+      const displayCurrent = currentPlayingSong || (showPlayerCurrentTrack ? playerCurrentTrack : null);
+      const requestedSongArtwork = appConfig.sysConfig?.RequestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar';
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ current: currentPlayingSong, queue: targetQueue, status: currentStatusMessage, accepting: isAccepting, playing: isPlaying, uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isCdpConnected }));
+      res.end(JSON.stringify({ current: displayCurrent, currentIsRequested: !!currentPlayingSong, playerPausedAfterRequests, requestedSongArtwork, queue: targetQueue, status: currentStatusMessage, accepting: isAccepting, playing: isPlaying, uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isCdpConnected }));
       return;
     }
 
@@ -1566,7 +1776,7 @@ function startBackendServer() {
         return;
       }
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ roomId: appConfig.roomId, myRoomId: appConfig.myRoomId || 0, biliLogin: !!biliCookie, uid: biliUid, currentUser: currentUserInfo, version: app.getVersion(), accepting: isAccepting, playing: isPlaying, widgetStyle: appConfig.widgetStyle, cdpConnected: isCdpConnected, config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 } } }));
+      res.end(JSON.stringify({ roomId: appConfig.roomId, myRoomId: appConfig.myRoomId || 0, biliLogin: !!biliCookie, uid: biliUid, currentUser: currentUserInfo, version: app.getVersion(), accepting: isAccepting, playing: isPlaying, widgetStyle: appConfig.widgetStyle, cdpConnected: isCdpConnected, config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, ShowPlayerCurrentTrack: false, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 } } }));
       return;
     }
 
@@ -1713,6 +1923,7 @@ function startBackendServer() {
       return;
     }
 
+    if (url.pathname === '/api/bili/logout' && req.method === 'POST') { logoutBiliAccount(); res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
     if (url.pathname === '/api/bili/qrstart' && req.method === 'POST') { startBiliQrLogin(); res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
     if (url.pathname === '/api/bili/qrstatus') { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ qrBase64: qrCodeBase64, status: qrLoginStatus, isLogin: !!biliCookie })); return; }
     if (url.pathname === '/api/logs') { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify(sysLogs)); return; }

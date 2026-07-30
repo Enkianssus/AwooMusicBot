@@ -1096,6 +1096,14 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                 const res = await fetch('http://localhost:5555/api/bili/qrstatus');
                 const json = await res.json();
                 setQrState({ loading: false, base64: json.qrBase64, message: json.status });
+                if (json.isLogin) {
+                    setConfig((prev: any) => prev ? ({
+                        ...prev,
+                        biliLogin: true,
+                        uid: json.uid,
+                        currentUser: json.currentUser
+                    }) : prev);
+                }
             } catch {}
         };
         fetchQr();

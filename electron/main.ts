@@ -289,10 +289,15 @@ function createEmptyBiliUserInfo() {
 
 let currentUserInfo: any = createEmptyBiliUserInfo();
 
+function isBiliLoginReady(): boolean {
+  return Boolean(biliCookie && biliUid > 0 && currentUserInfo.uid === biliUid);
+}
+
 let qrCodeBase64 = "";
 let qrLoginStatus = "等待获取二维码...";
 let isQrLoggingIn = false;
 let qrPollTimer: NodeJS.Timeout | null = null;
+let qrLoginAttemptId = 0;
 
 let targetQueue: any[] = [];
 let currentPlayingSong: any = null;
@@ -319,10 +324,8 @@ let currentBiliWs: any = null;
 let biliPingTimer: NodeJS.Timeout | null = null;
 
 function logoutBiliAccount() {
-  if (qrPollTimer) {
-    clearInterval(qrPollTimer);
-    qrPollTimer = null;
-  }
+  qrLoginAttemptId++;
+  stopBiliQrPolling();
   isQrLoggingIn = false;
   qrCodeBase64 = '';
   qrLoginStatus = '已退出登录，可重新扫码绑定账号';
@@ -1417,58 +1420,69 @@ async function getBiliAvatar(uid: string): Promise<string> {
   return `https://api.dicebear.com/7.x/identicon/svg?seed=${uid}`;
 }
 
-async function updateCurrentUserInfo(): Promise<void> {
-  if (!biliCookie) return;
-  const headers: any = { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/", "Cookie": biliCookie };
+async function updateCurrentUserInfo(expectedCookie: string = biliCookie): Promise<boolean> {
+  if (!expectedCookie) return false;
+  const headers: any = { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/", "Cookie": expectedCookie };
 
   try {
     const navRes = await fetch("https://api.bilibili.com/x/web-interface/nav", { headers });
     const navData: any = await navRes.json();
-    if (navData.code !== 0) return;
+    if (navData.code !== 0 || navData.data?.isLogin !== true || !Number(navData.data?.mid)) {
+      writeLog(`[Bilibili] 登录凭据校验失败 code=${navData.code ?? 'unknown'}`, 'Yellow');
+      return false;
+    }
 
     const d = navData.data;
-    currentUserInfo.uid = Number(d.mid) || 0;
-    currentUserInfo.uname = d.uname || '';
-    currentUserInfo.face = d.face || '';
-    currentUserInfo.level = d.level_info?.current_level ?? 0;
-    biliUid = currentUserInfo.uid;
-    currentUserInfo.myRoomId = 0;
+    const nextUserInfo = createEmptyBiliUserInfo();
+    nextUserInfo.uid = Number(d.mid) || 0;
+    nextUserInfo.uname = d.uname || '';
+    nextUserInfo.face = d.face || '';
+    nextUserInfo.level = d.level_info?.current_level ?? 0;
 
     try {
-      const roomRes = await fetch(`https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid=${currentUserInfo.uid}`, { headers });
+      const roomRes = await fetch(`https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid=${nextUserInfo.uid}`, { headers });
       const roomData: any = await roomRes.json();
-      if (roomData.code === 0 && Number(roomData.data?.roomid) > 0) currentUserInfo.myRoomId = Number(roomData.data.roomid);
+      if (roomData.code === 0 && Number(roomData.data?.roomid) > 0) nextUserInfo.myRoomId = Number(roomData.data.roomid);
     } catch { }
 
     try {
-      const statRes = await fetch(`https://api.bilibili.com/x/relation/stat?vmid=${currentUserInfo.uid}`, { headers });
+      const statRes = await fetch(`https://api.bilibili.com/x/relation/stat?vmid=${nextUserInfo.uid}`, { headers });
       const statData: any = await statRes.json();
-      if (statData.code === 0 && statData.data?.follower !== undefined) currentUserInfo.followerCount = Number(statData.data.follower) || 0;
+      if (statData.code === 0 && statData.data?.follower !== undefined) nextUserInfo.followerCount = Number(statData.data.follower) || 0;
     } catch { }
 
-    if (currentUserInfo.myRoomId > 0) {
+    if (nextUserInfo.myRoomId > 0) {
       try {
-        const guardRes = await fetch(`https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList?roomid=${currentUserInfo.myRoomId}&page=1&ruid=${currentUserInfo.uid}&page_size=1`, { headers });
+        const guardRes = await fetch(`https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList?roomid=${nextUserInfo.myRoomId}&page=1&ruid=${nextUserInfo.uid}&page_size=1`, { headers });
         const guardData: any = await guardRes.json();
-        if (guardData.code === 0 && guardData.data?.info?.num !== undefined) currentUserInfo.guardCount = Number(guardData.data.info.num) || 0;
+        if (guardData.code === 0 && guardData.data?.info?.num !== undefined) nextUserInfo.guardCount = Number(guardData.data.info.num) || 0;
       } catch { }
 
       try {
-        const clubRes = await fetch(`https://api.live.bilibili.com/live_user/v1/Club/get_club_info?uid=${currentUserInfo.uid}`, { headers });
+        const clubRes = await fetch(`https://api.live.bilibili.com/live_user/v1/Club/get_club_info?uid=${nextUserInfo.uid}`, { headers });
         const clubData: any = await clubRes.json();
-        if (clubData.code === 0 && clubData.data && !Array.isArray(clubData.data) && clubData.data.fans_num !== undefined) currentUserInfo.fanClubCount = Number(clubData.data.fans_num) || 0;
+        if (clubData.code === 0 && clubData.data && !Array.isArray(clubData.data) && clubData.data.fans_num !== undefined) nextUserInfo.fanClubCount = Number(clubData.data.fans_num) || 0;
       } catch { }
     }
 
-    if (currentUserInfo.myRoomId > 0) {
-      appConfig.myRoomId = currentUserInfo.myRoomId;
+    // 扫码、退出登录或更换账号可能在网络请求期间发生；过期请求不得覆盖较新的登录状态。
+    if (biliCookie !== expectedCookie) return false;
+
+    currentUserInfo = nextUserInfo;
+    biliUid = nextUserInfo.uid;
+    if (nextUserInfo.myRoomId > 0) {
+      appConfig.myRoomId = nextUserInfo.myRoomId;
       if (!appConfig.roomId) {
-        appConfig.roomId = currentUserInfo.myRoomId;
-        writeLog(`>>> [账号] 检测到本账号直播间 ${currentUserInfo.myRoomId}，已自动设为监控房间。`, 'Cyan');
+        appConfig.roomId = nextUserInfo.myRoomId;
+        writeLog(`>>> [账号] 检测到本账号直播间 ${nextUserInfo.myRoomId}，已自动设为监控房间。`, 'Cyan');
       }
     }
     saveConfig();
-  } catch (err: any) { writeLog(`[系统] 获取用户信息失败: ${err.message}`, 'Yellow'); }
+    return true;
+  } catch (err: any) {
+    writeLog(`[系统] 获取用户信息失败: ${err.message}`, 'Yellow');
+    return false;
+  }
 }
 
 // ==========================================
@@ -1692,8 +1706,98 @@ function handleDanmaku(user: any, msg: string) {
 // ==========================================
 // B站扫码登录核心逻辑
 // ==========================================
+const BILI_LOGIN_COOKIE_NAMES = ['DedeUserID', 'DedeUserID__ckMd5', 'SESSDATA', 'bili_jct', 'sid', 'buvid3', 'buvid4'];
+
+function getCanonicalBiliCookieName(name: string): string | null {
+  return BILI_LOGIN_COOKIE_NAMES.find(cookieName => cookieName.toLowerCase() === name.toLowerCase()) || null;
+}
+
+function collectBiliCookiesFromUrl(rawUrl: string, cookies: Map<string, string>, depth: number = 0) {
+  if (!rawUrl || depth > 2) return;
+
+  try {
+    const parsedUrl = new URL(rawUrl, 'https://passport.bilibili.com/');
+    const collectRawQuery = (rawQuery: string) => {
+      for (const pair of rawQuery.replace(/^\?/, '').split('&')) {
+        if (!pair) continue;
+        const separatorIndex = pair.indexOf('=');
+        const rawKey = separatorIndex >= 0 ? pair.slice(0, separatorIndex) : pair;
+        const rawValue = separatorIndex >= 0 ? pair.slice(separatorIndex + 1) : '';
+        let decodedKey = rawKey;
+        try { decodedKey = decodeURIComponent(rawKey.replace(/\+/g, ' ')); } catch {}
+
+        const cookieName = getCanonicalBiliCookieName(decodedKey);
+        // Cookie 值必须保留 B站返回的百分号编码；URLSearchParams 会解码 SESSDATA，导致凭据失效。
+        if (cookieName && rawValue) cookies.set(cookieName, rawValue);
+
+        if (!cookieName && depth < 2 && /^(?:https?%3A|https?:)/i.test(rawValue)) {
+          let nestedUrl = rawValue;
+          try { nestedUrl = decodeURIComponent(rawValue); } catch {}
+          collectBiliCookiesFromUrl(nestedUrl, cookies, depth + 1);
+        }
+      }
+    };
+
+    collectRawQuery(parsedUrl.search);
+
+    const rawHash = parsedUrl.hash.replace(/^#/, '');
+    if (rawHash) collectRawQuery(rawHash.includes('?') ? rawHash.slice(rawHash.indexOf('?')) : rawHash);
+  } catch {}
+}
+
+function collectBiliCookiesFromResponse(response: Response, cookies: Map<string, string>) {
+  const responseHeaders: any = response.headers;
+  const setCookieHeaders: string[] = typeof responseHeaders.getSetCookie === 'function'
+    ? responseHeaders.getSetCookie()
+    : [response.headers.get('set-cookie') || ''];
+
+  for (const setCookieHeader of setCookieHeaders) {
+    if (!setCookieHeader) continue;
+    for (const cookieName of BILI_LOGIN_COOKIE_NAMES) {
+      const escapedName = cookieName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const match = setCookieHeader.match(new RegExp(`(?:^|[,;]\\s*)${escapedName}=([^;,\\s]+)`, 'i'));
+      if (match?.[1]) cookies.set(cookieName, match[1]);
+    }
+  }
+}
+
+async function collectBiliCookiesFromLoginRedirect(loginUrl: string, headers: Record<string, string>, cookies: Map<string, string>) {
+  let currentUrl = loginUrl;
+
+  for (let redirectCount = 0; redirectCount < 5 && currentUrl; redirectCount++) {
+    collectBiliCookiesFromUrl(currentUrl, cookies);
+
+    let parsedUrl: URL;
+    try { parsedUrl = new URL(currentUrl); } catch { return; }
+    if (!['https:', 'http:'].includes(parsedUrl.protocol)) return;
+
+    try {
+      const response = await fetch(parsedUrl, { headers, redirect: 'manual' });
+      collectBiliCookiesFromResponse(response, cookies);
+      const location = response.headers.get('location');
+      if (!location || response.status < 300 || response.status >= 400) return;
+      currentUrl = new URL(location, parsedUrl).toString();
+    } catch {
+      return;
+    }
+  }
+}
+
+function serializeBiliLoginCookies(cookies: Map<string, string>): string {
+  return BILI_LOGIN_COOKIE_NAMES
+    .filter(cookieName => cookies.has(cookieName))
+    .map(cookieName => `${cookieName}=${cookies.get(cookieName)}`)
+    .join('; ');
+}
+
+function stopBiliQrPolling() {
+  if (qrPollTimer) clearInterval(qrPollTimer);
+  qrPollTimer = null;
+}
+
 async function startBiliQrLogin() {
   if (isQrLoggingIn) return;
+  const attemptId = ++qrLoginAttemptId;
   isQrLoggingIn = true; qrCodeBase64 = ""; qrLoginStatus = "正在向 B站请求二维码...";
 
   try {
@@ -1706,38 +1810,83 @@ async function startBiliQrLogin() {
     qrCodeBase64 = "data:image/png;base64," + Buffer.from(await qrImgRes.arrayBuffer()).toString('base64');
     qrLoginStatus = "请使用手机 B站 APP 扫码";
 
-    if (qrPollTimer) clearInterval(qrPollTimer);
+    stopBiliQrPolling();
     let pollCount = 0;
+    let pollRequestInFlight = false;
 
     qrPollTimer = setInterval(async () => {
+      if (attemptId !== qrLoginAttemptId || pollRequestInFlight) return;
       pollCount++;
-      if (pollCount > 60) { clearInterval(qrPollTimer!); qrLoginStatus = "二维码已失效，请重新发起"; isQrLoggingIn = false; return; }
+      if (pollCount > 60) { stopBiliQrPolling(); qrLoginStatus = "二维码已失效，请重新发起"; isQrLoggingIn = false; return; }
 
+      pollRequestInFlight = true;
       try {
         const pollRes = await fetch(`https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=${genData.data.qrcode_key}`, { headers });
+        if (attemptId !== qrLoginAttemptId) return;
         const pollData: any = await pollRes.json();
         const code = pollData.data?.code;
 
         if (code === 86090) qrLoginStatus = "已扫码，请在手机上点击确认";
-        else if (code === 86038) { clearInterval(qrPollTimer!); qrLoginStatus = "二维码已失效，请重新发起"; isQrLoggingIn = false; }
+        else if (code === 86038) { stopBiliQrPolling(); qrLoginStatus = "二维码已失效，请重新发起"; isQrLoggingIn = false; }
         else if (code === 0) {
-          clearInterval(qrPollTimer!); qrLoginStatus = "扫码成功！正在提取身份凭证...";
+          stopBiliQrPolling();
+          qrLoginStatus = "扫码成功！正在提取并校验身份凭证...";
+
+          const loginCookies = new Map<string, string>();
+          collectBiliCookiesFromResponse(pollRes, loginCookies);
           if (pollData.data?.url) {
-            const params = new URLSearchParams(new URL(pollData.data.url).search);
-            const cookies: string[] = []; let uid = 0;
-            params.forEach((value, key) => {
-              if (['DedeUserID', 'DedeUserID__ckMd5', 'SESSDATA', 'bili_jct'].includes(key)) cookies.push(`${key}=${value}`);
-              if (key === 'DedeUserID') uid = parseInt(value, 10);
-            });
-            biliCookie = cookies.join('; '); biliUid = uid; saveConfig();
-            await updateCurrentUserInfo();
-            if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);
+            collectBiliCookiesFromUrl(pollData.data.url, loginCookies);
+            await collectBiliCookiesFromLoginRedirect(pollData.data.url, headers, loginCookies);
           }
-          qrLoginStatus = "登录完成，请前往连接直播间！"; isQrLoggingIn = false;
+          if (attemptId !== qrLoginAttemptId) return;
+
+          const candidateCookie = serializeBiliLoginCookies(loginCookies);
+          const candidateUid = Number(loginCookies.get('DedeUserID')) || 0;
+          if (!loginCookies.get('SESSDATA') || !candidateUid || !candidateCookie) {
+            qrLoginStatus = "登录凭据提取失败，请重新获取二维码再试";
+            isQrLoggingIn = false;
+            writeLog(`[Bilibili] 扫码返回成功，但未取得完整登录凭据（已获取 ${loginCookies.size} 个 Cookie）`, 'Yellow');
+            return;
+          }
+
+          const previousLogin = {
+            cookie: biliCookie,
+            uid: biliUid,
+            userInfo: { ...currentUserInfo }
+          };
+          biliCookie = candidateCookie;
+          biliUid = candidateUid;
+          currentUserInfo = createEmptyBiliUserInfo();
+
+          const loginVerified = await updateCurrentUserInfo();
+          if (attemptId !== qrLoginAttemptId) return;
+          if (!loginVerified) {
+            biliCookie = previousLogin.cookie;
+            biliUid = previousLogin.uid;
+            currentUserInfo = previousLogin.userInfo;
+            qrLoginStatus = "账号校验失败，未保存本次登录，请重新扫码";
+            isQrLoggingIn = false;
+            writeLog('[Bilibili] 扫码凭据未通过账号接口校验，已回滚原登录状态', 'Yellow');
+            return;
+          }
+
+          qrCodeBase64 = '';
+          qrLoginStatus = `登录成功：${currentUserInfo.uname || `UID ${biliUid}`}`;
+          isQrLoggingIn = false;
+          writeLog(`[Bilibili] 扫码登录成功：${currentUserInfo.uname} (${biliUid})`, 'Green');
+          if (appConfig.roomId) void connectToLiveRoom(appConfig.roomId);
         }
-      } catch { }
+      } catch (err: any) {
+        writeLog(`[Bilibili] 扫码状态轮询异常: ${err?.message || err}`, 'Yellow');
+      } finally {
+        pollRequestInFlight = false;
+      }
     }, 2000);
-  } catch (err: any) { qrLoginStatus = `错误: ${err.message}`; isQrLoggingIn = false; }
+  } catch (err: any) {
+    stopBiliQrPolling();
+    qrLoginStatus = `错误: ${err.message}`;
+    isQrLoggingIn = false;
+  }
 }
 
 function readRequestBody(req: http.IncomingMessage): Promise<string> {
@@ -1776,7 +1925,7 @@ function startBackendServer() {
         return;
       }
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ roomId: appConfig.roomId, myRoomId: appConfig.myRoomId || 0, biliLogin: !!biliCookie, uid: biliUid, currentUser: currentUserInfo, version: app.getVersion(), accepting: isAccepting, playing: isPlaying, widgetStyle: appConfig.widgetStyle, cdpConnected: isCdpConnected, config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, ShowPlayerCurrentTrack: false, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 } } }));
+      res.end(JSON.stringify({ roomId: appConfig.roomId, myRoomId: appConfig.myRoomId || 0, biliLogin: isBiliLoginReady(), uid: biliUid, currentUser: currentUserInfo, version: app.getVersion(), accepting: isAccepting, playing: isPlaying, widgetStyle: appConfig.widgetStyle, cdpConnected: isCdpConnected, config: appConfig.sysConfig || { EnableCDP: true, CdpPort: 9222, ShowAllDanmaku: false, IdleWaitNext: true, ShowPlayerCurrentTrack: false, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', SuperUsers: [], Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 } } }));
       return;
     }
 
@@ -1925,7 +2074,7 @@ function startBackendServer() {
 
     if (url.pathname === '/api/bili/logout' && req.method === 'POST') { logoutBiliAccount(); res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
     if (url.pathname === '/api/bili/qrstart' && req.method === 'POST') { startBiliQrLogin(); res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
-    if (url.pathname === '/api/bili/qrstatus') { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ qrBase64: qrCodeBase64, status: qrLoginStatus, isLogin: !!biliCookie })); return; }
+    if (url.pathname === '/api/bili/qrstatus') { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ qrBase64: qrCodeBase64, status: qrLoginStatus, isLogin: isBiliLoginReady(), uid: biliUid, currentUser: currentUserInfo })); return; }
     if (url.pathname === '/api/logs') { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify(sysLogs)); return; }
 
     if (req.method === 'GET' && !url.pathname.startsWith('/api/') && url.pathname !== '/data') {

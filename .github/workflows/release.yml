@@ -15,16 +15,23 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'npm'
 
       - name: Install Dependencies
         run: npm ci
+
+      - name: Verify source and production dependencies
+        shell: pwsh
+        run: |
+          npm run lint
+          npm test
+          npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
 
       - name: Get Version and Sync package.json
         id: get_version
@@ -59,26 +66,26 @@ jobs:
       - name: Install Velopack CLI
         run: dotnet tool install -g vpk
 
-      - name: Rename exe to ASCII
+      - name: Verify packaged executable
         shell: powershell
         run: |
-          Get-ChildItem "dist_electron\win-unpacked\*.exe" | ForEach-Object {
-            Rename-Item $_.FullName "BiliNCM.exe"
-            Write-Host "Renamed $($_.Name) to BiliNCM.exe"
+          $exe = "dist_electron\win-unpacked\AwooMusicBot.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Packaged executable not found: $exe"
           }
-          Get-ChildItem "dist_electron\win-unpacked\*.exe" | Select-Object Name
+          Get-Item $exe | Select-Object Name, Length
 
       - name: Pack with Velopack
         shell: pwsh
         run: |
           chcp 65001 > $null
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          vpk pack -u bilincm -v $env:VERSION -p dist_electron/win-unpacked -e BiliNCM.exe --packTitle "嗷呜点歌机" -i assets/icon.ico
+          vpk pack -u awoo-musicbot -v $env:VERSION -p dist_electron/win-unpacked -e AwooMusicBot.exe --packTitle "Awoo MusicBot" -i assets/icon.ico
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "BiliNCM Release ${{ env.TAG_NAME }}"
+          name: "Awoo MusicBot ${{ env.TAG_NAME }}"
           tag_name: "${{ env.TAG_NAME }}"
           draft: false
           prerelease: false

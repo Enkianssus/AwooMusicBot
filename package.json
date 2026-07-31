@@ -1,27 +1,32 @@
 {
-  "name": "bilincm-ts",
+  "name": "awoo-musicbot",
   "private": true,
-  "version": "1.0.14",
+  "version": "1.1.0",
   "type": "module",
-  "description": "B站点歌机 TypeScript 客户端",
+  "description": "Awoo MusicBot - 支持多播放器的 Bilibili 弹幕点歌机器人",
   "author": "Enkianssus",
-  "productName": "嗷呜点歌机",
+  "productName": "Awoo MusicBot",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && electron-builder",
+    "build:dev": "tsc && vite build && electron-builder --dir --config.directories.output=dist_electron_dev_1.1.0",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "test": "node --test tests/*.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
     "bufferutil": "^4.1.0",
+    "extract-zip": "^2.0.1",
+    "qrcode": "^1.5.4",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "utf-8-validate": "^6.0.6",
     "velopack": "^0.0.1589-ga2c5a97",
-    "ws": "^8.20.0"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.5",
     "@types/react": "^18.2.64",
     "@types/react-dom": "^18.2.21",
     "@types/ws": "^8.18.1",
@@ -42,14 +47,14 @@
     "vite-plugin-electron-renderer": "^0.14.5"
   },
   "build": {
-    "appId": "com.enkianssus.bilincmbot",
-    "productName": "嗷呜点歌机",
+    "appId": "com.enkianssus.awoomusicbot",
+    "productName": "Awoo MusicBot",
     "directories": {
       "output": "dist_electron"
     },
     "win": {
       "icon": "assets/icon.ico",
-      "executableName": "BiliNCM",
+      "executableName": "AwooMusicBot",
       "target": [
         {
           "target": "dir"

@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <PlatformTarget>x86</PlatformTarget>
+    <AssemblyName>BiliNCM.PlayerBridge</AssemblyName>
+    <RootNamespace>UnifiedPlayerControlPoc</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\experiments\unified-player-control-poc\PlayerContracts.cs"
+             Link="Adapters\PlayerContracts.cs" />
+    <Compile Include="..\..\experiments\unified-player-control-poc\GuardedNextMonitor.cs"
+             Link="Adapters\GuardedNextMonitor.cs" />
+    <Compile Include="..\..\experiments\unified-player-control-poc\NeteasePlayerAdapter.cs"
+             Link="Adapters\NeteasePlayerAdapter.cs" />
+    <Compile Include="..\..\experiments\unified-player-control-poc\KugouPlayerAdapter.cs"
+             Link="Adapters\KugouPlayerAdapter.cs" />
+    <Compile Include="..\..\experiments\unified-player-control-poc\QQMusicPlayerAdapter.cs"
+             Link="Adapters\QQMusicPlayerAdapter.cs" />
+    <Compile Include="..\..\experiments\unified-player-control-poc\QQMusicAudioMuteScope.cs"
+             Link="Adapters\QQMusicAudioMuteScope.cs" />
+    <Compile Include="..\..\experiments\unified-player-control-poc\QQMusicTimelineProbe.cs"
+             Link="Adapters\QQMusicTimelineProbe.cs" />
+    <Compile Include="..\..\experiments\unified-player-control-poc\QQMusicCompatibilityTypes.cs"
+             Link="Adapters\QQMusicCompatibilityTypes.cs" />
+
+    <Compile Include="..\..\experiments\kugou-control-poc\KugouNativeController.cs"
+             Link="Vendor\KugouNativeController.cs" />
+    <Compile Include="..\..\experiments\qqmusic-control-poc\QQMusicNativeController.cs"
+             Link="Vendor\QQMusicNativeController.cs" />
+    <Compile Include="..\..\experiments\qqmusic-control-poc\QQMusicCatalogClient.cs"
+             Link="Vendor\QQMusicCatalogClient.cs" />
+    <Compile Include="..\..\experiments\qqmusic-control-poc\QQMusicNativeNextTransport.cs"
+             Link="Vendor\QQMusicNativeNextTransport.cs" />
+  </ItemGroup>
+</Project>

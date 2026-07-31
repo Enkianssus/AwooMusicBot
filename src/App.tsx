@@ -1,18 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 // ==========================================
 // 0. 环境检测
 // ==========================================
 const isElectron = new URLSearchParams(window.location.search).get('mode') === 'electron';
 
-let ipcRenderer: any = null;
-if (isElectron) {
-    try {
-        ipcRenderer = require('electron').ipcRenderer;
-    } catch {
-        console.warn('ipcRenderer 不可用');
-    }
-}
+const electronAPI = isElectron ? window.electronAPI : undefined;
 
 // ==========================================
 // 1. 类型定义
@@ -112,6 +105,22 @@ interface QrState {
     loading: boolean;
     base64: string;
     message: string;
+}
+
+type NativeConnectorId = 'netease' | 'kugou' | 'qqmusic' | 'folia';
+
+interface ConnectorStatus {
+    id: NativeConnectorId;
+    name: string;
+    installed: boolean;
+    currentVersion: string | null;
+    latestVersion: string | null;
+    minimumCoreVersion: string | null;
+    compatible: boolean;
+    updateAvailable: boolean;
+    updating: boolean;
+    checkedAt: string;
+    error: string | null;
 }
 
 // ==========================================
@@ -219,7 +228,6 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [toasts, setToasts] = useState<ToastInfo[]>([]);
     const lastToastTimeRef = useRef<number>(0);
     const lastSyncTimeRef = useRef<number>(0);
-    const appsIssueToastShownRef = useRef<boolean>(false);
 
     const triggerToast = (msg: string) => {
         const id = Date.now() + Math.random();
@@ -255,7 +263,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             localStorage.setItem('bili-first-launch', 'false');
             setTimeout(() => {
                 triggerToast("🎉 欢迎使用！已自动为您打开控制面板。如果您关闭了它，可随时点击右上角的 ⚙️ 按钮呼出！");
-                ipcRenderer?.send('open-admin');
+                electronAPI?.openAdmin();
             }, 1000);
         }
     }, []);
@@ -286,7 +294,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         }, 500);
 
         return () => clearTimeout(syncTimer);
-    }, [theme, widgetStyle, isElectron]);
+    }, [theme, widgetStyle]);
 
     useEffect(() => {
         if (isElectron) return;
@@ -298,7 +306,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             target.style.top = `${widgetStyle.y}px`;
             target.style.margin = '0';
         }
-    }, [widgetStyle, isElectron]);
+    }, [widgetStyle]);
 
     useEffect(() => {
         const fetchData = async () => {
@@ -353,16 +361,6 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
                 if (typeof json.cdpConnected === 'boolean') {
                     setIsCdpConnected(json.cdpConnected);
-                }
-
-                // ⭐ 针对 WindowsApps 启动权限错误的 Overlay 静默诊断与浮窗强提示
-                if (json.status && (json.status.includes('EPERM') || json.status.includes('WindowsApps'))) {
-                    if (!appsIssueToastShownRef.current) {
-                        appsIssueToastShownRef.current = true;
-                        triggerToast("⚠️ 启动失败！检测到网易云可能处于系统安全目录下(WindowsApps)或发生权限问题。请点击设置进入控制面板查看异常排查指南！");
-                    }
-                } else {
-                    appsIssueToastShownRef.current = false;
                 }
 
             } catch { setIsConnected(false); }
@@ -497,12 +495,12 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     };
 
     const handleWindowClose = () => {
-        if (isElectron && ipcRenderer) ipcRenderer.send('close-window');
+        if (isElectron) electronAPI?.closeWindow();
         else { fetch('http://localhost:5555/api/exit', { method: 'POST' }); window.close(); }
     };
 
     const handleWindowMinimize = () => {
-        if (isElectron && ipcRenderer) ipcRenderer.send('minimize-window');
+        if (isElectron) electronAPI?.minimizeWindow();
     };
 
     const handleDragStart = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -512,7 +510,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         const target = (e.currentTarget as HTMLElement).closest('.react-widget-root') as HTMLElement;
         if (!target) return;
 
-        let startX = e.clientX, startY = e.clientY, initialX = widgetStyle.x, initialY = widgetStyle.y;
+        const startX = e.clientX, startY = e.clientY, initialX = widgetStyle.x, initialY = widgetStyle.y;
 
         const onMouseMove = (ev: MouseEvent) => {
             target.style.left = `${initialX + (ev.clientX - startX)}px`;
@@ -539,7 +537,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
         targetHandle.setPointerCapture(e.pointerId);
 
-        let startX = e.clientX, startY = e.clientY, initialW = widgetStyle.w, initialH = widgetStyle.h;
+        const startX = e.clientX, startY = e.clientY, initialW = widgetStyle.w, initialH = widgetStyle.h;
         let animationFrameId: number;
 
         const onPointerMove = (ev: PointerEvent) => {
@@ -579,7 +577,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             animationFrameId = requestAnimationFrame(() => {
                 lastW = Math.max(300, initialW + (ev.screenX - startX));
                 lastH = Math.max(400, initialH + (ev.screenY - startY));
-                ipcRenderer?.send('overlay-resize', lastW, lastH);
+                electronAPI?.resizeOverlay(lastW, lastH);
             });
         };
 
@@ -728,7 +726,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             >
                                 <span className="text-[10px] leading-none">{playing ? '🟢' : '🔴'}</span>
                             </button>
-                            <h1 className="font-bold text-[15px] tracking-wide pointer-events-none whitespace-nowrap shrink-0" style={{ color: theme.titleColor }}>嗷呜点歌机</h1>
+                            <h1 className="font-bold text-[15px] tracking-wide pointer-events-none whitespace-nowrap shrink-0" style={{ color: theme.titleColor }}>Awoo MusicBot</h1>
                         </div>
 
                         <div className="no-drag flex items-center relative h-6 flex-1 justify-end min-w-0">
@@ -979,11 +977,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 // 4. 核心组件: 后台管理控制面板
 // ==========================================
 
-interface AdminWidgetProps {
-    onClose: () => void;
-}
-
-const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
+const AdminWidget: React.FC = () => {
     const [config, setConfig] = useState<any>(null);
     const [activeTab, setActiveTab] = useState<string>('settings');
 
@@ -999,37 +993,102 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const [autoScroll, setAutoScroll] = useState<boolean>(true);
     const logContainerRef = useRef<HTMLDivElement>(null);
 
-    // ⭐ 新增: 智能诊断警告触发状态
-    const [hasWindowsAppsIssue, setHasWindowsAppsIssue] = useState<boolean>(false);
     const [hasBiliLoopIssue, setHasBiliLoopIssue] = useState<boolean>(false);
 
     const [superUserInput, setSuperUserInput] = useState<string>('');
     const [debugInput, setDebugInput] = useState<string>('');
 
     const [adminToast, setAdminToast] = useState<string>('');
+    const [connectorStatuses, setConnectorStatuses] = useState<
+        Partial<Record<NativeConnectorId, ConnectorStatus>>
+    >({});
+    const [connectorChecking, setConnectorChecking] = useState(false);
+    const [connectorUpdating, setConnectorUpdating] = useState<
+        NativeConnectorId | null
+    >(null);
+    const [connectorStatusError, setConnectorStatusError] = useState('');
+    const [feedbackForm, setFeedbackForm] = useState({
+        category: 'bug',
+        priority: 'normal',
+        title: '',
+        description: '',
+        contact: ''
+    });
+    const [feedbackDiagnostics, setFeedbackDiagnostics] = useState<any>(null);
+    const [feedbackIncludeDiagnostics, setFeedbackIncludeDiagnostics] = useState(true);
+    const [feedbackIncludeLogs, setFeedbackIncludeLogs] = useState(false);
+    const [feedbackLoading, setFeedbackLoading] = useState(false);
+    const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+    const [feedbackResult, setFeedbackResult] = useState<any>(null);
 
-    // ⭐ 防抖重连定时器引用
-    const restartTimerRef = useRef<NodeJS.Timeout | null>(null);
-
-    const showAdminToast = (msg: string) => {
+    const showAdminToast = useCallback((msg: string) => {
         setAdminToast(msg);
         setTimeout(() => setAdminToast(''), 3000);
-    };
+    }, []);
+
+    const loadConnectorStatuses = useCallback(async (forceRefresh = false) => {
+        setConnectorChecking(true);
+        setConnectorStatusError('');
+        try {
+            const suffix = forceRefresh ? '?refresh=1' : '';
+            const response = await fetch(
+                `http://localhost:5555/api/connectors/status${suffix}`
+            );
+            const result = await response.json();
+            if (!result.success) {
+                throw new Error(result.message || '连接器更新服务不可用');
+            }
+            const nextStatuses: Partial<
+                Record<NativeConnectorId, ConnectorStatus>
+            > = {};
+            for (const status of result.connectors || []) {
+                nextStatuses[status.id as NativeConnectorId] = status;
+            }
+            setConnectorStatuses(nextStatuses);
+            if (forceRefresh) {
+                const statuses = (result.connectors || []) as ConnectorStatus[];
+                const count = statuses.filter(
+                    (status: ConnectorStatus) => status.updateAvailable
+                ).length;
+                const failureCount = statuses.filter(
+                    status => status.error || !status.compatible
+                ).length;
+                showAdminToast(
+                    failureCount > 0
+                        ? `⚠️ ${failureCount} 个连接器无法完成版本检查或与本体不兼容`
+                        : count > 0
+                        ? `发现 ${count} 个可安装或可更新的连接器`
+                        : '✅ 四个播放器连接器均为最新'
+                );
+            }
+        } catch (error: unknown) {
+            const message = error instanceof Error
+                ? error.message
+                : '检查连接器更新失败';
+            setConnectorStatusError(message);
+            if (forceRefresh) {
+                showAdminToast(`❌ ${message}`);
+            }
+        } finally {
+            setConnectorChecking(false);
+        }
+    }, [showAdminToast]);
 
     const activeTabRef = useRef<string>(activeTab);
     useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
 
+    useEffect(() => {
+        if (activeTab !== 'settings') return;
+        void loadConnectorStatuses(false);
+        const timer = setInterval(
+            () => void loadConnectorStatuses(false),
+            10_000
+        );
+        return () => clearInterval(timer);
+    }, [activeTab, loadConnectorStatuses]);
+
     const isInitialConfigLoad = useRef(true);
     const lastConfigString = useRef('');
-
-    // ⭐ 组件卸载时清理定时器，防止内存泄漏
-    useEffect(() => {
-        return () => {
-            if (restartTimerRef.current) {
-                clearTimeout(restartTimerRef.current);
-            }
-        };
-    }, []);
 
     useEffect(() => {
         const fetchConfig = async () => {
@@ -1047,11 +1106,6 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
                 setRoomIdInput(prev => {
                     if (prev === '' && json.roomId !== 0 && json.roomId !== json.uid) return json.roomId.toString();
-                    return prev;
-                });
-
-                setActiveTab(prev => {
-                    if (!json.biliLogin && prev !== 'login') return 'login';
                     return prev;
                 });
 
@@ -1087,7 +1141,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         }, 800);
 
         return () => clearTimeout(timer);
-    }, [config?.config]);
+    }, [config, showAdminToast]);
 
     useEffect(() => {
         if (activeTab !== 'login') return;
@@ -1126,19 +1180,10 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         return () => clearInterval(timer);
     }, [activeTab]);
 
-    // ⭐ 新增: 实时自动化诊断错误关键字分析
+    // 实时分析 B站弹幕连接是否出现频繁重连。
     useEffect(() => {
         if (sysLogs.length === 0) return;
 
-        // 1. 诊断 WindowsApps / spawn EPERM 权限受阻
-        const winAppsError = sysLogs.some(log =>
-            log.Message.includes('spawn EPERM') ||
-            log.Message.includes('WindowsApps') ||
-            log.Message.includes('权限不足')
-        );
-        setHasWindowsAppsIssue(winAppsError);
-
-        // 2. 诊断 B站 直播间 WebSocket 连接断线环路 (重复产生连接事件)
         const connectEvents = sysLogs.filter(log =>
             log.Message.includes('直播间已连接') ||
             log.Message.includes('弹幕监控启动')
@@ -1179,15 +1224,147 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
             });
             const json = await res.json();
             if(json.success) showAdminToast("✅ 连接请求成功！请查看运行日志确认。");
-            else showAdminToast("❌ 连接失败，请检查网络或确认扫码登录是否有效。");
+            else showAdminToast("❌ 连接失败，请检查房间号或网络连接。");
         } catch { showAdminToast("❌ 请求后端失败"); }
     };
 
-    const handleRestartNCM = async () => {
+    const waitForPlayerConnection = async (
+        timeoutMs = 4500
+    ): Promise<boolean> => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 350));
+            try {
+                const response = await fetch(
+                    'http://localhost:5555/api/config'
+                );
+                const latest = await response.json();
+                if (latest.playerConnected === true) {
+                    setConfig((previous: any) => previous ? ({
+                        ...previous,
+                        playerConnected: true,
+                        cdpConnected: true,
+                        playerConnecting: false,
+                        playerSnapshot: latest.playerSnapshot
+                    }) : previous);
+                    return true;
+                }
+            } catch {
+                // The normal configuration poll will keep retrying.
+            }
+        }
+        return false;
+    };
+
+    const handleReconnectPlayer = async () => {
+        setConfig((prev: any) => prev ? ({
+            ...prev,
+            playerConnected: false,
+            cdpConnected: false,
+            playerConnecting: true,
+            playerSnapshot: null
+        }) : prev);
         try {
-            const res = await fetch('http://localhost:5555/api/sys/restart_ncm', { method: 'POST' });
-            if(res.ok) showAdminToast("✅ 操作指令已发送，请查看运行日志！");
-        } catch { showAdminToast("❌ 发送指令失败"); }
+            const res = await fetch('http://localhost:5555/api/sys/reconnect_player', { method: 'POST' });
+            const json = await res.json();
+            const connected = json.success === true
+                || await waitForPlayerConnection();
+            setConfig((prev: any) => prev ? ({
+                ...prev,
+                playerConnected: connected,
+                cdpConnected: connected,
+                playerConnecting: false
+            }) : prev);
+            if(connected) showAdminToast("✅ 播放器已自动连接！");
+            else showAdminToast("⚠️ 暂未检测到所选播放器，后台会继续尝试连接。");
+        } catch {
+            setConfig((prev: any) => prev ? ({
+                ...prev,
+                playerConnected: false,
+                cdpConnected: false,
+                playerConnecting: false
+            }) : prev);
+            showAdminToast("❌ 发送指令失败");
+        }
+    };
+
+    const handleConnectorReinstall = async (
+        connectorId: NativeConnectorId
+    ) => {
+        if (connectorUpdating) return;
+        const playerTypeByConnector: Record<NativeConnectorId, string> = {
+            netease: 'NCM',
+            kugou: 'Kugou',
+            qqmusic: 'QQMusic',
+            folia: 'Folia'
+        };
+        const reinstallsSelectedPlayer =
+            config?.config?.PlayerType === playerTypeByConnector[connectorId];
+        setConnectorUpdating(connectorId);
+        if (reinstallsSelectedPlayer) {
+            setConfig((previous: any) => previous ? ({
+                ...previous,
+                playerConnecting: true
+            }) : previous);
+        }
+
+        try {
+            const response = await fetch(
+                'http://localhost:5555/api/connectors/reinstall',
+                {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ connectorId })
+                }
+            );
+            const result = await response.json();
+            if (!result.success) {
+                throw new Error(result.message || '连接器重新安装失败');
+            }
+
+            if (result.status) {
+                setConnectorStatuses(previous => ({
+                    ...previous,
+                    [connectorId]: result.status
+                }));
+            }
+            let selectedConnected = result.reconnected === true;
+            if (reinstallsSelectedPlayer) {
+                if (!selectedConnected) {
+                    selectedConnected = await waitForPlayerConnection();
+                }
+                setConfig((previous: any) => previous ? ({
+                    ...previous,
+                    playerConnected: selectedConnected,
+                    cdpConnected: selectedConnected,
+                    playerConnecting: false
+                }) : previous);
+            }
+            await loadConnectorStatuses(false);
+            if (!reinstallsSelectedPlayer) {
+                showAdminToast('✅ 连接器重新安装完成，正在切换并连接播放器...');
+                await handleSetPlayerType(playerTypeByConnector[connectorId]);
+            } else {
+                showAdminToast(
+                    selectedConnected
+                        ? `✅ ${result.status?.name || '播放器'}连接器已重新安装并自动连接！`
+                        : '⚠️ 连接器已重新安装，后台正在等待播放器连接。'
+                );
+            }
+        } catch (error: unknown) {
+            const message = error instanceof Error
+                ? error.message
+                : '连接器重新安装失败';
+            showAdminToast(`❌ ${message}`);
+            if (reinstallsSelectedPlayer) {
+                setConfig((previous: any) => previous ? ({
+                    ...previous,
+                    playerConnecting: false
+                }) : previous);
+            }
+        } finally {
+            setConnectorUpdating(null);
+        }
     };
 
     const handleUpdateCheck = async () => {
@@ -1236,6 +1413,85 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
     const startQrLogin = async () => {
         setQrState(prev => ({ ...prev, loading: true, base64: '' }));
         await fetch('http://localhost:5555/api/bili/qrstart', { method: 'POST' });
+    };
+
+    const loadFeedbackDiagnostics = useCallback(async (includeLogs = false) => {
+        setFeedbackLoading(true);
+        try {
+            const response = await fetch(
+                'http://localhost:5555/api/feedback/diagnostics'
+                + (includeLogs ? '?logs=1' : '')
+            );
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.message || '诊断信息读取失败');
+            }
+            setFeedbackDiagnostics(result);
+        } catch (error: unknown) {
+            const message = error instanceof Error
+                ? error.message
+                : '诊断信息读取失败';
+            showAdminToast(`❌ ${message}`);
+        } finally {
+            setFeedbackLoading(false);
+        }
+    }, [showAdminToast]);
+
+    useEffect(() => {
+        if (activeTab !== 'feedback') return;
+        void loadFeedbackDiagnostics(feedbackIncludeLogs);
+    }, [
+        activeTab,
+        feedbackIncludeLogs,
+        loadFeedbackDiagnostics
+    ]);
+
+    const handleFeedbackSubmit = async () => {
+        if (feedbackSubmitting) return;
+        if (feedbackForm.title.trim().length < 4) {
+            showAdminToast('❌ 反馈标题至少需要 4 个字符');
+            return;
+        }
+        if (feedbackForm.description.trim().length < 10) {
+            showAdminToast('❌ 请至少用 10 个字符描述问题');
+            return;
+        }
+
+        setFeedbackSubmitting(true);
+        setFeedbackResult(null);
+        try {
+            const response = await fetch(
+                'http://localhost:5555/api/feedback/submit',
+                {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        ...feedbackForm,
+                        includeDiagnostics: feedbackIncludeDiagnostics,
+                        includeLogs:
+                            feedbackIncludeDiagnostics && feedbackIncludeLogs
+                    })
+                }
+            );
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.message || '提交失败');
+            }
+            setFeedbackResult(result);
+            setFeedbackForm(previous => ({
+                ...previous,
+                title: '',
+                description: ''
+            }));
+            showAdminToast(`✅ 已提交反馈 ${result.id}`);
+        } catch (error: unknown) {
+            const message = error instanceof Error
+                ? error.message
+                : '提交失败';
+            showAdminToast(`❌ ${message}`);
+        } finally {
+            setFeedbackSubmitting(false);
+        }
     };
 
     const logoutBili = async () => {
@@ -1288,8 +1544,8 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         try {
             const res = await fetch('http://localhost:5555/api/debug/play_next', { method: 'POST' });
             const json = await res.json();
-            if(json.success) showAdminToast("✅ 切歌指令已成功发送！");
-            else showAdminToast("❌ 切歌失败，播放器拒绝响应或未连接！");
+            if(json.success) showAdminToast(`✅ ${json.message || '切歌指令已成功发送！'}`);
+            else showAdminToast(`❌ ${json.message || '切歌失败，播放器拒绝响应或未连接！'}`);
         } catch(err: any) { showAdminToast("❌ 请求后端失败：" + err.message); }
     };
 
@@ -1333,23 +1589,48 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         setConfig((prev: any) => ({...prev, config: {...prev.config, SuperUsers: currentSu.filter(n => n !== name)}}));
     };
 
-    const handleSetPlayerType = (type: string) => {
+    const handleSetPlayerType = async (type: string) => {
+        if (!config?.config || config.config.PlayerType === type) return;
+        const nextSysConfig = { ...config.config, PlayerType: type };
+        lastConfigString.current = JSON.stringify(nextSysConfig);
         setConfig((prev: any) => ({
             ...prev,
-            config: { ...prev.config, PlayerType: type }
+            playerConnected: false,
+            cdpConnected: false,
+            playerConnecting: true,
+            playerSnapshot: null,
+            config: nextSysConfig
         }));
+        showAdminToast("正在切换并自动连接播放器...");
 
-        // ⭐ 如果 1.2 秒内用户又切了播放器，清除之前的定时器
-        if (restartTimerRef.current) {
-            clearTimeout(restartTimerRef.current);
+        try {
+            const res = await fetch('http://localhost:5555/api/config', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({ sysConfig: nextSysConfig })
+            });
+            const json = await res.json();
+            const connected = json.playerConnected === true
+                || await waitForPlayerConnection();
+            setConfig((prev: any) => prev ? ({
+                ...prev,
+                playerConnected: connected,
+                cdpConnected: connected,
+                playerConnecting: connected
+                    ? false
+                    : json.playerConnecting === true
+            }) : prev);
+            if (connected) showAdminToast("✅ 已切换并自动连接播放器！");
+            else showAdminToast("⚠️ 已切换播放器，后台正在等待连接。");
+        } catch {
+            setConfig((prev: any) => prev ? ({
+                ...prev,
+                playerConnected: false,
+                cdpConnected: false,
+                playerConnecting: false
+            }) : prev);
+            showAdminToast("❌ 切换播放器失败，请查看运行日志。");
         }
-
-        showAdminToast("已切换播放器，等待自动保存后将自动重连...");
-
-        // ⭐ 设置 1.2 秒定时器 (确保 800ms 的自动保存完成后触发重连)
-        restartTimerRef.current = setTimeout(() => {
-            handleRestartNCM();
-        }, 1200);
     };
 
     const permTypes = [
@@ -1359,6 +1640,19 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
         { key: 'CancelPermission', label: '撤回权限 (撤回自己点的最近一首)' },
         { key: 'ToggleAcceptPermission', label: '开关接单权限 (开启/关闭)' },
         { key: 'ForceControlPermission', label: '强控队列权限 (立即/插队/撤回他人)' },
+    ];
+
+    const playerOptions: Array<{
+        type: string;
+        name: string;
+        method: string;
+        detail: string;
+        connectorId: NativeConnectorId;
+    }> = [
+        { type: 'NCM', name: '网易云音乐', method: '原生 IPC', detail: '不重启客户端，不需要调试端口', connectorId: 'netease' },
+        { type: 'Kugou', name: '酷狗音乐', method: '窗口消息 + IPC', detail: '原生控制与安全下一首守卫', connectorId: 'kugou' },
+        { type: 'QQMusic', name: 'QQ 音乐', method: '单实例命令 + 静音守卫', detail: '错误下一首静音、暂停后接管', connectorId: 'qqmusic' },
+        { type: 'Folia', name: 'Folia', method: '独立 Stage 连接器', detail: 'HTTP + WebSocket；支持 ID 校验与封面', connectorId: 'folia' }
     ];
 
     return (
@@ -1381,6 +1675,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                         { id: 'settings', icon: '⚙️', label: '基础设置' },
                         { id: 'logs', icon: '📝', label: '运行日志' },
                         { id: 'faq', icon: '❓', label: '常见问题' },
+                        { id: 'feedback', icon: '💬', label: '问题反馈' },
                         { id: 'login', icon: '📱', label: '扫码登录' },
                         { id: 'update', icon: '🚀', label: '版本升级' },
                         { id: 'debug', icon: '🐞', label: '调试测试' }
@@ -1398,27 +1693,8 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                         <div className="max-w-3xl mx-auto">
 
                             {/* ⭐ 新增: 全局联动智能异常自诊断提示栏 (在所有Tab的最上方持续警醒显示) */}
-                            {(hasWindowsAppsIssue || hasBiliLoopIssue) && (
+                            {hasBiliLoopIssue && (
                                 <div className="mb-6 space-y-3 animate-fadeIn">
-                                    {hasWindowsAppsIssue && (
-                                        <div className="bg-red-500/15 border border-red-500/30 p-4 rounded-xl flex items-start gap-3 text-red-200 shadow-lg">
-                                            <span className="text-xl shrink-0 mt-0.5">⚠️</span>
-                                            <div className="text-xs space-y-1 flex-1">
-                                                <div className="font-bold text-red-400 text-sm">检测到网易云音乐启动受阻 (spawn EPERM)</div>
-                                                <p className="leading-relaxed text-gray-300">
-                                                    当前点歌机自动锁定并运行的路径带有 <code className="text-red-300 bg-red-950 px-1 py-0.5 rounded font-mono">WindowsApps</code>。
-                                                    说明您之前安装并使用的是 **Windows 应用商店版网易云**，该版本运行于独立受保沙盒中，系统强行阻止一切第三方点歌机直接将其调起控制。
-                                                </p>
-                                                <div className="pt-2 flex flex-col sm:flex-row gap-2">
-                                                    <span className="font-bold text-white bg-red-500/30 px-2 py-0.5 rounded shrink-0 self-start">核心解决方案</span>
-                                                    <span className="text-gray-200">
-                                                        请前往系统控制面板中<strong>彻底卸载微软商店版网易云</strong>，然后必须前往 <a href="https://music.163.com/" target="_blank" rel="noreferrer" className="text-blue-400 underline font-bold hover:text-blue-300">网易云音乐官方网站</a> 重新下载 Win32 传统安装包。安装完成后，删除或清理点歌机的旧路径缓存后再启动。
-                                                    </span>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )}
-
                                     {hasBiliLoopIssue && (
                                         <div className="bg-amber-500/15 border border-amber-500/30 p-4 rounded-xl flex items-start gap-3 text-amber-200 shadow-lg">
                                             <span className="text-xl shrink-0 mt-0.5">🌐</span>
@@ -1435,8 +1711,8 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                             如果您使用了纯美国或其他海外节点的全局梯子，B站会出于风控安全直接拒绝/掐断来自这些回环 IP 的直播 Websocket 连接。请尝试**关掉代理**，或切回**国内节点**，或在梯子中设置**绕过本地主机 / PAC分流模式**。
                                                         </li>
                                                         <li>
-                                                            <strong className="text-white">重新登录：</strong>
-                                                            有些时候 B站 连接握手鉴权信息超时失效也会导致不断被断线重连。请前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300 focus:outline-none" onClick={() => setActiveTab('login')}>扫码登录</button> 页，重新绑定登录任意一个普通的 B站 账号获取全新的连接状态。
+                                                            <strong className="text-white">重新建立连接：</strong>
+                                                            游客模式本身可以接收弹幕，不要求扫码。请先在「运行状态」重新连接直播间；如果你原本使用了登录账号，也可以前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300 focus:outline-none" onClick={() => setActiveTab('login')}>扫码登录</button> 页刷新可选的账号凭据。
                                                         </li>
                                                         <li>
                                                             <strong className="text-white">核对房间号：</strong>
@@ -1589,43 +1865,31 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                 <div className="space-y-6 animate-slide-in-right pb-10">
                                     <h2 className="text-2xl font-bold text-white mb-6">❓ 常见问题与自助诊断</h2>
 
-                                    {/* FAQ CARD 1: 网易云无法控制 */}
+                                    {/* FAQ CARD 1: 播放器无法控制 */}
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-4 shadow-inner">
                                         <h3 className="text-md font-bold text-red-400 flex items-center gap-2 pb-2 border-b border-white/5">
-                                            <span>🎵</span> 问题 1：点歌机启动网易云失败或无法控制（无法连接/雷达离线）？
+                                            <span>🎵</span> 问题 1：当前播放器显示“未连接”或无法控制？
                                         </h3>
 
                                         <div className="space-y-4 text-sm leading-relaxed text-gray-300">
                                             <div>
-                                                <strong className="text-white block mb-1">诊断 A：检查您是否安装了“微软商店（Microsoft Store）”版本</strong>
+                                                <strong className="text-white block mb-1">第一步：确认播放器已启动并显示主窗口</strong>
                                                 <p className="text-xs text-gray-400 leading-relaxed">
-                                                    请进入控制面板的 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('logs')}>运行日志</button> 查看最近一轮网易云启动地址。若路径中包含 <code className="px-1.5 py-0.5 rounded bg-red-950 text-red-300 font-mono text-xs">WindowsApps</code> 文件夹（如 <code>C:\Program Files\WindowsApps\...</code>），则代表此应用是微软商店包。
-                                                </p>
-                                                <div className="mt-2 text-xs bg-black/40 p-3 rounded-lg border border-white/5">
-                                                    <span className="text-amber-400 font-bold block mb-1">为什么这会导致失败？</span>
-                                                    微软商店下载的版本处于系统严密沙箱保护中。Windows 规定任何第三方外部应用都**无权直接通过绝对路径调起**沙箱内的 `.exe`，因此会导致后端抛出 <strong>spawn EPERM</strong> 的“权限不足”报错。同时，沙盒内隔离了底层的 WebSocket 通信，令点歌雷达无法获取控制权。
-                                                </div>
-                                                <p className="text-xs text-gray-300 mt-2 font-bold flex items-center gap-1.5">
-                                                    <span className="text-green-400">💡 解决方案：</span>
-                                                    前往系统“已安装的应用”里<strong>卸载商店版网易云音乐</strong>，然后打开 <a href="https://music.163.com/" target="_blank" rel="noreferrer" className="text-cyan-400 font-bold underline hover:text-cyan-300">网易云官方网站</a> 下载传统的 Win32 客户端。重新安装后，请清理或重新选择点歌机里的扫描路径即可。
+                                                    v1.1.0 不再启动、结束或重启播放器。请先手动打开网易云、酷狗或 QQ 音乐；使用 Folia 时请启动 Stage API。再到 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('settings')}>基础设置</button> 选择对应方式并点击“重新连接”。
                                                 </p>
                                             </div>
 
                                             <div className="border-t border-white/5 pt-3">
-                                                <strong className="text-white block mb-1">诊断 B：端口占用情况（普通Win32版重试指南）</strong>
+                                                <strong className="text-white block mb-1">第二步：查看播放器版本和运行日志</strong>
                                                 <p className="text-xs text-gray-400 leading-relaxed">
-                                                    如果是官网传统版本网易云仍然无法正常连接，可能是其默认的控制端口 <code className="text-blue-400 font-mono">9222</code> 被您的浏览器、网游加速器或其他注入软件提前占用。
-                                                </p>
-                                                <p className="text-xs text-gray-300 mt-2 font-bold flex items-center gap-1.5">
-                                                    <span className="text-green-400">💡 解决方案：</span>
-                                                    请切换至 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('settings')}>基础设置</button>，将网易云调试端口由 <code className="text-blue-400 font-mono">9222</code> 调整更改为 <code className="text-blue-400 font-mono">9223</code>（即原端口值 + 1），然后点击其右侧的<strong>“强制重载 / 重连”</strong>按钮！
+                                                    网易云通过原生 IPC 连接；酷狗使用窗口消息与内部 IPC；QQ 使用单实例命令；Folia 使用本机 Stage API。播放器更新后若某项能力被拒绝，请把 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('logs')}>运行日志</button> 中的版本和错误信息发来。网易云不再需要调试端口。
                                                 </p>
                                             </div>
 
                                             <div className="border-t border-white/5 pt-3">
-                                                <strong className="text-white block mb-1">🛠️ 如何一键测试网易云是否控制成功？</strong>
+                                                <strong className="text-white block mb-1">第三步：用调试页做主动测试</strong>
                                                 <p className="text-xs text-gray-400 leading-relaxed">
-                                                    点歌机是否已完成对接，不需要真正等人点歌。直接前往控制面板的 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('debug')}>调试测试</button> 分页下，点击<strong>“模拟切歌指令：立即触发播放下一首”</strong>。如果您的电脑桌面端网易云音乐瞬间执行了切歌操作，说明连接控制已经**完全打通且完美在线**！
+                                                    前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('debug')}>调试测试</button> 搜索一首歌并登记下一首，或手动触发下一首。该操作会真实控制当前选中的播放器。
                                                 </p>
                                             </div>
                                         </div>
@@ -1663,9 +1927,8 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                         <strong className="text-green-400">解决方法：</strong> 请尝试彻底<strong>关闭全局网络代理（梯子）</strong>，切换回<strong>中国本地宽带/5G直连</strong>，或在梯子中设置 Bypass 局域网分流。
                                                     </li>
                                                     <li>
-                                                        <strong className="text-white">账号授权凭证失效？</strong>
-                                                        有时系统缓存的扫码登录身份由于过期被服务器丢弃，阻碍了后续的监视连接。<br/>
-                                                        <strong className="text-green-400">解决方法：</strong> 请前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('login')}>扫码登录</button> 重新生成一个登录二维码并重新扫码鉴权绑定。使用任意普通 B 站个人号登录均可成功拉取弹幕。
+                                                        <strong className="text-white">重新建立游客或账号连接</strong>
+                                                        游客模式无需扫码即可接收弹幕。请先前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('status')}>运行状态</button> 重新连接直播间；只有在你需要白名单、权限分级，或想刷新已有账号凭据时，才需要前往扫码登录页。
                                                     </li>
                                                     <li>
                                                         <strong className="text-white">房间号错填成 UID？</strong>
@@ -1696,7 +1959,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                             />
                                             <button onClick={handleDebugInsert} className="px-6 py-3 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg font-bold transition-colors shadow-lg">发送到播放器</button>
                                         </div>
-                                        <p className="text-xs text-gray-500 mb-8 leading-relaxed">此操作将调用搜索接口提取歌曲ID，然后推送给网易云/Folia播放器。你可以用它来测试底层注入/API连接是否正常工作。</p>
+                                        <p className="text-xs text-gray-500 mb-8 leading-relaxed">此操作会使用当前选中播放器自己的搜索接口；Folia 使用 Stage 搜索接口，其余播放器使用各自适配器，并登记下一首守卫。</p>
 
                                         <h3 className="text-sm font-bold text-blue-400 mb-4 uppercase tracking-wider">🛠️ 测试二：模拟切歌指令</h3>
                                         <button onClick={handleDebugPlayNext} className="w-full px-6 py-4 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg font-bold transition-colors shadow-lg flex justify-center items-center gap-2">
@@ -1744,107 +2007,188 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                             </div>
                                         </div>
                                     ) : (
-                                        <div className="bg-white/5 p-4 rounded-xl border border-white/10 mb-6 text-sm text-gray-400 flex items-center gap-2">
+                                        <div className="bg-cyan-500/10 p-4 rounded-xl border border-cyan-500/20 mb-6 text-sm text-cyan-100 flex items-start gap-3">
                                             <span>👤</span>
-                                            <span>当前未登录，请前往「扫码登录」获取账号信息。</span>
+                                            <div>
+                                                <div className="font-bold">游客模式已启用</div>
+                                                <div className="text-xs text-gray-400 mt-1">无需扫码即可连接直播间和使用普通点歌。超级用户白名单与自定义权限控制需登录后才可设置。</div>
+                                            </div>
                                         </div>
                                     )}
 
-                                    {/* 播放器注入控制区域 */}
+                                    {/* 播放器原生控制区域 */}
                                     <div className="bg-white/5 p-6 rounded-xl border border-purple-500/40 space-y-5 mb-6 shadow-[0_0_15px_rgba(168,85,247,0.15)] relative overflow-hidden">
-                                        <div className="absolute top-0 right-0 bg-purple-600 text-white text-xs px-3 py-1 rounded-bl-lg font-bold">新特性</div>
+                                        <div className="absolute top-0 right-0 bg-purple-600 text-white text-xs px-3 py-1 rounded-bl-lg font-bold">v1.1 独立连接器</div>
 
-                                        <h3 className="text-sm font-bold text-purple-400 uppercase tracking-widest border-b border-white/10 pb-3">
-                                            <span>💻 播放器设置</span>
-                                        </h3>
+                                        <div className="flex items-center justify-between gap-3 border-b border-white/10 pb-3">
+                                            <h3 className="text-sm font-bold text-purple-400 uppercase tracking-widest">
+                                                💻 播放器设置
+                                            </h3>
+                                            <span className="px-3 py-1.5 bg-green-500/10 text-green-300 text-[11px] rounded-lg font-bold border border-green-500/30">
+                                                {connectorChecking ? '⏳ 正在同步版本' : '♨️ 兼容优先更新已开启'}
+                                            </span>
+                                        </div>
+
+                                        {connectorStatusError && (
+                                            <div className="bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2 text-[11px] text-red-300">
+                                                连接器版本检查失败：{connectorStatusError}。已安装的连接器仍可继续使用；首次使用则需要网络恢复后自动下载安装。
+                                            </div>
+                                        )}
 
                                         <div className="hidden md:grid grid-cols-12 gap-4 text-[11px] text-gray-500 font-bold uppercase tracking-wider pb-2 border-b border-white/5 mt-3">
-                                            <div className="col-span-3">目标播放器</div>
+                                            <div className="col-span-2">目标播放器</div>
                                             <div className="col-span-2">当前状态</div>
-                                            <div className="col-span-4">环境配置</div>
+                                            <div className="col-span-3">连接器版本</div>
+                                            <div className="col-span-2">控制方式</div>
                                             <div className="col-span-3 text-right">操作</div>
                                         </div>
 
                                         <div className="flex flex-col gap-3 mt-2">
-                                            {/* 网易云原生 */}
-                                            <div className={`grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border ${config.config.PlayerType === 'NCM' ? 'border-purple-500/50 shadow-inner' : 'border-white/10'} rounded-lg p-3 transition-colors hover:bg-white/5`}>
-                                                <div className="col-span-3 flex items-center gap-3">
-                                                    <button onClick={() => handleSetPlayerType('NCM')} className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${config.config.PlayerType === 'NCM' ? 'border-purple-500' : 'border-gray-500'}`}>
-                                                        {config.config.PlayerType === 'NCM' && <div className="w-2.5 h-2.5 bg-purple-500 rounded-full" />}
-                                                    </button>
-                                                    <span className={`text-sm font-bold tracking-wide ${config.config.PlayerType === 'NCM' ? 'text-white' : 'text-gray-400'}`}>网易云音乐</span>
-                                                </div>
-                                                <div className="col-span-2">
-                                                    {config.config.PlayerType === 'NCM' ? (
-                                                        <span className={`text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${config.cdpConnected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
-                                                            {config.cdpConnected ? '✅ 雷达在线' : '❌ 未连接'}
-                                                        </span>
-                                                    ) : (
-                                                        <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">未启用</span>
-                                                    )}
-                                                </div>
-                                                <div className="col-span-4 flex items-center gap-2">
-                                                    <span className={`text-xs ${config.config.PlayerType === 'NCM' ? 'text-gray-300' : 'text-gray-600'}`}>调试端口:</span>
-                                                    <input disabled={config.config.PlayerType !== 'NCM'} type="number" className="w-20 bg-black/50 border border-white/10 rounded text-xs text-white p-1.5 focus:border-purple-500 outline-none text-center disabled:opacity-50" value={config.config.CdpPort || 9222} onChange={e => setConfig({...config, config: {...config.config, CdpPort: parseInt(e.target.value)}})} />
-                                                </div>
-                                                <div className="col-span-3 flex justify-end">
-                                                    <button disabled={config.config.PlayerType !== 'NCM'} onClick={handleRestartNCM} className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-xs rounded-lg font-bold shadow transition-colors border border-purple-400/50 disabled:opacity-30 disabled:cursor-not-allowed">
-                                                        🔌 强制重载
-                                                    </button>
-                                                </div>
-                                            </div>
-
-                                            {/* Folia */}
-                                            <div className={`grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border ${config.config.PlayerType === 'Folia' ? 'border-purple-500/50 shadow-inner' : 'border-white/10'} rounded-lg p-3 transition-colors hover:bg-white/5`}>
-                                                <div className="col-span-3 flex items-center gap-3">
-                                                    <button onClick={() => handleSetPlayerType('Folia')} className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${config.config.PlayerType === 'Folia' ? 'border-purple-500' : 'border-gray-500'}`}>
-                                                        {config.config.PlayerType === 'Folia' && <div className="w-2.5 h-2.5 bg-purple-500 rounded-full" />}
-                                                    </button>
-                                                    <span className={`text-sm font-bold tracking-wide flex items-center gap-1 ${config.config.PlayerType === 'Folia' ? 'text-white' : 'text-gray-400'}`}>Folia 播放器</span>
-                                                </div>
-                                                <div className="col-span-2">
-                                                    {config.config.PlayerType === 'Folia' ? (
-                                                        <span className={`text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${config.cdpConnected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
-                                                            {config.cdpConnected ? '✅ API 在线' : '❌ 未连接'}
-                                                        </span>
-                                                    ) : (
-                                                        <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">未启用</span>
-                                                    )}
-                                                </div>
-                                                <div className="col-span-4 flex items-center gap-2">
-                                                    <span className={`text-xs ${config.config.PlayerType === 'Folia' ? 'text-pink-400' : 'text-gray-600'}`}>Stage Token:</span>
-                                                    <input
-                                                        disabled={config.config.PlayerType !== 'Folia'}
-                                                        type="text"
-                                                        className="flex-1 min-w-[80px] bg-black/50 border border-white/10 rounded-lg text-xs text-white p-1.5 outline-none focus:border-pink-500 placeholder-gray-600 disabled:opacity-50"
-                                                        placeholder="Bearer Token..."
-                                                        value={config.config.FoliaToken || ''}
-                                                        onChange={e => setConfig({...config, config: {...config.config, FoliaToken: e.target.value}})}
-                                                    />
-                                                </div>
-                                                <div className="col-span-3 flex justify-end">
-                                                    <button disabled={config.config.PlayerType !== 'Folia'} onClick={handleRestartNCM} className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-xs rounded-lg font-bold shadow transition-colors border border-purple-400/50 disabled:opacity-30 disabled:cursor-not-allowed">
-                                                        🔄 测试连接
-                                                    </button>
-                                                </div>
-                                            </div>
-
-                                            <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/20 border border-white/5 rounded-lg p-3 opacity-50 cursor-not-allowed grayscale">
-                                                <div className="col-span-3 flex items-center gap-3">
-                                                    <div className="w-5 h-5 rounded-full border-2 border-gray-500 shrink-0"></div>
-                                                    <span className="text-sm text-gray-400 font-bold tracking-wide">关闭所有注入</span>
-                                                </div>
-                                                <div className="col-span-9 flex justify-end">
-                                                    <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">纯净模式 / UI展示</span>
-                                                </div>
-                                            </div>
+                                            {playerOptions.map(player => {
+                                                const selected = config.config.PlayerType === player.type;
+                                                const connected = config.playerConnected ?? config.cdpConnected;
+                                                const connecting = selected && config.playerConnecting === true;
+                                                const connectorStatus =
+                                                    connectorStatuses[player.connectorId];
+                                                const reinstalling =
+                                                    player.connectorId === connectorUpdating;
+                                                const automaticallyUpdating =
+                                                    connectorStatus?.updating === true;
+                                                return (
+                                                    <div key={player.type} className={`grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border ${selected ? 'border-purple-500/50 shadow-inner' : 'border-white/10'} rounded-lg p-3 transition-colors hover:bg-white/5`}>
+                                                        <div className="md:col-span-2 flex items-center gap-3">
+                                                            <button onClick={() => handleSetPlayerType(player.type)} className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${selected ? 'border-purple-500' : 'border-gray-500'}`}>
+                                                                {selected && <div className="w-2.5 h-2.5 bg-purple-500 rounded-full" />}
+                                                            </button>
+                                                            <span className={`text-sm font-bold tracking-wide ${selected ? 'text-white' : 'text-gray-400'}`}>{player.name}</span>
+                                                        </div>
+                                                        <div className="md:col-span-2">
+                                                            {selected ? (
+                                                                <span className={`text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${connecting ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/30' : connected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
+                                                                    {connecting ? '⏳ 连接中' : connected ? '✅ 已连接' : '❌ 未连接'}
+                                                                </span>
+                                                            ) : (
+                                                                <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">未启用</span>
+                                                            )}
+                                                        </div>
+                                                        <div className="md:col-span-3 min-w-0">
+                                                            {connectorStatus ? (
+                                                                    <div className="space-y-1">
+                                                                        <div className="text-[11px] text-gray-300">
+                                                                            当前：
+                                                                            <span className="font-mono text-white">
+                                                                                {connectorStatus.installed
+                                                                                    ? `独立 v${connectorStatus.currentVersion}`
+                                                                                    : '未安装'}
+                                                                            </span>
+                                                                        </div>
+                                                                        <div className="text-[10px] text-gray-500">
+                                                                            网站最新：
+                                                                            <span className="font-mono">
+                                                                                {connectorStatus.latestVersion
+                                                                                    ? `v${connectorStatus.latestVersion}`
+                                                                                    : '未知'}
+                                                                            </span>
+                                                                        </div>
+                                                                        <span
+                                                                            title={connectorStatus.error || undefined}
+                                                                            className={`inline-flex text-[9px] px-2 py-0.5 rounded-full border ${
+                                                                                connectorStatus.updating
+                                                                                    ? 'bg-yellow-500/10 text-yellow-300 border-yellow-500/30'
+                                                                                    : connectorStatus.error
+                                                                                    ? 'bg-red-500/10 text-red-300 border-red-500/30'
+                                                                                    : !connectorStatus.compatible
+                                                                                        ? 'bg-orange-500/10 text-orange-300 border-orange-500/30'
+                                                                                        : connectorStatus.updateAvailable
+                                                                                            ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30'
+                                                                                            : 'bg-green-500/10 text-green-300 border-green-500/30'
+                                                                            }`}
+                                                                        >
+                                                                            {connectorStatus.updating
+                                                                                ? connectorStatus.installed ? '后台更新中' : '自动安装中'
+                                                                                : connectorStatus.error
+                                                                                ? '检查失败'
+                                                                                : !connectorStatus.compatible
+                                                                                    ? `需要本体 v${connectorStatus.minimumCoreVersion}`
+                                                                                    : connectorStatus.updateAvailable
+                                                                                        ? connectorStatus.installed ? '有新版本可选' : '缺失时自动安装'
+                                                                                        : '已是最新'}
+                                                                        </span>
+                                                                    </div>
+                                                            ) : (
+                                                                    <span className="text-[10px] text-gray-500">
+                                                                        {connectorChecking ? '正在读取版本...' : '尚未检查版本'}
+                                                                    </span>
+                                                            )}
+                                                        </div>
+                                                        <div className="md:col-span-2">
+                                                            <div className={`text-xs font-bold ${selected ? 'text-purple-300' : 'text-gray-600'}`}>{player.method}</div>
+                                                            <div className="text-[10px] text-gray-500 mt-1">{player.detail}</div>
+                                                        </div>
+                                                        <div className="md:col-span-3 flex flex-wrap justify-end gap-2">
+                                                            <button
+                                                                disabled={
+                                                                    connectorUpdating !== null
+                                                                    || connectorStatus?.updating === true
+                                                                    || connectorStatus?.compatible === false
+                                                                }
+                                                                onClick={() => void handleConnectorReinstall(player.connectorId)}
+                                                                className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-[11px] rounded-lg font-bold shadow transition-colors border border-amber-400/40 disabled:opacity-30 disabled:cursor-not-allowed"
+                                                            >
+                                                                {reinstalling
+                                                                    ? '⏳ 重新安装中'
+                                                                    : automaticallyUpdating
+                                                                        ? '⏳ 自动更新中'
+                                                                        : '🛠️ 重新安装'}
+                                                            </button>
+                                                            <button
+                                                                disabled={
+                                                                    !selected
+                                                                    || connecting
+                                                                    || connectorUpdating !== null
+                                                                    || connectorStatus?.updating === true
+                                                                }
+                                                                onClick={handleReconnectPlayer}
+                                                                className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-[11px] rounded-lg font-bold shadow transition-colors border border-purple-400/50 disabled:opacity-30 disabled:cursor-not-allowed"
+                                                            >
+                                                                {connecting ? '⏳ 连接中' : '🔄 重新连接'}
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
                                         </div>
+
+                                        {config.config.PlayerType === 'Folia' && (
+                                            <div className="bg-pink-500/5 border border-pink-500/20 rounded-lg p-4">
+                                                <label className="block text-xs text-pink-300 font-bold mb-2">Folia Stage Token</label>
+                                                <input
+                                                    type="password"
+                                                    value={config.config.FoliaToken || ''}
+                                                    onChange={e => setConfig({
+                                                        ...config,
+                                                        config: {
+                                                            ...config.config,
+                                                            FoliaToken: e.target.value
+                                                        }
+                                                    })}
+                                                    placeholder={
+                                                        config.config.FoliaTokenConfigured
+                                                            ? '已配置；输入新 Token 可替换'
+                                                            : 'Bearer Token...'
+                                                    }
+                                                    className="w-full bg-black/40 border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none focus:border-pink-500"
+                                                />
+                                                <p className="text-[10px] text-gray-500 mt-2">
+                                                    Token 仅保存在本机配置中，并只通过本地进程环境交给 Folia 连接器。保存后点击上方“重新连接”，连接本机 32107 端口的 Stage API。
+                                                </p>
+                                            </div>
+                                        )}
 
                                         <div className="text-xs text-gray-500 mt-2 italic flex gap-2 leading-relaxed">
                                             <span className="shrink-0">💡</span>
                                             <span>
-                                                网易云使用 CDP 原生通信。<br/>
-                                                Folia 请在播放器设置开启 <strong>Stage Mode</strong>，将数据源设为 Stage API 并填入给出的 Bearer Token。
+                                                本体会自动补齐缺少的连接器，并每 30 分钟检查新版本。当前连接器能正常连接时只提示、不强制替换；连接失败且有兼容更新时才自动升级并重连。“重新安装”用于手动修复。
                                             </span>
                                         </div>
                                     </div>
@@ -1881,7 +2225,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                     onChange={e => setConfig({...config, config: {...config.config, IdleWaitNext: e.target.value === 'true'}})}
                                                     className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none cursor-pointer"
                                                 >
-                                                    <option value="true">加入网易云/Folia下一首 (等当前播完)</option>
+                                                    <option value="true">登记播放器下一首守卫（等当前播完）</option>
                                                     <option value="false">立即强行切歌播放</option>
                                                 </select>
                                             </div>
@@ -1894,8 +2238,18 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                     className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none cursor-pointer"
                                                 >
                                                     <option value="continue">继续播放主播歌单（默认）</option>
-                                                    <option value="pause">最后一首点歌结束后暂停播放器</option>
+                                                    <option
+                                                        value="pause"
+                                                        disabled={config.playerSnapshot?.capabilities?.pause === false}
+                                                    >
+                                                        最后一首点歌结束后暂停播放器
+                                                    </option>
                                                 </select>
+                                                {config.playerSnapshot?.capabilities?.pause === false && (
+                                                    <span className="text-xs text-yellow-400 block mt-1.5">
+                                                        当前播放器连接器无法保证明确暂停，将继续播放主播歌单。
+                                                    </span>
+                                                )}
                                             </div>
 
                                             <div>
@@ -1906,7 +2260,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                     className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none cursor-pointer"
                                                 >
                                                     <option value="bili_avatar">B站点歌人头像（默认）</option>
-                                                    <option value="song_cover">网易云音乐歌曲封面</option>
+                                                    <option value="song_cover">播放器歌曲封面</option>
                                                 </select>
                                                 <span className="text-xs text-gray-500 block mt-1.5">主播歌单始终显示歌曲封面</span>
                                             </div>
@@ -1937,12 +2291,56 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                         </div>
                                     </div>
 
-                                    <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
+                                    <div className="bg-white/5 p-6 rounded-xl border border-cyan-500/20 space-y-5 mb-6">
+                                        <div className="border-b border-white/10 pb-3">
+                                            <h3 className="text-sm font-bold text-cyan-400 uppercase tracking-widest">🔌 外部只读接口</h3>
+                                            <p className="text-xs text-gray-500 mt-2">供 OBS 插件或其他工具读取当前歌曲与待播队列，仅监听本机 127.0.0.1。</p>
+                                        </div>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            <div className="flex justify-between items-center bg-black/30 border border-white/10 rounded-lg p-3">
+                                                <div>
+                                                    <label className="block text-sm text-white font-medium">HTTP API</label>
+                                                    <span className="text-xs text-gray-500">GET /api/v1/state</span>
+                                                </div>
+                                                <button onClick={() => setConfig({...config, config: {...config.config, ExternalHttpEnabled: !config.config.ExternalHttpEnabled}})} className={`w-10 h-6 rounded-full p-1 transition-colors ${config.config.ExternalHttpEnabled ? 'bg-cyan-600' : 'bg-gray-600'}`}>
+                                                    <div className={`w-4 h-4 rounded-full bg-white transition-transform ${config.config.ExternalHttpEnabled ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                                                </button>
+                                            </div>
+                                            <div className="flex justify-between items-center bg-black/30 border border-white/10 rounded-lg p-3">
+                                                <div>
+                                                    <label className="block text-sm text-white font-medium">WebSocket 推送</label>
+                                                    <span className="text-xs text-gray-500">状态变化时推送 /ws</span>
+                                                </div>
+                                                <button onClick={() => setConfig({...config, config: {...config.config, ExternalWebSocketEnabled: !config.config.ExternalWebSocketEnabled}})} className={`w-10 h-6 rounded-full p-1 transition-colors ${config.config.ExternalWebSocketEnabled ? 'bg-cyan-600' : 'bg-gray-600'}`}>
+                                                    <div className={`w-4 h-4 rounded-full bg-white transition-transform ${config.config.ExternalWebSocketEnabled ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs text-gray-400 mb-2">本地监听端口</label>
+                                            <input
+                                                type="number"
+                                                min="1024"
+                                                max="65535"
+                                                value={config.config.ExternalApiPort || 5556}
+                                                onChange={e => setConfig({...config, config: {...config.config, ExternalApiPort: parseInt(e.target.value) || 5556}})}
+                                                className="w-32 bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-cyan-500 outline-none"
+                                            />
+                                            <div className="text-xs text-gray-500 mt-2 font-mono break-all">
+                                                HTTP: http://127.0.0.1:{config.config.ExternalApiPort || 5556}/api/v1/state<br/>
+                                                WebSocket: ws://127.0.0.1:{config.config.ExternalApiPort || 5556}/ws
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div className={`bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6 relative ${!config.biliLogin ? 'opacity-50' : ''}`}>
                                         <h3 className="text-sm font-bold text-yellow-400 uppercase tracking-widest border-b border-white/10 pb-3">👑 超级用户白名单</h3>
                                         <p className="text-sm text-gray-500">在下方名单中的 B站用户名，将完全无视冷却时间和任何点歌、切歌权限限制。</p>
+                                        {!config.biliLogin && <div className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3">游客模式下不可用，请先扫码登录。</div>}
 
                                         <div className="flex gap-3">
                                             <input
+                                                disabled={!config.biliLogin}
                                                 type="text"
                                                 value={superUserInput}
                                                 onChange={e => setSuperUserInput(e.target.value)}
@@ -1950,7 +2348,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                 className="flex-1 bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none"
                                                 placeholder="输入需要特权的 B站完整用户名..."
                                             />
-                                            <button onClick={addSuperUser} className="px-6 py-2.5 bg-yellow-600 hover:bg-yellow-500 text-white text-md rounded-lg font-bold transition-colors">添加</button>
+                                            <button disabled={!config.biliLogin} onClick={addSuperUser} className="px-6 py-2.5 bg-yellow-600 hover:bg-yellow-500 text-white text-md rounded-lg font-bold transition-colors disabled:cursor-not-allowed">添加</button>
                                         </div>
 
                                         <div className="flex flex-wrap gap-3 mt-3">
@@ -1960,15 +2358,16 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                 config.config.SuperUsers.map((su: string) => (
                                                     <div key={su} className="bg-white/10 border border-white/20 text-white px-3 py-1.5 rounded-lg text-sm flex items-center gap-2">
                                                         <span>{su}</span>
-                                                        <button onClick={() => removeSuperUser(su)} className="text-red-400 hover:text-red-300 font-bold ml-1">✕</button>
+                                                        <button disabled={!config.biliLogin} onClick={() => removeSuperUser(su)} className="text-red-400 hover:text-red-300 font-bold ml-1 disabled:cursor-not-allowed">✕</button>
                                                     </div>
                                                 ))
                                             )}
                                         </div>
                                     </div>
 
-                                    <div className="bg-white/5 p-6 rounded-xl border border-white/10">
+                                    <div className={`bg-white/5 p-6 rounded-xl border border-white/10 ${!config.biliLogin ? 'opacity-50' : ''}`}>
                                         <h3 className="text-sm font-bold text-green-400 uppercase tracking-widest border-b border-white/10 pb-3 mb-5">🛡️ 弹幕指令权限控制</h3>
+                                        {!config.biliLogin && <div className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3 mb-5">游客模式固定使用基础权限，以下自定义设置暂不可用。</div>}
 
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                                             {permTypes.map(pt => {
@@ -1980,7 +2379,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
 
                                                         <div className="flex justify-between items-center">
                                                             <span className="text-sm text-gray-300">允许房管无视限制</span>
-                                                            <button onClick={() => updatePermission(pt.key, 'AllowManager', !pData.AllowManager)} className={`w-10 h-6 rounded-full p-1 transition-colors ${pData.AllowManager ? 'bg-green-600' : 'bg-gray-600'}`}>
+                                                            <button disabled={!config.biliLogin} onClick={() => updatePermission(pt.key, 'AllowManager', !pData.AllowManager)} className={`w-10 h-6 rounded-full p-1 transition-colors disabled:cursor-not-allowed ${pData.AllowManager ? 'bg-green-600' : 'bg-gray-600'}`}>
                                                                 <div className={`w-4 h-4 rounded-full bg-white transition-transform ${pData.AllowManager ? 'translate-x-4' : 'translate-x-0'}`}></div>
                                                             </button>
                                                         </div>
@@ -1988,6 +2387,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                         <div>
                                                             <label className="block text-xs text-gray-500 mb-1.5">最低航海舰队要求</label>
                                                             <select
+                                                                disabled={!config.biliLogin}
                                                                 value={pData.MinGuardType}
                                                                 onChange={e => updatePermission(pt.key, 'MinGuardType', parseInt(e.target.value))}
                                                                 className="w-full bg-black border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none cursor-pointer"
@@ -2003,6 +2403,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                         <div>
                                                             <label className="block text-xs text-gray-500 mb-1.5">最低粉丝牌等级要求 (0为无限制)</label>
                                                             <input
+                                                                disabled={!config.biliLogin}
                                                                 type="number"
                                                                 value={pData.MinMedalLevel}
                                                                 onChange={e => updatePermission(pt.key, 'MinMedalLevel', parseInt(e.target.value))}
@@ -2018,6 +2419,97 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                 </div>
                             )}
 
+                            {activeTab === 'feedback' && (
+                                <div className="animate-slide-in-right pb-10 space-y-6">
+                                    <div>
+                                        <h2 className="text-2xl font-bold text-white mb-2">问题反馈</h2>
+                                        <p className="text-sm text-gray-400 leading-relaxed">
+                                            在这里提交软件问题、播放器兼容性或功能建议。版本和连接器状态会在你确认后附带，登录 Cookie、二维码凭据、用户白名单和房间号不会上传。
+                                        </p>
+                                    </div>
+
+                                    <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5">
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">反馈类型</label>
+                                                <select value={feedbackForm.category} onChange={event => setFeedbackForm(previous => ({...previous, category: event.target.value}))} className="w-full bg-black/40 border border-white/10 rounded-lg p-3 text-sm text-white outline-none">
+                                                    <option value="bug">软件问题</option>
+                                                    <option value="connector">连接器问题</option>
+                                                    <option value="compatibility">播放器兼容性</option>
+                                                    <option value="feature">功能建议</option>
+                                                    <option value="other">其他</option>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">影响程度</label>
+                                                <select value={feedbackForm.priority} onChange={event => setFeedbackForm(previous => ({...previous, priority: event.target.value}))} className="w-full bg-black/40 border border-white/10 rounded-lg p-3 text-sm text-white outline-none">
+                                                    <option value="normal">一般</option>
+                                                    <option value="high">严重影响使用</option>
+                                                    <option value="critical">完全无法使用</option>
+                                                    <option value="low">轻微</option>
+                                                </select>
+                                            </div>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-xs text-gray-400 mb-2">标题</label>
+                                            <input value={feedbackForm.title} maxLength={120} onChange={event => setFeedbackForm(previous => ({...previous, title: event.target.value}))} placeholder="例如：网易云更新后无法插入下一首" className="w-full bg-black/40 border border-white/10 rounded-lg p-3 text-sm text-white outline-none focus:border-blue-500/70" />
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs text-gray-400 mb-2">详细描述</label>
+                                            <textarea value={feedbackForm.description} maxLength={8000} onChange={event => setFeedbackForm(previous => ({...previous, description: event.target.value}))} placeholder="请写清复现步骤、预期结果和实际结果" className="w-full min-h-40 bg-black/40 border border-white/10 rounded-lg p-3 text-sm text-white outline-none focus:border-blue-500/70 resize-y" />
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs text-gray-400 mb-2">联系方式（可选）</label>
+                                            <input value={feedbackForm.contact} maxLength={200} onChange={event => setFeedbackForm(previous => ({...previous, contact: event.target.value}))} placeholder="邮箱、GitHub 或其他联系方式" className="w-full bg-black/40 border border-white/10 rounded-lg p-3 text-sm text-white outline-none" />
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-cyan-500/5 p-5 rounded-xl border border-cyan-500/20 space-y-4">
+                                        <div className="flex items-center justify-between gap-4">
+                                            <div>
+                                                <div className="font-bold text-cyan-300">诊断信息</div>
+                                                <div className="text-xs text-gray-400 mt-1">包含本体、系统、播放器与四个连接器版本，以及队列数量和连接状态。</div>
+                                            </div>
+                                            <button onClick={() => setFeedbackIncludeDiagnostics(previous => !previous)} className={`w-11 h-6 rounded-full p-1 transition-colors shrink-0 ${feedbackIncludeDiagnostics ? 'bg-cyan-600' : 'bg-gray-600'}`}>
+                                                <div className={`w-4 h-4 rounded-full bg-white transition-transform ${feedbackIncludeDiagnostics ? 'translate-x-5' : 'translate-x-0'}`}></div>
+                                            </button>
+                                        </div>
+                                        <label className={`flex items-center gap-3 text-sm ${feedbackIncludeDiagnostics ? 'text-gray-300' : 'text-gray-600'}`}>
+                                            <input type="checkbox" disabled={!feedbackIncludeDiagnostics} checked={feedbackIncludeLogs} onChange={event => setFeedbackIncludeLogs(event.target.checked)} className="w-4 h-4" />
+                                            同时附带最近 80 条运行日志（令牌、Cookie 等字段会自动隐藏）
+                                        </label>
+                                        {feedbackIncludeDiagnostics && (
+                                            <details className="bg-black/30 rounded-lg border border-white/5">
+                                                <summary className="cursor-pointer px-4 py-3 text-xs text-cyan-300 font-bold">
+                                                    {feedbackLoading ? '正在刷新诊断…' : '预览将要提交的诊断信息'}
+                                                </summary>
+                                                <pre className="px-4 pb-4 text-[11px] leading-relaxed text-gray-400 overflow-auto max-h-72 whitespace-pre-wrap break-all">
+                                                    {JSON.stringify(feedbackDiagnostics?.diagnostics || {}, null, 2)}
+                                                </pre>
+                                            </details>
+                                        )}
+                                    </div>
+
+                                    {feedbackResult && (
+                                        <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-5 text-sm text-green-200">
+                                            <div className="font-bold text-green-400 mb-1">反馈提交成功：{feedbackResult.id}</div>
+                                            <div className="text-xs text-gray-400 mb-3">请保存编号；处理进度与公开回复可以随时查询。</div>
+                                            <a href={feedbackResult.trackingUrl} target="_blank" rel="noreferrer" className="inline-block px-4 py-2 rounded-lg bg-green-600/30 border border-green-500/40 hover:bg-green-600/40">打开反馈进度页</a>
+                                        </div>
+                                    )}
+
+                                    <div className="flex flex-wrap gap-3">
+                                        <button disabled={feedbackSubmitting || feedbackLoading} onClick={handleFeedbackSubmit} className="px-6 py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-xl text-sm font-bold transition-colors">
+                                            {feedbackSubmitting ? '正在提交…' : '提交反馈'}
+                                        </button>
+                                        <a href="https://app.enkianss.us/feedback" target="_blank" rel="noreferrer" className="px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 text-gray-300 rounded-xl text-sm font-bold transition-colors">
+                                            使用网页提交
+                                        </a>
+                                    </div>
+                                </div>
+                            )}
+
                             {activeTab === 'login' && (
                                 <div className="space-y-6 animate-slide-in-right flex flex-col items-center pt-10">
                                     <h2 className="text-2xl font-bold text-white mb-2 self-start w-full max-w-md">B站账号授权</h2>
@@ -2028,8 +2520,8 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                                 已检测到有效的账号登录缓存 <br/> (UID: {config.uid}) <br/><br/> 您可直接前往「运行状态」切换房间号！
                                             </div>
                                         ) : (
-                                            <div className="mb-6 w-full bg-red-500/20 border border-red-500/40 p-4 rounded-xl text-red-400 font-medium text-sm">
-                                                未检测到账号登录信息，请先扫码登录！
+                                            <div className="mb-6 w-full bg-cyan-500/10 border border-cyan-500/30 p-4 rounded-xl text-cyan-200 font-medium text-sm leading-relaxed">
+                                                当前为游客模式，可直接使用普通点歌。扫码登录是可选项，用于启用超级用户白名单和自定义权限控制。
                                             </div>
                                         )}
 
@@ -2052,7 +2544,7 @@ const AdminWidget: React.FC<AdminWidgetProps> = ({ onClose: _onClose }) => {
                                         </div>
 
                                         <p className="text-xs text-gray-500 mt-4 leading-relaxed">
-                                            完全在本地完成登录。⚠️ 请注意：只需扫码登录<strong className="text-pink-400">任意普通B站账号</strong>即可获取弹幕，不需要必须是主播的账号！
+                                            登录凭据仅保存在本地。需要白名单或权限分级时，扫码登录<strong className="text-pink-400">任意普通B站账号</strong>即可，不要求必须是主播账号。
                                         </p>
                                     </div>
                                 </div>
@@ -2115,7 +2607,7 @@ const App: React.FC = () => {
             <>
                 <GlobalStyles />
                 <div style={{ background: '#0d1117', minHeight: '100vh' }}>
-                    <AdminWidget onClose={() => ipcRenderer?.send('close-window')} />
+                    <AdminWidget />
                 </div>
             </>
         );
@@ -2125,7 +2617,7 @@ const App: React.FC = () => {
         <>
             <GlobalStyles />
             <OverlayWidget onToggleAdmin={() => {
-                if (isElectron) ipcRenderer?.send('open-admin');
+                if (isElectron) electronAPI?.openAdmin();
             }}/>
         </>
     );

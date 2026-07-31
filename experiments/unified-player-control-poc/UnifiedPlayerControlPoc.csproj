@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <PlatformTarget>x86</PlatformTarget>
+    <RootNamespace>UnifiedPlayerControlPoc</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- This is the exact control core linked by kugou-control-ui-poc/Release-patched. -->
+    <Compile Include="..\kugou-control-poc\KugouNativeController.cs"
+             Link="Vendor\KugouNativeController.cs" />
+
+    <!-- QQ title/catalog readers are non-invasive. NativeNext is opt-in in the UI. -->
+    <Compile Include="..\qqmusic-control-poc\QQMusicNativeController.cs"
+             Link="Vendor\QQMusicNativeController.cs" />
+    <Compile Include="..\qqmusic-control-poc\QQMusicCatalogClient.cs"
+             Link="Vendor\QQMusicCatalogClient.cs" />
+    <Compile Include="..\qqmusic-control-poc\QQMusicNativeNextTransport.cs"
+             Link="Vendor\QQMusicNativeNextTransport.cs" />
+  </ItemGroup>
+</Project>

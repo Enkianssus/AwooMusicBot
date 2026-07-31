@@ -10,7 +10,19 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+dist-electron/
+dist_electron*/
+release/
+Releases/
+artifacts/
 *.local
+native/player-bridge/bin/
+native/player-bridge/obj/
+native/player-bridge/publish/
+experiments/**/bin/
+experiments/**/obj/
+BiliNCM-Connectors/
+.codex-tests/
 
 # Editor directories and files
 .vscode/*

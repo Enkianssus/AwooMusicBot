@@ -270,7 +270,7 @@ export class ConnectorUpdater {
         success: false,
         updated: false,
         message:
-          `连接器 ${status.latestVersion} 要求 Awoo MusicBot `
+          `连接器 ${status.latestVersion} 要求嗷呜点歌机 `
           + `${status.minimumCoreVersion} 或更高版本`,
         status
       };

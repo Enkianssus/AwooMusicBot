@@ -35,8 +35,8 @@ import {
 const customRequire = createRequire(import.meta.url);
 const { UpdateManager } = customRequire('velopack');
 
-// 1.1 起产品更名为 Awoo MusicBot。继续沿用旧用户数据目录，确保从
-// BiliNCM 1.0.x 升级时保留登录信息、播放器选择和连接器安装状态。
+// 1.1 起底层包名与仓库改为 Awoo MusicBot；面向用户仍使用“嗷呜点歌机”。
+// 继续沿用旧用户数据目录，确保升级时保留登录信息、播放器选择和连接器安装状态。
 if (process.platform === 'win32') {
   app.setPath(
     'userData',
@@ -2627,7 +2627,7 @@ function startBackendServer() {
 // 程序启动入口
 // ==========================================
 app.whenReady().then(() => {
-  writeLog('=== Awoo MusicBot 内部日志已连接 ===', 'Cyan');
+  writeLog('=== 嗷呜点歌机内部日志已连接 ===', 'Cyan');
   loadConfig();
   void startPlayerBridge();
   connectorMaintenanceTimer = setInterval(

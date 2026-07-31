@@ -67,9 +67,9 @@ jobs:
         run: dotnet tool install -g vpk
 
       - name: Verify packaged executable
-        shell: powershell
+        shell: pwsh
         run: |
-          $exe = "dist_electron\win-unpacked\AwooMusicBot.exe"
+          $exe = "dist_electron\win-unpacked\嗷呜点歌机.exe"
           if (-not (Test-Path $exe)) {
             throw "Packaged executable not found: $exe"
           }
@@ -80,12 +80,12 @@ jobs:
         run: |
           chcp 65001 > $null
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          vpk pack -u awoo-musicbot -v $env:VERSION -p dist_electron/win-unpacked -e AwooMusicBot.exe --packTitle "Awoo MusicBot" -i assets/icon.ico
+          vpk pack -u awoo-musicbot -v $env:VERSION -p dist_electron/win-unpacked -e "嗷呜点歌机.exe" --packTitle "嗷呜点歌机" -i assets/icon.ico
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "Awoo MusicBot ${{ env.TAG_NAME }}"
+          name: "嗷呜点歌机 ${{ env.TAG_NAME }}"
           tag_name: "${{ env.TAG_NAME }}"
           draft: false
           prerelease: false

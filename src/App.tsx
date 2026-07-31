@@ -726,7 +726,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             >
                                 <span className="text-[10px] leading-none">{playing ? '🟢' : '🔴'}</span>
                             </button>
-                            <h1 className="font-bold text-[15px] tracking-wide pointer-events-none whitespace-nowrap shrink-0" style={{ color: theme.titleColor }}>Awoo MusicBot</h1>
+                            <h1 className="font-bold text-[15px] tracking-wide pointer-events-none whitespace-nowrap shrink-0" style={{ color: theme.titleColor }}>嗷呜点歌机</h1>
                         </div>
 
                         <div className="no-drag flex items-center relative h-6 flex-1 justify-end min-w-0">
@@ -1707,8 +1707,8 @@ const AdminWidget: React.FC = () => {
                                                     <div className="font-bold text-white flex items-center gap-1">🛠️ 请依序排查以下3项：</div>
                                                     <ul className="list-decimal pl-4 space-y-1 text-gray-300 mt-1">
                                                         <li>
-                                                            <strong className="text-white">关闭全局 VPN/代理网络：</strong>
-                                                            如果您使用了纯美国或其他海外节点的全局梯子，B站会出于风控安全直接拒绝/掐断来自这些回环 IP 的直播 Websocket 连接。请尝试**关掉代理**，或切回**国内节点**，或在梯子中设置**绕过本地主机 / PAC分流模式**。
+                                                            <strong className="text-white">美国/海外 IP 应该可以使用：</strong>
+                                                            v1.1.1 已加入海外网络兼容处理，正常情况下使用美国或其他海外 IP 也能连接弹幕。若仍反复断线，请先重新连接；仍无法恢复时，再尝试规则/PAC 分流、让 B站直播域名直连，或临时关闭代理、切换国内节点。
                                                         </li>
                                                         <li>
                                                             <strong className="text-white">重新建立连接：</strong>
@@ -1875,7 +1875,7 @@ const AdminWidget: React.FC = () => {
                                             <div>
                                                 <strong className="text-white block mb-1">第一步：确认播放器已启动并显示主窗口</strong>
                                                 <p className="text-xs text-gray-400 leading-relaxed">
-                                                    v1.1.0 不再启动、结束或重启播放器。请先手动打开网易云、酷狗或 QQ 音乐；使用 Folia 时请启动 Stage API。再到 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('settings')}>基础设置</button> 选择对应方式并点击“重新连接”。
+                                                    v1.1.1 不再启动、结束或重启播放器。请先手动打开网易云、酷狗或 QQ 音乐；使用 Folia 时请启动 Stage API。再到 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('settings')}>基础设置</button> 选择对应方式并点击“重新连接”。
                                                 </p>
                                             </div>
 
@@ -1922,9 +1922,9 @@ const AdminWidget: React.FC = () => {
                                                 <strong className="text-white block mb-1.5">第二步：依次进行网络、凭证和房间号校准排查</strong>
                                                 <ul className="list-decimal pl-5 space-y-2.5 text-xs text-gray-400">
                                                     <li>
-                                                        <strong className="text-white">是否开启了全局代理梯子（如纯美国/海外节点 VPN）？</strong>
-                                                        如果您挂了全局科学上网，B站 的直播服务器检测到境外 IP 连接时，出于防爬虫与账号风控安全拦截策略，会<strong>直接掐灭并拒绝</strong> Websocket 弹幕回环请求，导致连接一直反复断开（频繁报“弹幕监控启动！”）。<br/>
-                                                        <strong className="text-green-400">解决方法：</strong> 请尝试彻底<strong>关闭全局网络代理（梯子）</strong>，切换回<strong>中国本地宽带/5G直连</strong>，或在梯子中设置 Bypass 局域网分流。
+                                                        <strong className="text-white">美国/海外 IP 在 v1.1.1 中应该可以使用</strong>
+                                                        新版已经加入海外网络兼容处理，不再把境外 IP 视为必然不可用。若当前线路仍触发 B站风控并反复断线，请先重新连接一次；仍不行时，再尝试规则/PAC 分流并让 B站直播域名直连，或临时关闭代理、切换国内节点。<br/>
+                                                        <strong className="text-green-400">建议：</strong> 先保持当前美国 IP 直接测试，只有实际失败时才使用上述替代方法。
                                                     </li>
                                                     <li>
                                                         <strong className="text-white">重新建立游客或账号连接</strong>

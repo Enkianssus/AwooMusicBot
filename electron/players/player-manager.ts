@@ -1,4 +1,11 @@
-import { PlayerBridgeClient } from '../player-bridge-client';
+import {
+  PlayerBridgeClient,
+  type PlayerBridgeEvent
+} from '../player-bridge-client';
+import {
+  tracksHaveDifferentStableIds,
+  tracksRepresentSameSong
+} from '../queue-head-policy';
 import {
   type ConnectorUpdateResult,
   type ConnectorUpdateStatus,
@@ -46,6 +53,9 @@ export class PlayerManager {
   private probeGeneration: number | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private lastObservedTrackKey: string | null = null;
+  private lastObservedTrack: PlayerTrack | null = null;
+  private missingTrackObservationCount = 0;
+  private observationEpoch = 0;
   private observationTail: Promise<void> = Promise.resolve();
   private operationTail: Promise<void> = Promise.resolve();
   private state: PlayerConnectionState = {
@@ -57,7 +67,8 @@ export class PlayerManager {
   constructor(private readonly options: PlayerManagerOptions) {
     this.bridge = new PlayerBridgeClient(
       message => this.options.log(message, 'Yellow'),
-      this.options.getFoliaToken
+      this.options.getFoliaToken,
+      event => this.handleBridgeEvent(event)
     );
     this.backends = {
       netease: new NeteasePlayerBackend(this.bridge),
@@ -136,10 +147,14 @@ export class PlayerManager {
   }
 
   async updateConnector(
-    connectorId: NativeConnectorId
+    connectorId: NativeConnectorId,
+    allowPlayerVersionChange = false
   ): Promise<ConnectorUpdateResult & { reconnected?: boolean }> {
     // Download and verify in the background while normal commands continue.
-    const result = await this.bridge.updateConnector(connectorId);
+    const result = await this.bridge.updateConnector(
+      connectorId,
+      allowPlayerVersionChange
+    );
     if (
       result.success
       && result.updated
@@ -214,6 +229,7 @@ export class PlayerManager {
 
   async connectSelected(): Promise<boolean> {
     const generation = ++this.selectionGeneration;
+    this.observationEpoch++;
     this.stopPolling();
     this.setState(false, true, null);
 
@@ -252,10 +268,18 @@ export class PlayerManager {
           false,
           this.state.snapshot
         );
-        if (backend.usesNativeBridge) {
+        if (
+          backend.usesNativeBridge
+          && !this.bridge.supportsSnapshotEvents
+        ) {
           this.pollTimer = setInterval(
             () => void this.pollNativePlayer(generation),
             350
+          );
+        } else if (this.bridge.supportsSnapshotEvents) {
+          this.options.log(
+            `✅ ${backend.label} 已启用连接器实时状态事件，不再进行 350ms 状态轮询`,
+            'Green'
           );
         }
       }
@@ -316,10 +340,13 @@ export class PlayerManager {
 
   resetObservedTrack(): void {
     this.lastObservedTrackKey = null;
+    this.lastObservedTrack = null;
+    this.missingTrackObservationCount = 0;
   }
 
   async stop(): Promise<void> {
     this.selectionGeneration++;
+    this.observationEpoch++;
     this.stopPolling();
     for (const backend of Object.values(this.backends)) {
       backend.deactivate();
@@ -364,6 +391,22 @@ export class PlayerManager {
     }
   }
 
+  private handleBridgeEvent(event: PlayerBridgeEvent): void {
+    if (event.player !== this.selectedKey) return;
+    if (event.event === 'connectorExit') {
+      this.options.log(
+        `⚠️ ${PLAYER_LABELS[event.player]} 连接器已退出: ${event.error || '未知原因'}`,
+        'Yellow'
+      );
+      this.observationEpoch++;
+      this.resetObservedTrack();
+      this.setState(false, false, this.state.snapshot);
+      return;
+    }
+    if (event.event !== 'snapshot' || !event.snapshot) return;
+    this.acceptSnapshot(event.player, event.snapshot, true);
+  }
+
   private acceptSnapshot(
     sourceKey: PlayerKey,
     snapshot: PlayerSnapshot,
@@ -384,10 +427,21 @@ export class PlayerManager {
     }
 
     if (observeTrack) {
+      const nextTrack = snapshot.connected ? snapshot.next || null : null;
+      const nextObservation = snapshot.nextObservation
+        || (nextTrack
+          ? 'track'
+          : sourceKey === 'qqmusic'
+            ? 'unknown'
+            : 'legacy');
       this.queueObservation(sourceKey, {
         track: snapshot.connected ? snapshot.current || null : null,
+        nextTrack,
+        nextObservation,
         coverUrl: snapshot.current?.coverUrl || '',
-        nextDescription: '由下一首守卫管理'
+        nextDescription: snapshot.next?.title
+          ? `${snapshot.next.title}${snapshot.next.artist ? ` - ${snapshot.next.artist}` : ''}`
+          : '由下一首守卫管理'
       });
     }
   }
@@ -396,24 +450,49 @@ export class PlayerManager {
     sourceKey: PlayerKey,
     observation: PlayerTrackObservation
   ): void {
+    const selectionGeneration = this.selectionGeneration;
+    const observationEpoch = this.observationEpoch;
     this.observationTail = this.observationTail
       .then(async () => {
-        if (sourceKey !== this.selectedKey) return;
+        if (
+          sourceKey !== this.selectedKey
+          || selectionGeneration !== this.selectionGeneration
+          || observationEpoch !== this.observationEpoch
+          || !this.state.connected
+        ) return;
         const track = observation.track;
         if (!track?.title) {
+          this.missingTrackObservationCount++;
+          // Native player metadata can briefly disappear while its cache and
+          // window title are being rewritten. Do not turn a single empty poll
+          // into a fake stop/start sequence because it can hide the real track
+          // transition that advances the request queue.
+          if (this.missingTrackObservationCount < 3) return;
           if (this.lastObservedTrackKey) {
             await this.options.onTrackChanged(null, observation);
             this.lastObservedTrackKey = null;
+            this.lastObservedTrack = null;
           }
           return;
         }
 
+        this.missingTrackObservationCount = 0;
+
         const observedKey = this.getTrackKey(track);
-        if (observedKey !== this.lastObservedTrackKey) {
+        if (
+          observedKey !== this.lastObservedTrackKey
+          && (
+            tracksHaveDifferentStableIds(this.lastObservedTrack, track)
+            || !tracksRepresentSameSong(this.lastObservedTrack, track)
+          )
+        ) {
           await this.options.onTrackChanged(track, observation);
           this.lastObservedTrackKey = observedKey;
+          this.lastObservedTrack = track;
         } else {
           this.options.onTrackUpdated(track, observation);
+          this.lastObservedTrackKey = observedKey;
+          this.lastObservedTrack = track;
         }
       })
       .catch((error: any) => {

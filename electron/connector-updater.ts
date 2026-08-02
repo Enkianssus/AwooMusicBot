@@ -4,6 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import extract from 'extract-zip';
+import {
+  canAutoUpdateConnector,
+  classifyConnectorUpdate,
+  requiresManualConnectorUpdate,
+  type ConnectorUpdateKind
+} from './connector-version-policy';
 
 export type NativeConnectorId =
   | 'netease'
@@ -20,6 +26,10 @@ export interface ConnectorUpdateStatus {
   minimumCoreVersion: string | null;
   compatible: boolean;
   updateAvailable: boolean;
+  autoUpdateAvailable: boolean;
+  manualUpdateAvailable: boolean;
+  updateKind: ConnectorUpdateKind;
+  supportedPlayerVersion: string | null;
   updating: boolean;
   checkedAt: string;
   error: string | null;
@@ -37,6 +47,8 @@ interface ConnectorCatalogEntry {
   version: string;
   protocolVersion: number;
   minimumCoreVersion: string;
+  testedPlayerVersion?: string;
+  playerVersionPolicy?: string;
   runtime?: 'win-x86' | 'win-x64';
   asset: string;
   size: number;
@@ -58,6 +70,32 @@ interface ActiveConnector {
   activatedAt: string;
 }
 
+interface QQMusicProfileCatalogEntry {
+  id: 'qqmusic';
+  version: string;
+  schemaVersion: number;
+  minimumConnectorVersion: string;
+  asset: string;
+  size: number;
+  sha256: string;
+  signature: string;
+  downloadUrl: string;
+}
+
+interface QQMusicProfileCatalog {
+  schemaVersion: number;
+  publicKeyId: string;
+  profiles: {
+    qqmusic: QQMusicProfileCatalogEntry | null;
+  };
+}
+
+interface ActiveQQMusicProfiles {
+  version: string;
+  directory: string;
+  activatedAt: string;
+}
+
 const CONNECTOR_IDS: NativeConnectorId[] = [
   'netease',
   'kugou',
@@ -72,8 +110,11 @@ const CONNECTOR_NAMES: Record<NativeConnectorId, string> = {
 };
 const CATALOG_URL =
   'https://app.enkianss.us/connectors/v1/catalog.json';
+const QQMUSIC_PROFILE_CATALOG_URL =
+  'https://app.enkianss.us/connectors/v1/profiles/qqmusic/catalog.json';
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 const PROTOCOL_VERSION = 1;
+const CONNECTOR_VERSION_PATTERN = /^\d+(?:\.\d+){2,4}$/;
 const PUBLIC_KEY_ID = 'bilincm-connectors-2026-01';
 const RELEASE_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEApFy/TMxhGKlxzOS2b1gjvQxnvFhjefK0sbxsCXFS2uc=
@@ -95,6 +136,7 @@ export class ConnectorUpdater {
     Promise<ConnectorUpdateResult>
   >();
   private readonly validatedExecutables = new Set<string>();
+  private qqMusicProfileUpdate: Promise<string | null> | null = null;
 
   constructor(
     private readonly onLog: (message: string) => void
@@ -106,6 +148,24 @@ export class ConnectorUpdater {
 
   async isInstalled(connectorId: NativeConnectorId): Promise<boolean> {
     return Boolean(await this.readActive(connectorId));
+  }
+
+  async getLaunchEnvironment(
+    connectorId: NativeConnectorId
+  ): Promise<Record<string, string>> {
+    if (connectorId !== 'qqmusic') return {};
+    try {
+      const directory = await this.ensureQQMusicProfiles();
+      return directory
+        ? { BILINCM_QQMUSIC_PROFILE_DIR: directory }
+        : {};
+    } catch (error: unknown) {
+      this.onLog(
+        `[QQ 画像] 在线画像更新失败，继续使用连接器内置画像：`
+        + getErrorMessage(error)
+      );
+      return {};
+    }
   }
 
   async ensureInstalled(
@@ -215,20 +275,26 @@ export class ConnectorUpdater {
   }
 
   async update(
-    connectorId: NativeConnectorId
+    connectorId: NativeConnectorId,
+    allowPlayerVersionChange = false
   ): Promise<ConnectorUpdateResult> {
-    return this.runUpdate(connectorId, false);
+    return this.runUpdate(
+      connectorId,
+      false,
+      allowPlayerVersionChange
+    );
   }
 
   async reinstall(
     connectorId: NativeConnectorId
   ): Promise<ConnectorUpdateResult> {
-    return this.runUpdate(connectorId, true);
+    return this.runUpdate(connectorId, true, false);
   }
 
   private async runUpdate(
     connectorId: NativeConnectorId,
-    forceReinstall: boolean
+    forceReinstall: boolean,
+    allowPlayerVersionChange: boolean
   ): Promise<ConnectorUpdateResult> {
     const existingUpdate = this.updates.get(connectorId);
     if (existingUpdate) {
@@ -241,7 +307,11 @@ export class ConnectorUpdater {
       }));
     }
 
-    const update = this.updateInternal(connectorId, forceReinstall)
+    const update = this.updateInternal(
+      connectorId,
+      forceReinstall,
+      allowPlayerVersionChange
+    )
       .finally(() => {
         if (this.updates.get(connectorId) === update) {
           this.updates.delete(connectorId);
@@ -253,7 +323,8 @@ export class ConnectorUpdater {
 
   private async updateInternal(
     connectorId: NativeConnectorId,
-    forceReinstall: boolean
+    forceReinstall: boolean,
+    allowPlayerVersionChange: boolean
   ): Promise<ConnectorUpdateResult> {
     const statuses = await this.getStatuses(true);
     const status = statuses.find(item => item.id === connectorId)!;
@@ -272,6 +343,20 @@ export class ConnectorUpdater {
         message:
           `连接器 ${status.latestVersion} 要求嗷呜点歌机 `
           + `${status.minimumCoreVersion} 或更高版本`,
+        status
+      };
+    }
+    if (
+      status.manualUpdateAvailable
+      && !allowPlayerVersionChange
+    ) {
+      return {
+        success: false,
+        updated: false,
+        message:
+          `${status.name}连接器 ${status.latestVersion} 属于新的播放器版本分支，`
+          + `支持的播放器版本：${status.supportedPlayerVersion || '未注明'}。`
+          + '请在播放器设置中手动确认更新。',
         status
       };
     }
@@ -350,6 +435,16 @@ export class ConnectorUpdater {
         entry.minimumCoreVersion
       ) >= 0
     );
+    const updateKind = classifyConnectorUpdate(
+      active?.version || null,
+      entry?.version || null,
+      connectorId
+    );
+    const updateAvailable = Boolean(
+      entry
+      && compatible
+      && updateKind !== 'none'
+    );
     return {
       id: connectorId,
       name: CONNECTOR_NAMES[connectorId],
@@ -358,14 +453,24 @@ export class ConnectorUpdater {
       latestVersion: entry?.version || null,
       minimumCoreVersion: entry?.minimumCoreVersion || null,
       compatible,
-      updateAvailable: Boolean(
-        entry
-        && compatible
-        && (
-          !active
-          || compareVersions(active.version, entry.version) < 0
-        )
-      ),
+      updateAvailable,
+      autoUpdateAvailable: updateAvailable
+        && canAutoUpdateConnector(
+          active?.version || null,
+          entry?.version || null,
+          connectorId
+        ),
+      manualUpdateAvailable: updateAvailable
+        && requiresManualConnectorUpdate(
+          active?.version || null,
+          entry?.version || null,
+          connectorId
+        ),
+      updateKind,
+      supportedPlayerVersion:
+        entry?.testedPlayerVersion
+        || entry?.playerVersionPolicy
+        || null,
       updating: this.updates.has(connectorId),
       checkedAt,
       error
@@ -422,8 +527,12 @@ export class ConnectorUpdater {
     if (
       entry.id !== connectorId
       || entry.protocolVersion !== PROTOCOL_VERSION
-      || !/^\d+\.\d+\.\d+$/.test(entry.version)
+      || !CONNECTOR_VERSION_PATTERN.test(entry.version)
       || !/^\d+\.\d+\.\d+$/.test(entry.minimumCoreVersion)
+      || !(
+        entry.testedPlayerVersion?.trim()
+        || entry.playerVersionPolicy?.trim()
+      )
       || !Number.isSafeInteger(entry.size)
       || entry.size <= 0
       || !/^[a-f0-9]{64}$/i.test(entry.sha256)
@@ -590,6 +699,184 @@ export class ConnectorUpdater {
     }
   }
 
+  private async ensureQQMusicProfiles(): Promise<string | null> {
+    if (this.qqMusicProfileUpdate) return this.qqMusicProfileUpdate;
+    const update = this.ensureQQMusicProfilesInternal().finally(() => {
+      if (this.qqMusicProfileUpdate === update) {
+        this.qqMusicProfileUpdate = null;
+      }
+    });
+    this.qqMusicProfileUpdate = update;
+    return update;
+  }
+
+  private async ensureQQMusicProfilesInternal(): Promise<string | null> {
+    const active = await this.readActiveQQMusicProfiles();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    let catalog: QQMusicProfileCatalog;
+    try {
+      const response = await fetch(QQMUSIC_PROFILE_CATALOG_URL, {
+        method: 'GET',
+        cache: 'no-store',
+        signal: controller.signal,
+        headers: { Accept: 'application/json' }
+      });
+      if (!response.ok) throw new Error(`画像清单 HTTP ${response.status}`);
+      catalog = await response.json() as QQMusicProfileCatalog;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const entry = catalog.profiles?.qqmusic;
+    if (
+      catalog.schemaVersion !== 1
+      || catalog.publicKeyId !== PUBLIC_KEY_ID
+      || !entry
+      || entry.id !== 'qqmusic'
+      || entry.schemaVersion !== 1
+      || !/^\d+\.\d+\.\d+$/.test(entry.version)
+      || !Number.isSafeInteger(entry.size)
+      || entry.size <= 0
+      || !/^[a-f0-9]{64}$/i.test(entry.sha256)
+      || !entry.signature
+      || entry.asset !== `bilincm-qqmusic-profiles-${entry.version}.zip`
+      || !entry.downloadUrl.startsWith(
+        'https://app.enkianss.us/connectors/v1/profiles/qqmusic/download/'
+      )
+      || path.basename(new URL(entry.downloadUrl).pathname) !== entry.asset
+    ) {
+      throw new Error('QQ 音乐画像更新清单无效');
+    }
+
+    if (active && compareVersions(active.version, entry.version) >= 0) {
+      return active.directory;
+    }
+
+    const profileRoot = this.getQQMusicProfileRoot();
+    const versionDirectory = path.join(profileRoot, entry.version);
+    const nonce = crypto.randomBytes(8).toString('hex');
+    const archivePath = path.join(profileRoot, `.download-${nonce}.zip`);
+    const stagingDirectory = path.join(profileRoot, `.staging-${nonce}`);
+    await fs.promises.mkdir(profileRoot, { recursive: true });
+    try {
+      const downloadController = new AbortController();
+      const downloadTimeout = setTimeout(
+        () => downloadController.abort(),
+        60000
+      );
+      let archive: Buffer;
+      try {
+        const response = await fetch(entry.downloadUrl, {
+          method: 'GET',
+          cache: 'no-store',
+          signal: downloadController.signal
+        });
+        if (!response.ok) throw new Error(`画像下载 HTTP ${response.status}`);
+        archive = Buffer.from(await response.arrayBuffer());
+      } finally {
+        clearTimeout(downloadTimeout);
+      }
+      if (archive.length !== entry.size) {
+        throw new Error(`画像大小不匹配：${archive.length}/${entry.size}`);
+      }
+      const digest = crypto.createHash('sha256').update(archive).digest('hex');
+      if (!crypto.timingSafeEqual(
+        Buffer.from(digest, 'hex'),
+        Buffer.from(entry.sha256, 'hex')
+      )) {
+        throw new Error('QQ 画像 SHA-256 校验失败');
+      }
+      if (!crypto.verify(
+        null,
+        archive,
+        RELEASE_PUBLIC_KEY,
+        Buffer.from(entry.signature, 'base64')
+      )) {
+        throw new Error('QQ 画像 Ed25519 签名校验失败');
+      }
+
+      await fs.promises.writeFile(archivePath, archive, { flag: 'wx' });
+      await extract(archivePath, { dir: stagingDirectory });
+      const profileFiles = (await fs.promises.readdir(stagingDirectory))
+        .filter(file => /^\d+\.\d+\.json$/i.test(file));
+      if (profileFiles.length === 0) {
+        throw new Error('QQ 画像包没有版本画像 JSON');
+      }
+      for (const file of profileFiles) {
+        const document = JSON.parse(await fs.promises.readFile(
+          path.join(stagingDirectory, file),
+          'utf8'
+        ));
+        if (
+          document.schemaVersion !== 1
+          || !/^\d+\.\d+$/.test(String(document.fileVersion || ''))
+          || !/^[a-f0-9]{64}$/i.test(String(document.clientSha256 || ''))
+          || !/^[a-f0-9]{64}$/i.test(String(document.commonSha256 || ''))
+        ) {
+          throw new Error(`QQ 画像文件无效：${file}`);
+        }
+      }
+
+      if (await pathExists(versionDirectory)) {
+        await removeInside(profileRoot, versionDirectory);
+      }
+      await fs.promises.rename(stagingDirectory, versionDirectory);
+      await this.writeActiveQQMusicProfiles({
+        version: entry.version,
+        directory: versionDirectory,
+        activatedAt: new Date().toISOString()
+      });
+      this.onLog(`[QQ 画像] 已更新到 ${entry.version}`);
+      return versionDirectory;
+    } finally {
+      await fs.promises.rm(archivePath, { force: true });
+      if (await pathExists(stagingDirectory)) {
+        await removeInside(profileRoot, stagingDirectory);
+      }
+    }
+  }
+
+  private async readActiveQQMusicProfiles(): Promise<ActiveQQMusicProfiles | null> {
+    const activePath = path.join(this.getQQMusicProfileRoot(), 'active.json');
+    try {
+      const active = JSON.parse(
+        await fs.promises.readFile(activePath, 'utf8')
+      ) as ActiveQQMusicProfiles;
+      const expected = path.join(
+        this.getQQMusicProfileRoot(),
+        active.version
+      );
+      return /^\d+\.\d+\.\d+$/.test(active.version)
+        && path.resolve(active.directory) === path.resolve(expected)
+        && await pathExists(expected)
+          ? { ...active, directory: expected }
+          : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeActiveQQMusicProfiles(
+    active: ActiveQQMusicProfiles
+  ): Promise<void> {
+    const root = this.getQQMusicProfileRoot();
+    await fs.promises.mkdir(root, { recursive: true });
+    const activePath = path.join(root, 'active.json');
+    const temporaryPath = `${activePath}.${process.pid}.tmp`;
+    await fs.promises.writeFile(
+      temporaryPath,
+      `${JSON.stringify(active, null, 2)}\n`,
+      'utf8'
+    );
+    await fs.promises.rm(activePath, { force: true });
+    await fs.promises.rename(temporaryPath, activePath);
+  }
+
+  private getQQMusicProfileRoot(): string {
+    return path.join(this.getConnectorRoot('qqmusic'), 'profiles');
+  }
+
   private async readActive(
     connectorId: NativeConnectorId
   ): Promise<ActiveConnector | null> {
@@ -603,7 +890,7 @@ export class ConnectorUpdater {
       ) as ActiveConnector;
       if (
         active.id !== connectorId
-        || !/^\d+\.\d+\.\d+$/.test(active.version)
+        || !CONNECTOR_VERSION_PATTERN.test(active.version)
       ) {
         return null;
       }

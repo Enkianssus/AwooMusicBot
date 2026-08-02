@@ -10,9 +10,22 @@ import { createRequire } from 'module';
 import { WebSocket, WebSocketServer } from 'ws';
 import QRCode from 'qrcode';
 import {
+  planImmediatePlaybackCommand,
+  planObservedNextAction,
   planQueueHeadMutation,
-  queueSongIdentity
+  queueSongIdentity,
+  shouldDeferManagedTrackObservation,
+  shouldPreserveGuardAfterImmediate,
+  tracksRepresentSameSong
 } from './queue-head-policy';
+import type { NextObservation } from './queue-head-policy';
+import { shouldAutoUpgradeConnectorAfterFailure } from './connector-recovery-policy';
+import {
+  isLoopbackRemoteAddress,
+  normalizeLocalSongKeyword,
+  normalizeLocalSongRequestMode
+} from './local-test-api-policy';
+import type { LocalSongRequestMode } from './local-test-api-policy';
 import {
   getNeteaseSongCover
 } from './players/netease-player';
@@ -334,9 +347,26 @@ let lastQueueActionTime = 0; // 全局队列操作防抖冷却时间
 let activePlayerSnapshot: PlayerSnapshot | null = null;
 let playerConnecting = false;
 let registeredNextGuardKey = '';
+let registeredNextGuardSongIdentity = '';
 let queueHeadNeedsGuardOnlyAfterCurrentChange = false;
-const cancelledNativeNextKeys = new Set<string>();
+const cancelledNativeNextSongs = new Map<string, any>();
 let nextGuardOperationTail: Promise<void> = Promise.resolve();
+let managedPlayerActionSequence = 0;
+let localTestRequestSequence = 0;
+let localTestRequestTail: Promise<void> = Promise.resolve();
+
+interface ManagedPlayerAction {
+  id: number;
+  kind: 'play-now' | 'interrupt';
+  target: any;
+  command: 'PlaySelected' | 'InterruptSelected';
+  startedAt: number;
+  expiresAt: number;
+  inFlight: boolean;
+  targetObserved: boolean;
+}
+
+let activeManagedPlayerAction: ManagedPlayerAction | null = null;
 
 function getSelectedPlayerKey(): PlayerKey {
   return playerKeyFromConfig(appConfig.sysConfig?.PlayerType);
@@ -358,7 +388,10 @@ const playerManager = new PlayerManager({
     activePlayerSnapshot = state.snapshot;
     if (!state.connected) {
       registeredNextGuardKey = '';
+      registeredNextGuardSongIdentity = '';
       queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+      activeManagedPlayerAction = null;
+      cancelledNativeNextSongs.clear();
     }
   },
   onTrackChanged: async (track, observation) => {
@@ -369,10 +402,17 @@ const playerManager = new PlayerManager({
     await syncTrackChangeLogic(
       String(track.id || `${track.title}|${track.artist}`),
       track.title,
-      null,
+      observation.nextTrack
+        ? String(
+            observation.nextTrack.id
+            || `${observation.nextTrack.title}|${observation.nextTrack.artist}`
+          )
+        : null,
       observation.nextDescription,
       track.artist || '',
-      observation.coverUrl || ''
+      observation.coverUrl || '',
+      observation.nextTrack || null,
+      observation.nextObservation
     );
   },
   onTrackUpdated: (track, observation) => {
@@ -382,6 +422,18 @@ const playerManager = new PlayerManager({
       track.artist || '',
       observation.coverUrl || ''
     );
+    const managedAction = activeManagedPlayerAction;
+    if (managedAction && tracksRepresentSameSong(managedAction.target, track)) {
+      managedAction.targetObserved = true;
+      if (queueHeadNeedsGuardOnlyAfterCurrentChange && targetQueue[0]) {
+        queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+        void armNextGuardOnly(targetQueue[0]);
+      }
+      if (!managedAction.inFlight
+          && activeManagedPlayerAction?.id === managedAction.id) {
+        activeManagedPlayerAction = null;
+      }
+    }
   }
 });
 
@@ -800,8 +852,8 @@ function cacheSongCover(songId: string, coverUrl: string): void {
 }
 
 async function getNcmSongCover(songId: string): Promise<string> {
-  const normalizedId = String(songId || '');
-  if (!normalizedId) return '';
+  const normalizedId = String(songId || '').trim();
+  if (!/^\d+$/.test(normalizedId)) return '';
   if (songCoverCache.has(normalizedId)) return songCoverCache.get(normalizedId) || '';
 
   const coverUrl = await getNeteaseSongCover(normalizedId);
@@ -816,8 +868,35 @@ function updatePlayerCurrentTrack(trackId: string, songName: string, artistName:
   }
 
   const normalizedId = String(trackId);
-  const knownCoverUrl = coverUrl || songCoverCache.get(normalizedId) || '';
+  const requestedCoverUrl = currentPlayingSong
+    && (
+      String(currentPlayingSong.Id || '') === normalizedId
+      || tracksRepresentSameSong(currentPlayingSong, {
+        id: normalizedId,
+        title: songName,
+        artist: artistName
+      })
+    )
+    ? String(currentPlayingSong.CoverUrl || '')
+    : '';
+  const knownCoverUrl = coverUrl
+    || requestedCoverUrl
+    || songCoverCache.get(normalizedId)
+    || '';
   if (knownCoverUrl) cacheSongCover(normalizedId, knownCoverUrl);
+  if (knownCoverUrl && currentPlayingSong && (
+    String(currentPlayingSong.Id || '') === normalizedId
+    || tracksRepresentSameSong(currentPlayingSong, {
+      id: normalizedId,
+      title: songName,
+      artist: artistName
+    })
+  )) {
+    currentPlayingSong = {
+      ...currentPlayingSong,
+      CoverUrl: knownCoverUrl
+    };
+  }
 
   playerCurrentTrack = {
     Id: normalizedId,
@@ -838,18 +917,51 @@ function updatePlayerCurrentTrack(trackId: string, songName: string, artistName:
   }
 }
 
-async function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string, currArtist: string = '', currCoverUrl: string = ''): Promise<void> {
+async function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string, currArtist: string = '', currCoverUrl: string = '', observedNextTrack: any = null, nextObservation: NextObservation = 'legacy'): Promise<void> {
   playerPausedAfterRequests = false;
   updatePlayerCurrentTrack(currId, currName, currArtist, currCoverUrl);
-  writeLog(`[状态同步] 🎵 播放器切歌信号: ${currName} (${currId}) | 下一首预告: ${nextName}`, 'Magenta');
+  writeLog(
+    `[状态同步] 🎵 播放器切歌信号: ${currName} (${currId}) | `
+    + `下一首预告: ${nextName}${nextId ? ` (${nextId})` : ''}`,
+    'Magenta'
+  );
+
+  const managedAction = activeManagedPlayerAction;
+  if (managedAction && Date.now() > managedAction.expiresAt) {
+    writeLog(
+      `[动作归因] 点歌机动作 #${managedAction.id} 已超时；`
+      + '后续切歌恢复按播放器端/用户操作处理。',
+      'Yellow'
+    );
+    activeManagedPlayerAction = null;
+  } else if (managedAction) {
+    const observed = {
+      id: currId,
+      title: currName,
+      artist: currArtist
+    };
+    if (shouldDeferManagedTrackObservation(managedAction.target, observed)) {
+      writeLog(
+        `[动作归因] 忽略点歌机动作 #${managedAction.id} 的中间切歌: `
+        + `${currName}；等待最终目标 ${managedAction.target?.SongName}`,
+        'DarkGray'
+      );
+      return;
+    }
+    managedAction.targetObserved = true;
+    writeLog(
+      `[动作归因] 点歌机动作 #${managedAction.id} 已确认最终目标: ${currName}`,
+      'DarkGray'
+    );
+  }
   let stateChanged = false;
 
-  const cancelledKey = getQueueSongIdentity({
-    Id: currId,
-    PlayerKey: getSelectedPlayerKey()
-  });
-  if (currId && cancelledNativeNextKeys.delete(cancelledKey)) {
+  const cancelledEntry = [...cancelledNativeNextSongs.entries()]
+    .find(([, song]) => isObservedSong(song));
+  if (currId && cancelledEntry) {
+    cancelledNativeNextSongs.delete(cancelledEntry[0]);
     registeredNextGuardKey = '';
+    registeredNextGuardSongIdentity = '';
     writeLog(
       `[队首撤回兜底] 已撤回的预插歌曲开始播放，立即跳过: ${currName}`,
       'Yellow'
@@ -859,7 +971,7 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
   }
 
   if (!isPlaying) {
-    if (targetQueue.length > 0 && currId === targetQueue[0]?.Id) {
+    if (targetQueue.length > 0 && isObservedSong(targetQueue[0])) {
       writeLog(`[状态同步] 处于暂停状态，自动跳过待播曲目以防消耗: ${targetQueue[0]?.SongName}`, 'Yellow');
       await requestPlayerNext();
     } else {
@@ -867,13 +979,15 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
     }
   }
   else {
-    if (currentPlayingSong && currId !== currentPlayingSong?.Id) {
+    if (currentPlayingSong && !isObservedSong(currentPlayingSong)) {
       const checkSkipForce = skipForcePlayOnce;
       skipForcePlayOnce = false;
 
-      if (targetQueue.length > 0 && currId === targetQueue[0]?.Id) {
+      if (targetQueue.length > 0 && isObservedSong(targetQueue[0])) {
         writeLog(`[状态同步] 自然衔接到队首: ${targetQueue[0]?.SongName}`, 'Green');
         registeredNextGuardKey = '';
+        registeredNextGuardSongIdentity = '';
+        queueHeadNeedsGuardOnlyAfterCurrentChange = false;
         currentPlayingSong = targetQueue.shift();
         stateChanged = true;
       } else if (targetQueue.length > 0) {
@@ -900,15 +1014,19 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
       }
     } else if (
       currentPlayingSong
-      && currId === currentPlayingSong?.Id
-      && currId === targetQueue[0]?.Id
+      && isObservedSong(currentPlayingSong)
+      && isObservedSong(targetQueue[0])
     ) {
       registeredNextGuardKey = '';
+      registeredNextGuardSongIdentity = '';
+      queueHeadNeedsGuardOnlyAfterCurrentChange = false;
       targetQueue.shift();
       stateChanged = true;
     } else if (!currentPlayingSong && targetQueue.length > 0) {
-      if (currId === targetQueue[0]?.Id) {
+      if (isObservedSong(targetQueue[0])) {
         registeredNextGuardKey = '';
+        registeredNextGuardSongIdentity = '';
+        queueHeadNeedsGuardOnlyAfterCurrentChange = false;
         currentPlayingSong = targetQueue.shift();
         stateChanged = true;
       } else {
@@ -922,17 +1040,42 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
 
     if (stateChanged) setGlobalStatus(currentPlayingSong ? `[播放] ${currentPlayingSong?.SongName}` : '点歌就绪');
 
-    if (isPlaying && targetQueue.length > 0 && currentPlayingSong && currId === currentPlayingSong?.Id) {
-      if (String(nextId) !== String(targetQueue[0]?.Id)) {
-        writeLog(`[队首推进] 当前点歌已开始播放，只登记新的本地队首: ${targetQueue[0]?.SongName}`, 'DarkGray');
-        if (queueHeadNeedsGuardOnlyAfterCurrentChange) {
-          queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+    if (isPlaying && targetQueue.length > 0 && currentPlayingSong && isObservedSong(currentPlayingSong)) {
+      const nextAction = planObservedNextAction({
+        expected: targetQueue[0],
+        observedNext: observedNextTrack,
+        nextObservation,
+        preserveInsertedHead: queueHeadNeedsGuardOnlyAfterCurrentChange,
+        expectedAlreadyGuarded:
+          registeredNextGuardSongIdentity
+            === getQueueSongIdentity(targetQueue[0])
+      });
+      if (nextAction !== 'none') {
+        writeLog(
+          nextAction === 'arm-only'
+            ? `[队首推进] 立即播放前已插入队首，只重新绑定守卫: ${targetQueue[0]?.SongName}`
+            : observedNextTrack
+            ? `[队首推进] 播放器实际下一首“${nextName}”与代播队首不符，重新插入: ${targetQueue[0]?.SongName}`
+            : `[队首推进] 播放器确认下一首缺失，登记代播队首守卫: ${targetQueue[0]?.SongName}`,
+          nextAction === 'insert' && observedNextTrack ? 'Yellow' : 'DarkGray'
+        );
+        queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+        if (nextAction === 'arm-only') {
           await armNextGuardOnly(targetQueue[0]);
         } else {
           await guardNextSong(targetQueue[0]);
         }
       }
     }
+  }
+
+  if (
+    managedAction
+    && managedAction.targetObserved
+    && !managedAction.inFlight
+    && activeManagedPlayerAction?.id === managedAction.id
+  ) {
+    activeManagedPlayerAction = null;
   }
 }
 
@@ -967,14 +1110,19 @@ async function connectWithConnectorMaintenanceStatus(
       return true;
     }
 
+    const connectorProbeResponded = Boolean(
+      playerManager.connectionState.snapshot
+    );
+
     const statuses = await playerManager.getConnectorStatuses(true);
     const status = statuses.find(item => item.id === connectorId);
-    if (
-      status?.installed
-      && status.compatible
-      && status.updateAvailable
-      && !status.updating
-    ) {
+    if (status && shouldAutoUpgradeConnectorAfterFailure({
+      connectorProbeResponded,
+      installed: status.installed,
+      compatible: status.compatible,
+      updateAvailable: status.autoUpdateAvailable,
+      updating: status.updating
+    })) {
       const recoveryStatus =
         `正在升级${PLAYER_LABELS[connectorId]}连接器并重试连接`;
       connectorMaintenanceStatus = recoveryStatus;
@@ -989,6 +1137,13 @@ async function connectWithConnectorMaintenanceStatus(
         result.success ? 'Green' : 'Yellow'
       );
       return result.success && result.reconnected === true;
+    }
+    if (connectorProbeResponded && status?.updateAvailable) {
+      writeLog(
+        `[连接器兼容恢复] ${status.name}连接器响应正常，`
+        + '当前只是播放器尚未连接；保留现有版本并继续等待。',
+        'DarkGray'
+      );
     }
     return false;
   } finally {
@@ -1021,14 +1176,22 @@ async function maintainPlayerConnectors(
         );
         continue;
       }
-      if (
-        status.updating
-        || status.installed
-      ) {
-        if (status.updateAvailable) {
+      if (status.updating) {
+        continue;
+      }
+      if (status.installed && !status.autoUpdateAvailable) {
+        if (status.manualUpdateAvailable) {
           writeLog(
-            `[连接器热更新] ${status.name} 有新版本 `
-            + `${status.latestVersion}；当前已安装版本仍可用，暂不自动替换。`,
+            `[连接器热更新] ${status.name} 有新的播放器版本分支 `
+            + `${status.latestVersion}，支持播放器版本 `
+            + `${status.supportedPlayerVersion || '未注明'}；`
+            + '不会自动更新，可在播放器设置中手动确认。',
+            'Yellow'
+          );
+        } else if (status.updateAvailable) {
+          writeLog(
+            `[连接器热更新] ${status.name} 有不可自动应用的更新 `
+            + `${status.latestVersion}，已保留当前版本。`,
             'DarkGray'
           );
         }
@@ -1166,6 +1329,13 @@ async function serializeNextGuardOperation<T>(
   }
 }
 
+async function waitForManagedPlayerActionSettlement(): Promise<void> {
+  const deadline = Date.now() + 12_500;
+  while (activeManagedPlayerAction && Date.now() < deadline) {
+    await new Promise<void>(resolve => setTimeout(resolve, 40));
+  }
+}
+
 async function guardNextSong(
   songInfo: any
 ): Promise<boolean> {
@@ -1190,11 +1360,13 @@ async function guardNextSong(
     if (isSuccessfulPlayerResult(result)) {
       queueHeadNeedsGuardOnlyAfterCurrentChange = false;
       registeredNextGuardKey = guardKey;
+      registeredNextGuardSongIdentity = getQueueSongIdentity(songInfo);
       writeLog(`✅ 已登记下一首守卫: ${songInfo.SongName}`, 'DarkGray');
       return true;
     }
     if (registeredNextGuardKey === guardKey) {
       registeredNextGuardKey = '';
+      registeredNextGuardSongIdentity = '';
     }
     return false;
   });
@@ -1207,6 +1379,7 @@ async function armNextGuardOnly(songInfo: any): Promise<boolean> {
     const result = await executePlayerCommand('ArmNextGuard', songInfo);
     if (isSuccessfulPlayerResult(result)) {
       registeredNextGuardKey = guardKey;
+      registeredNextGuardSongIdentity = getQueueSongIdentity(songInfo);
       writeLog(
         `🛡️ 队首已变化，只更新兜底目标且未再次插入播放器队列: ${songInfo.SongName}`,
         'DarkGray'
@@ -1215,6 +1388,7 @@ async function armNextGuardOnly(songInfo: any): Promise<boolean> {
     }
 
     registeredNextGuardKey = '';
+    registeredNextGuardSongIdentity = '';
     writeLog(
       `[队首守卫] 连接器未能只更新兜底目标，将由主程序在切歌后纠正: ${songInfo.SongName}`,
       'Yellow'
@@ -1225,11 +1399,11 @@ async function armNextGuardOnly(songInfo: any): Promise<boolean> {
 
 function rememberCancelledNativeNext(songInfo: any): void {
   if (!songInfo) return;
-  cancelledNativeNextKeys.add(getQueueSongIdentity(songInfo));
-  while (cancelledNativeNextKeys.size > 64) {
-    const oldest = cancelledNativeNextKeys.values().next().value;
+  cancelledNativeNextSongs.set(getQueueSongIdentity(songInfo), songInfo);
+  while (cancelledNativeNextSongs.size > 64) {
+    const oldest = cancelledNativeNextSongs.keys().next().value;
     if (typeof oldest !== 'string') break;
-    cancelledNativeNextKeys.delete(oldest);
+    cancelledNativeNextSongs.delete(oldest);
   }
 }
 
@@ -1238,7 +1412,9 @@ async function reconcileQueueHeadAfterMutation(
   context: string
 ): Promise<void> {
   const nextHead = targetQueue[0] || null;
-  const hadRegisteredNext = Boolean(registeredNextGuardKey);
+  const hadRegisteredNext = Boolean(registeredNextGuardKey)
+    && registeredNextGuardSongIdentity
+      === getQueueSongIdentity(previousHead);
   const action = planQueueHeadMutation({
     previousHeadIdentity: getQueueSongIdentity(previousHead),
     nextHeadIdentity: getQueueSongIdentity(nextHead),
@@ -1248,6 +1424,7 @@ async function reconcileQueueHeadAfterMutation(
   if (action === 'none') return;
 
   registeredNextGuardKey = '';
+  registeredNextGuardSongIdentity = '';
   if (action === 'insert') {
     await guardNextSong(nextHead);
     return;
@@ -1265,17 +1442,87 @@ async function reconcileQueueHeadAfterMutation(
   await armNextGuardOnly(nextHead);
 }
 
-async function playSongNow(songInfo: any): Promise<boolean> {
+async function playSongNow(
+  songInfo: any,
+  mode: 'play-now' | 'interrupt' = 'play-now'
+): Promise<boolean> {
   if (!songInfo) return false;
   playerPausedAfterRequests = false;
-  const previousCurrentPlayingSong = currentPlayingSong;
-  const hadRegisteredNativeNext = Boolean(registeredNextGuardKey);
-  queueHeadNeedsGuardOnlyAfterCurrentChange = hadRegisteredNativeNext;
-  registeredNextGuardKey = '';
-  currentPlayingSong = songInfo;
-  const result = await executePlayerCommand('PlaySelected', songInfo);
+  const operationState = await serializeNextGuardOperation(async () => {
+    const previousCurrentPlayingSong = currentPlayingSong;
+    const hadRegisteredNativeNext = Boolean(registeredNextGuardKey)
+      && registeredNextGuardSongIdentity
+        === getQueueSongIdentity(targetQueue[0]);
+    const command = planImmediatePlaybackCommand({
+      playerKey: getSelectedPlayerKey(),
+      mode,
+      hasCurrentSong: Boolean(previousCurrentPlayingSong)
+    });
+    queueHeadNeedsGuardOnlyAfterCurrentChange =
+      shouldPreserveGuardAfterImmediate({
+        command,
+        hadRegisteredGuard: hadRegisteredNativeNext,
+        hasDisplacedCurrentSong: Boolean(previousCurrentPlayingSong)
+      });
+    registeredNextGuardKey = '';
+    registeredNextGuardSongIdentity = '';
+    currentPlayingSong = songInfo;
+    const managedAction: ManagedPlayerAction = {
+      id: ++managedPlayerActionSequence,
+      kind: mode,
+      target: songInfo,
+      command,
+      startedAt: Date.now(),
+      expiresAt: Date.now() + 12_000,
+      inFlight: true,
+      targetObserved: false
+    };
+    activeManagedPlayerAction = managedAction;
+    setTimeout(() => {
+      if (
+        activeManagedPlayerAction?.id === managedAction.id
+        && Date.now() >= managedAction.expiresAt
+      ) {
+        activeManagedPlayerAction = null;
+        writeLog(
+          `[动作归因] 点歌机动作 #${managedAction.id} 等待最终目标超时；`
+          + '已恢复识别播放器端/用户切歌。',
+          'Yellow'
+        );
+      }
+    }, Math.max(0, managedAction.expiresAt - Date.now() + 50));
+    writeLog(
+      `[动作归因] 开始点歌机动作 #${managedAction.id}: ${command} -> `
+      + songInfo.SongName,
+      'DarkGray'
+    );
+    const result = await executePlayerCommand(command, songInfo);
+    managedAction.inFlight = false;
+    if (
+      managedAction.targetObserved
+      && activeManagedPlayerAction?.id === managedAction.id
+    ) {
+      activeManagedPlayerAction = null;
+    }
+    return {
+      previousCurrentPlayingSong,
+      hadRegisteredNativeNext,
+      result,
+      managedAction
+    };
+  });
+  const {
+    previousCurrentPlayingSong,
+    hadRegisteredNativeNext,
+    result,
+    managedAction
+  } = operationState;
+
   if (!isSuccessfulPlayerResult(result)) {
     if (isObservedSong(songInfo)) return true;
+    if (managedAction && activeManagedPlayerAction?.id === managedAction.id) {
+      activeManagedPlayerAction = null;
+    }
     currentPlayingSong = previousCurrentPlayingSong;
     queueHeadNeedsGuardOnlyAfterCurrentChange = false;
     if (hadRegisteredNativeNext && targetQueue[0]) {
@@ -1285,6 +1532,9 @@ async function playSongNow(songInfo: any): Promise<boolean> {
   }
   if (String(result?.outcome).toLowerCase() === 'indeterminate') {
     if (isObservedSong(songInfo)) return true;
+    if (managedAction && activeManagedPlayerAction?.id === managedAction.id) {
+      activeManagedPlayerAction = null;
+    }
     currentPlayingSong = previousCurrentPlayingSong;
     writeLog(
       `[立即播放] 命令已发出但播放器未确认目标，保留本地队首等待实际切歌: ${songInfo.SongName}`,
@@ -1302,21 +1552,7 @@ async function playSongNow(songInfo: any): Promise<boolean> {
 }
 
 function isObservedSong(songInfo: any): boolean {
-  if (!songInfo || !playerCurrentTrack) return false;
-  const expectedId = String(songInfo.Id || '').trim();
-  const observedId = String(playerCurrentTrack.Id || '').trim();
-  if (expectedId && observedId && expectedId === observedId) return true;
-  const normalize = (value: unknown) =>
-    String(value || '').replace(/\s+/g, '').toLowerCase();
-  return (
-    normalize(songInfo.SongName) === normalize(playerCurrentTrack.SongName)
-    && (
-      !songInfo.ArtistName
-      || !playerCurrentTrack.ArtistName
-      || normalize(songInfo.ArtistName)
-        === normalize(playerCurrentTrack.ArtistName)
-    )
-  );
+  return tracksRepresentSameSong(songInfo, playerCurrentTrack);
 }
 
 function getWebSocketClient() {
@@ -1402,11 +1638,38 @@ async function updateCurrentUserInfo(expectedCookie: string = biliCookie): Promi
 // ==========================================
 // B站弹幕点歌逻辑处理
 // ==========================================
+interface SongRequestResult {
+  success: boolean;
+  mode: LocalSongRequestMode;
+  keyword: string;
+  message: string;
+  song?: any;
+  queued?: boolean;
+  playbackConfirmed?: boolean;
+  guardRegistered?: boolean | null;
+}
+
+async function serializeLocalTestRequest<T>(
+  operation: () => Promise<T>
+): Promise<T> {
+  let release!: () => void;
+  const previous = localTestRequestTail;
+  localTestRequestTail = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
 async function tryRequestSong(
   user: any,
   keyword: string,
-  mode: 'normal' | 'top' | 'interrupt' | 'play_now' = 'normal'
-): Promise<void> {
+  mode: LocalSongRequestMode = 'normal'
+): Promise<SongRequestResult> {
   try {
     const normalizedKeyword = keyword.replace(/\s+/g, '');
     if (normalizedKeyword === '贞理的小曲' || normalizedKeyword === '真理的小曲') {
@@ -1419,7 +1682,12 @@ async function tryRequestSong(
     if (!track) {
       setGlobalStatus(`❌ 未搜到: ${keyword}`);
       await addReject(user, `未搜到歌曲: ${keyword}`);
-      return;
+      return {
+        success: false,
+        mode,
+        keyword,
+        message: `未搜到歌曲: ${keyword}`
+      };
     }
 
     const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
@@ -1439,19 +1707,43 @@ async function tryRequestSong(
       CoverUrl: coverUrl,
       GuardLevel: user.guardLevel
     };
-    cancelledNativeNextKeys.delete(getQueueSongIdentity(newSong));
+    cancelledNativeNextSongs.delete(getQueueSongIdentity(newSong));
 
     if (mode === 'interrupt') {
+      await waitForManagedPlayerActionSettlement();
       if (currentPlayingSong) targetQueue.unshift(currentPlayingSong);
       setGlobalStatus(`⚡ 插队: ${newSong.SongName}`);
-      if (!await playSongNow(newSong)) targetQueue.unshift(newSong);
-      return;
+      const playbackConfirmed = await playSongNow(newSong, 'interrupt');
+      if (!playbackConfirmed) targetQueue.unshift(newSong);
+      return {
+        success: true,
+        mode,
+        keyword,
+        message: playbackConfirmed
+          ? `已确认插队播放: ${newSong.SongName}`
+          : `插队播放未确认，已保留到队首: ${newSong.SongName}`,
+        song: newSong,
+        queued: !playbackConfirmed,
+        playbackConfirmed
+      };
     }
 
     if (mode === 'play_now') {
+      await waitForManagedPlayerActionSettlement();
       setGlobalStatus(`▶️ 立即: ${newSong.SongName}`);
-      if (!await playSongNow(newSong)) targetQueue.unshift(newSong);
-      return;
+      const playbackConfirmed = await playSongNow(newSong);
+      if (!playbackConfirmed) targetQueue.unshift(newSong);
+      return {
+        success: true,
+        mode,
+        keyword,
+        message: playbackConfirmed
+          ? `已确认立即播放: ${newSong.SongName}`
+          : `立即播放未确认，已保留到队首: ${newSong.SongName}`,
+        song: newSong,
+        queued: !playbackConfirmed,
+        playbackConfirmed
+      };
     }
 
     const previousHead = targetQueue[0] || null;
@@ -1463,6 +1755,7 @@ async function tryRequestSong(
       setGlobalStatus(`✅ 点歌: ${newSong.SongName}`);
     }
 
+    let guardRegistered: boolean | null = null;
     if (mode === 'top' && previousHead) {
       await reconcileQueueHeadAfterMutation(previousHead, '置顶点歌');
     } else if (!previousHead && isPlaying) {
@@ -1471,15 +1764,32 @@ async function tryRequestSong(
         && !currentPlayingSong
       ) {
         const first = targetQueue[0];
-        if (first) await playSongNow(first);
+        if (first) guardRegistered = await playSongNow(first);
       } else {
-        await guardNextSong(targetQueue[0]);
+        guardRegistered = await guardNextSong(targetQueue[0]);
       }
     }
+    return {
+      success: true,
+      mode,
+      keyword,
+      message: mode === 'top'
+        ? `已置顶: ${newSong.SongName}`
+        : `已加入待播队列: ${newSong.SongName}`,
+      song: newSong,
+      queued: true,
+      guardRegistered
+    };
   } catch (err: any) {
     writeLog(`[点歌搜索] ${getSelectedPlayerLabel()} 搜索异常: ${err?.message || err}`, 'Red');
     setGlobalStatus('❌ 搜索或播放器通信异常');
     await addReject(user, '搜索或播放器通信异常');
+    return {
+      success: false,
+      mode,
+      keyword,
+      message: err?.message || String(err)
+    };
   }
 }
 
@@ -2153,6 +2463,95 @@ function startBackendServer() {
       return;
     }
 
+    if (url.pathname === '/api/test/request-song') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      if (!isLoopbackRemoteAddress(req.socket.remoteAddress)) {
+        res.writeHead(403);
+        res.end(JSON.stringify({
+          success: false,
+          message: '本地测试点歌接口仅允许回环地址访问'
+        }));
+        return;
+      }
+      if (req.method === 'GET') {
+        res.end(JSON.stringify({
+          success: true,
+          localOnly: true,
+          serialized: true,
+          bypassesDanmakuChecks: true,
+          endpoint: `http://127.0.0.1:${INTERNAL_HTTP_PORT}/api/test/request-song`,
+          method: 'POST',
+          body: {
+            keyword: 'Shelter Porter Robinson Madeon',
+            mode: 'normal'
+          },
+          modes: ['normal', 'top', 'interrupt', 'play_now'],
+          aliases: {
+            queue: 'normal',
+            priority: 'top',
+            insert: 'interrupt',
+            immediate: 'play_now'
+          }
+        }));
+        return;
+      }
+      if (req.method !== 'POST') {
+        res.writeHead(405);
+        res.end(JSON.stringify({
+          success: false,
+          message: '仅支持 GET 说明或 POST 点歌'
+        }));
+        return;
+      }
+
+      const body = await readJsonRequest(req);
+      const keyword = normalizeLocalSongKeyword(body.keyword);
+      const mode = normalizeLocalSongRequestMode(body.mode);
+      if (!keyword || !mode) {
+        res.writeHead(400);
+        res.end(JSON.stringify({
+          success: false,
+          message: !keyword
+            ? 'keyword 必须是 1 到 200 个字符的字符串'
+            : 'mode 必须是 normal、top、interrupt 或 play_now'
+        }));
+        return;
+      }
+
+      const requestId = ++localTestRequestSequence;
+      const startedAt = Date.now();
+      const requestedBy = String(body.requestedBy || '本地测试 API')
+        .trim()
+        .slice(0, 40) || '本地测试 API';
+      writeLog(
+        `[本地测试 API] #${requestId} ${mode}: ${keyword}`,
+        'Cyan'
+      );
+      const result = await serializeLocalTestRequest(
+        () => tryRequestSong({
+          uid: 'local-test-api',
+          name: requestedBy,
+          avatar: 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Crect width=%2264%22 height=%2264%22 rx=%2216%22 fill=%22%236366f1%22/%3E%3Ctext x=%2232%22 y=%2241%22 text-anchor=%22middle%22 font-size=%2228%22 fill=%22white%22%3ET%3C/text%3E%3C/svg%3E',
+          guardLevel: 0
+        }, keyword, mode)
+      );
+      if (!result.success) {
+        res.writeHead(422);
+      }
+      res.end(JSON.stringify({
+        ...result,
+        requestId,
+        elapsedMs: Date.now() - startedAt,
+        player: {
+          key: getSelectedPlayerKey(),
+          connected: isPlayerConnected
+        },
+        current: currentPlayingSong || playerCurrentTrack,
+        queue: targetQueue
+      }));
+      return;
+    }
+
     if (url.pathname === '/api/config') {
       if (req.method === 'POST') {
         const body = await readJsonRequest(req);
@@ -2452,7 +2851,10 @@ function startBackendServer() {
         }
 
         setGlobalStatus(`正在更新${PLAYER_LABELS[connectorId]}连接器...`);
-        const result = await playerManager.updateConnector(connectorId);
+        const result = await playerManager.updateConnector(
+          connectorId,
+          true
+        );
         setGlobalStatus(
           result.success
             ? `✅ ${result.message}`

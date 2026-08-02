@@ -35,6 +35,9 @@ export interface PlayerSnapshot {
   version: string;
   status: string;
   current?: PlayerTrack | null;
+  next?: PlayerTrack | null;
+  nextSource?: string;
+  nextObservation?: 'unknown' | 'track' | 'empty' | null;
   observedAt: string;
   capabilities?: PlayerCapabilities | null;
 }
@@ -58,10 +61,20 @@ interface BridgeEnvelope {
   error?: string | null;
 }
 
+export interface PlayerBridgeEvent {
+  type: 'event';
+  event: 'snapshot' | 'connectorExit';
+  player: NativeConnectorId;
+  sequence: number;
+  snapshot?: PlayerSnapshot | null;
+  error?: string;
+}
+
 export class PlayerBridgeClient {
   private process: ChildProcessWithoutNullStreams | null = null;
   private activePlayer: NativeConnectorId | null = null;
   private activeCapabilities: PlayerCapabilities | null = null;
+  private activeFeatures = new Set<string>();
   private pending = new Map<string, PendingRequest>();
   private requestSequence = 0;
   private stdoutBuffer = '';
@@ -73,13 +86,18 @@ export class PlayerBridgeClient {
 
   constructor(
     private readonly onLog: (message: string) => void,
-    private readonly getFoliaToken: () => string = () => ''
+    private readonly getFoliaToken: () => string = () => '',
+    private readonly onEvent: (event: PlayerBridgeEvent) => void = () => {}
   ) {
     this.updater = new ConnectorUpdater(onLog);
   }
 
   get running(): boolean {
     return Boolean(this.process && !this.process.killed);
+  }
+
+  get supportsSnapshotEvents(): boolean {
+    return this.activeFeatures.has('snapshot-events-v1');
   }
 
   async start(player: NativeConnectorId): Promise<void> {
@@ -131,11 +149,15 @@ export class PlayerBridgeClient {
     this.stopping = false;
     this.stdoutBuffer = '';
     this.activeCapabilities = null;
+    this.activeFeatures.clear();
+    const connectorEnvironment =
+      await this.updater.getLaunchEnvironment(player);
     const child = spawn(executable, [], {
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
+        ...connectorEnvironment,
         BILINCM_FOLIA_TOKEN:
           player === 'folia' ? this.getFoliaToken().trim() : ''
       }
@@ -180,6 +202,26 @@ export class PlayerBridgeClient {
       );
     }
     this.activeCapabilities = ping?.capabilities || null;
+    this.activeFeatures = new Set(
+      Array.isArray(ping?.features)
+        ? ping.features.filter((feature: unknown): feature is string =>
+          typeof feature === 'string'
+        )
+        : []
+    );
+    if (this.supportsSnapshotEvents) {
+      const subscription = await this.request(
+        {
+          action: 'subscribe',
+          eventProtocolVersion: 1
+        },
+        5000
+      );
+      if (!subscription?.subscribed) {
+        this.activeFeatures.delete('snapshot-events-v1');
+        this.onLog('[播放器桥] 实时事件订阅不可用，已回退到状态轮询');
+      }
+    }
   }
 
   async restart(player: NativeConnectorId): Promise<void> {
@@ -200,9 +242,13 @@ export class PlayerBridgeClient {
   }
 
   async updateConnector(
-    connectorId: NativeConnectorId
+    connectorId: NativeConnectorId,
+    allowPlayerVersionChange = false
   ): Promise<ConnectorUpdateResult> {
-    return this.updater.update(connectorId);
+    return this.updater.update(
+      connectorId,
+      allowPlayerVersionChange
+    );
   }
 
   async reinstallConnector(
@@ -231,6 +277,7 @@ export class PlayerBridgeClient {
         this.process = null;
         this.activePlayer = null;
         this.activeCapabilities = null;
+        this.activeFeatures.clear();
         this.rejectAll(new Error('播放器桥已停止'));
       }
     }
@@ -313,13 +360,36 @@ export class PlayerBridgeClient {
   }
 
   private consumeLine(line: string): void {
-    let envelope: BridgeEnvelope;
+    let envelope: BridgeEnvelope | PlayerBridgeEvent;
     try {
       envelope = JSON.parse(line);
     } catch {
       this.onLog(`[播放器桥] 非协议输出: ${line}`);
       return;
     }
+
+
+    if ('type' in envelope && envelope.type === 'event') {
+      if (envelope.player !== this.activePlayer) return;
+      try {
+        this.onEvent({
+          ...envelope,
+          snapshot: envelope.snapshot
+            ? {
+              ...envelope.snapshot,
+              capabilities: this.activeCapabilities
+            }
+            : envelope.snapshot
+        });
+      } catch (error: any) {
+        this.onLog(
+          `[播放器桥] 实时事件处理失败: ${error?.message || error}`
+        );
+      }
+      return;
+    }
+
+    if (!('id' in envelope)) return;
 
     const pending = this.pending.get(envelope.id);
     if (!pending) return;
@@ -335,10 +405,22 @@ export class PlayerBridgeClient {
     error: Error
   ): void {
     if (this.process !== child) return;
+    const exitedPlayer = this.activePlayer;
     this.process = null;
     this.activePlayer = null;
     this.activeCapabilities = null;
+    this.activeFeatures.clear();
     this.rejectAll(error);
+    if (!this.stopping && exitedPlayer) {
+      this.onEvent({
+        type: 'event',
+        event: 'connectorExit',
+        player: exitedPlayer,
+        sequence: 0,
+        snapshot: null,
+        error: error.message
+      });
+    }
   }
 
   private waitForExit(

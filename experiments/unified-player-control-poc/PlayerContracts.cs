@@ -8,7 +8,8 @@ internal enum PlayerCommand
     Toggle,
     Next,
     PlaySelected,
-    InsertNext
+    InsertNext,
+    ArmNextGuard
 }
 
 internal enum OperationOutcome
@@ -37,7 +38,8 @@ internal sealed record PlayerTrack(
     string Title,
     string Artist,
     string Album,
-    string NativeData = "")
+    string NativeData = "",
+    string CoverUrl = "")
 {
     public string DisplayName =>
         string.IsNullOrWhiteSpace(Artist) ? Title : $"{Title} - {Artist}";
@@ -50,7 +52,9 @@ internal sealed record PlayerSnapshot(
     string Version,
     string Status,
     PlayerTrack? Current,
-    DateTimeOffset ObservedAt);
+    DateTimeOffset ObservedAt,
+    PlayerTrack? Next = null,
+    string NextSource = "");
 
 internal sealed record PlayerOperationResult(
     OperationOutcome Outcome,
@@ -82,5 +86,16 @@ internal interface IPlayerAdapter : IAsyncDisposable
     Task<PlayerOperationResult> ExecuteAsync(
         PlayerCommand command,
         PlayerTrack? track,
+        CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Optional additive event capability. A connector that implements this
+/// interface can push exact snapshots to the host; older adapters continue to
+/// use the ProbeAsync request path.
+/// </summary>
+internal interface IPlayerSnapshotEventSource
+{
+    IAsyncEnumerable<PlayerSnapshot> WatchSnapshotsAsync(
         CancellationToken cancellationToken);
 }

@@ -1,7 +1,8 @@
 import type { PlayerBridgeClient, PlayerTrack } from '../player-bridge-client';
+import { selectQqArtworkCover } from '../qqmusic-artwork';
+import { findQqShareUrl } from '../song-query-policy';
 import { NativePlayerBackend } from './native-player';
 
-const QQ_SHARE_BASE = 'https://c6.y.qq.com/base/fcgi-bin/u?__=';
 const QQ_DETAIL_ENDPOINT =
   'https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg';
 
@@ -11,29 +12,14 @@ interface QqShareReference {
 }
 
 interface QqLookupCandidate {
-  reference?: QqShareReference;
-  shareUrl?: string;
-}
-
-function findQqShareUrl(input: string): string | null {
-  const trimmed = input.trim();
-  const fullMatch = trimmed.match(
-    /https?:\/\/c6\.y\.qq\.com\/base\/fcgi-bin\/u\?__=([A-Za-z0-9_-]+)/i
-  );
-  if (fullMatch) return fullMatch[0];
-
-  const shortMatch = trimmed.match(
-    /(?:^|\s)(?:u\?__=|c6\.y\.qq\.com\/base\/fcgi-bin\/u\?__=)([A-Za-z0-9_-]+)/i
-  );
-  return shortMatch ? `${QQ_SHARE_BASE}${shortMatch[1]}` : null;
+  shareUrl: string;
 }
 
 function parseDirectQqReference(input: string): QqShareReference | null {
   const routeMatch = input.match(
     /(?:y\.qq\.com\/(?:n\/)?ryqq(?:_v2)?\/songDetail\/)([A-Za-z0-9]+)/i
   );
-  const explicitId = input.match(/^id\s*=\s*([A-Za-z0-9]+)\s*$/i);
-  const value = routeMatch?.[1] || explicitId?.[1];
+  const value = routeMatch?.[1];
   if (!value) return null;
   return {
     kind: /^\d+$/.test(value) ? 'songid' : 'songmid',
@@ -70,49 +56,13 @@ async function resolveQqShareReference(
 }
 
 function getQqLookupCandidates(query: string): QqLookupCandidate[] {
-  const trimmed = query.trim();
-  const direct = parseDirectQqReference(trimmed);
-  if (direct) {
-    const explicitValue = trimmed.match(
-      /^id\s*=\s*([A-Za-z0-9_-]+)\s*$/i
-    )?.[1];
-    const candidates: QqLookupCandidate[] = [{ reference: direct }];
-    if (explicitValue && /^[A-Za-z0-9_-]{12}$/.test(explicitValue)) {
-      candidates.push({ shareUrl: `${QQ_SHARE_BASE}${explicitValue}` });
-    }
-    return candidates;
-  }
-
-  const shareUrl = findQqShareUrl(trimmed);
-  if (shareUrl) {
-    return [{ shareUrl }];
-  }
-
-  if (/^\d+$/.test(trimmed)) {
-    return [{ reference: { kind: 'songid', value: trimmed } }];
-  }
-
-  // QQ short share codes are currently 12 characters. A songMid is commonly
-  // 14 characters; explicit id= keeps accepting other compatible lengths.
-  if (/^[A-Za-z0-9_-]{12}$/.test(trimmed)) {
-    return [
-      { shareUrl: `${QQ_SHARE_BASE}${trimmed}` },
-      { reference: { kind: 'songmid', value: trimmed } }
-    ];
-  }
-
-  if (/^[A-Za-z0-9]{14}$/.test(trimmed)) {
-    return [{ reference: { kind: 'songmid', value: trimmed } }];
-  }
-
-  return [];
+  const shareUrl = findQqShareUrl(query);
+  return shareUrl ? [{ shareUrl }] : [];
 }
 
 async function resolveQqCandidate(
   candidate: QqLookupCandidate
 ): Promise<QqShareReference | null> {
-  if (candidate.reference) return candidate.reference;
-  if (!candidate.shareUrl) return null;
   return await resolveQqShareReference(candidate.shareUrl);
 }
 
@@ -193,7 +143,20 @@ export class QQMusicPlayerBackend extends NativePlayerBackend {
     const exactTrack = exactResults.find(
       (track): track is PlayerTrack => track !== null
     );
-    if (exactTrack) return [exactTrack];
+    if (exactTrack) {
+      if (exactTrack.coverUrl) return [exactTrack];
+
+      const artworkQuery = [exactTrack.title, exactTrack.artist]
+        .filter(Boolean)
+        .join(' ');
+      const artworkCandidates = artworkQuery
+        ? await super.search(artworkQuery).catch(() => [])
+        : [];
+      return [{
+        ...exactTrack,
+        coverUrl: selectQqArtworkCover(exactTrack, artworkCandidates)
+      }];
+    }
 
     const keywordResult = await keywordSearch;
     if (keywordResult.error) throw keywordResult.error;

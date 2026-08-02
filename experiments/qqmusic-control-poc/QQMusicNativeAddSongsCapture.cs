@@ -31,10 +31,6 @@ internal sealed record QQMusicNativeAddSongsCaptureResult(
 
 internal static class QQMusicNativeAddSongsCapture
 {
-    private const string ExpectedModulePath =
-        @"F:\Program Files\QQMusic\QQMusic.dll";
-    private const string ExpectedFileVersion = "22.22";
-    private const int AddSongsFunctionRva = 0x42C010;
     private const byte ExpectedFirstInstruction = 0x55;
     private const byte BreakpointInstruction = 0xCC;
     private const uint ProcessVmOperation = 0x0008;
@@ -103,10 +99,21 @@ internal static class QQMusicNativeAddSongsCapture
                     "没有读取到正在播放的 QQ 音乐歌曲。");
             }
 
-            (process, moduleBase) = FindLoadedClientCore();
+            var analysis = QQMusicNativeNextAnalyzer.AnalyzeCurrent();
+            var profile = analysis.Profile;
+            if (!analysis.ExecutionAllowed || profile is null)
+            {
+                throw new InvalidOperationException(
+                    "当前 QQ 音乐没有通过完整画像校验："
+                    + analysis.Summary);
+            }
+
+            (process, moduleBase) = FindLoadedClientCore(
+                analysis.ClientModulePath,
+                analysis.FileVersion);
             processId = process.Id;
             functionAddress = checked(
-                moduleBase + (uint)AddSongsFunctionRva);
+                moduleBase + (uint)profile.AddSongsRva);
             processHandle = OpenProcess(
                 ProcessVmOperation
                     | ProcessVmRead
@@ -364,7 +371,9 @@ internal static class QQMusicNativeAddSongsCapture
     }
 
     private static (Process Process, uint ModuleBase)
-        FindLoadedClientCore()
+        FindLoadedClientCore(
+            string expectedModulePath,
+            string expectedFileVersion)
     {
         var matches = new List<(Process Process, uint Base, long Memory)>();
         foreach (var process in Process.GetProcessesByName("QQMusic"))
@@ -376,7 +385,7 @@ internal static class QQMusicNativeAddSongsCapture
                 {
                     if (!PathEquals(
                             module.FileName,
-                            ExpectedModulePath))
+                            expectedModulePath))
                     {
                         continue;
                     }
@@ -386,7 +395,7 @@ internal static class QQMusicNativeAddSongsCapture
                         .FileVersion;
                     if (!string.Equals(
                             version,
-                            ExpectedFileVersion,
+                            expectedFileVersion,
                             StringComparison.Ordinal))
                     {
                         continue;
@@ -419,7 +428,7 @@ internal static class QQMusicNativeAddSongsCapture
         if (matches.Count == 0)
         {
             throw new InvalidOperationException(
-                "没有找到已加载 QQMusic.dll 22.22 的客户端进程。");
+                $"没有找到已加载 QQMusic.dll {expectedFileVersion} 的客户端进程。");
         }
 
         var selected = matches

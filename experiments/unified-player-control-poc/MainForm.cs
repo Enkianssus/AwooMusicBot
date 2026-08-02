@@ -14,9 +14,9 @@ internal sealed class MainForm : Form
 
     private readonly IPlayerAdapter[] _adapters =
     [
-        new NeteasePlayerAdapter(),
-        new KugouPlayerAdapter(),
-        new QQMusicPlayerAdapter()
+        ConnectorProcessAdapter.CreateDefault("netease"),
+        ConnectorProcessAdapter.CreateDefault("kugou"),
+        ConnectorProcessAdapter.CreateDefault("qqmusic")
     ];
     private readonly CancellationTokenSource _lifetime = new();
     private readonly System.Windows.Forms.Timer _pollTimer = new()
@@ -28,9 +28,10 @@ internal sealed class MainForm : Form
     private readonly Label _versionLabel = new();
     private readonly Label _trackLabel = new();
     private readonly Label _trackIdLabel = new();
+    private readonly Label _nextTrackLabel = new();
+    private readonly Label _nextSourceLabel = new();
     private readonly Label _capabilitiesLabel = new();
     private readonly Label _operationLabel = new();
-    private readonly CheckBox _unsafeQqNextCheckBox = new();
     private readonly TextBox _searchTextBox = new();
     private readonly Button _searchButton = new();
     private readonly Button _refreshButton = new();
@@ -40,6 +41,7 @@ internal sealed class MainForm : Form
     private readonly Button _toggleButton = new();
     private readonly Button _nextButton = new();
     private readonly Button _playSelectedButton = new();
+    private readonly Button _armNextGuardButton = new();
     private readonly Button _insertNextButton = new();
     private readonly DataGridView _resultsGrid = new();
     private readonly BindingList<PlayerTrack> _searchResults = [];
@@ -50,6 +52,17 @@ internal sealed class MainForm : Form
     private bool _busy;
     private bool _polling;
     private bool _searching;
+    private bool _eventStreamActive;
+    private bool _fallbackPolling;
+    private bool _shown;
+    private bool _closing;
+    private bool _closeCleanupStarted;
+    private bool _allowClose;
+    private long _adapterGeneration;
+    private long _watchSequence;
+    private long _lastAppliedWatchSequence;
+    private CancellationTokenSource? _watchCancellation;
+    private Task? _watchTask;
 
     public MainForm()
     {
@@ -67,27 +80,55 @@ internal sealed class MainForm : Form
 
         Shown += async (_, _) =>
         {
-            _pollTimer.Start();
-            await RefreshSelectedPlayerAsync(manual: true);
+            _shown = true;
+            var generation = await RestartSelectedAdapterWatchAsync();
+            await RefreshSelectedPlayerAsync(
+                manual: true,
+                expectedGeneration: generation);
         };
-        FormClosed += (_, _) =>
+        FormClosing += async (_, eventArgs) =>
         {
-            _pollTimer.Stop();
-            _lifetime.Cancel();
-            foreach (var adapter in _adapters)
+            if (_allowClose)
             {
-                try
-                {
-                    adapter.DisposeAsync().AsTask().GetAwaiter().GetResult();
-                }
-                catch
-                {
-                    // The process is already closing.
-                }
+                return;
             }
 
-            _lifetime.Dispose();
-            _pollTimer.Dispose();
+            eventArgs.Cancel = true;
+            if (_closeCleanupStarted)
+            {
+                return;
+            }
+
+            _closeCleanupStarted = true;
+            _closing = true;
+            _pollTimer.Stop();
+            _watchCancellation?.Cancel();
+            _lifetime.Cancel();
+
+            try
+            {
+                await StopSelectedAdapterWatchAsync();
+                foreach (var adapter in _adapters)
+                {
+                    try
+                    {
+                        await adapter.DisposeAsync();
+                    }
+                    catch (Exception exception)
+                    {
+                        AppendLog(
+                            $"关闭 {adapter.DisplayName} 时忽略异常："
+                            + $"{exception.GetType().Name}: {exception.Message}");
+                    }
+                }
+            }
+            finally
+            {
+                _lifetime.Dispose();
+                _pollTimer.Dispose();
+                _allowClose = true;
+                Close();
+            }
         };
     }
 
@@ -106,7 +147,7 @@ internal sealed class MainForm : Form
             BackColor = PageColor
         };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 166));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 214));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -173,20 +214,22 @@ internal sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
-            RowCount = 5
+            RowCount = 7
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (var index = 0; index < 5; index++)
+        for (var index = 0; index < 7; index++)
         {
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f / 7f));
         }
 
         AddStatusRow(layout, 0, "连接状态", _connectionLabel);
         AddStatusRow(layout, 1, "版本", _versionLabel);
         AddStatusRow(layout, 2, "当前歌曲", _trackLabel);
         AddStatusRow(layout, 3, "歌曲标识", _trackIdLabel);
-        AddStatusRow(layout, 4, "能力", _capabilitiesLabel);
+        AddStatusRow(layout, 4, "下一首预览", _nextTrackLabel);
+        AddStatusRow(layout, 5, "下一首来源", _nextSourceLabel);
+        AddStatusRow(layout, 6, "能力", _capabilitiesLabel);
         card.Controls.Add(layout);
         return card;
     }
@@ -227,24 +270,19 @@ internal sealed class MainForm : Form
         row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
         row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
-        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 260));
-        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 205));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
 
         _searchTextBox.Dock = DockStyle.Fill;
         _searchTextBox.PlaceholderText = "输入歌名和歌手，例如：周杰伦 稻香";
         ConfigureButton(_searchButton, "搜索", PrimaryColor);
         ConfigureButton(_playSelectedButton, "立即播放所选", SuccessColor);
-        _unsafeQqNextCheckBox.Dock = DockStyle.Fill;
-        _unsafeQqNextCheckBox.Text =
-            "叠加 QQ 22.22 原生插队（修改进程，风险）";
-        _unsafeQqNextCheckBox.ForeColor = ErrorColor;
-        _unsafeQqNextCheckBox.TextAlign = ContentAlignment.MiddleLeft;
-        _unsafeQqNextCheckBox.Visible = false;
-        ConfigureButton(_insertNextButton, "设为下一首", Color.FromArgb(126, 34, 206));
+        ConfigureButton(_armNextGuardButton, "仅挂下一首守卫", Color.FromArgb(126, 34, 206));
+        ConfigureButton(_insertNextButton, "原生插入下一首", Color.FromArgb(88, 28, 135));
         row.Controls.Add(_searchTextBox, 0, 0);
         row.Controls.Add(_searchButton, 1, 0);
         row.Controls.Add(_playSelectedButton, 2, 0);
-        row.Controls.Add(_unsafeQqNextCheckBox, 3, 0);
+        row.Controls.Add(_armNextGuardButton, 3, 0);
         row.Controls.Add(_insertNextButton, 4, 0);
         return row;
     }
@@ -294,24 +332,16 @@ internal sealed class MainForm : Form
         _playerSelector.SelectedIndexChanged += async (_, _) =>
         {
             _searchResults.Clear();
-            _unsafeQqNextCheckBox.Visible =
-                SelectedAdapter is QQMusicPlayerAdapter;
             ApplyCapabilities();
-            await RefreshSelectedPlayerAsync(manual: true);
-        };
-        _unsafeQqNextCheckBox.CheckedChanged += (_, _) =>
-        {
-            if (SelectedAdapter is QQMusicPlayerAdapter adapter)
+            if (!_shown)
             {
-                adapter.AllowUnsafeNativeNext =
-                    _unsafeQqNextCheckBox.Checked;
-                AppendLog(
-                    adapter.AllowUnsafeNativeNext
-                        ? "已允许 QQ 22.22 原生插队；仍会执行校验，并保留暂停接管守卫。"
-                        : "已关闭 QQ 原生插队；设为下一首将仅使用暂停接管守卫。");
+                return;
             }
 
-            ApplyCapabilities();
+            var generation = await RestartSelectedAdapterWatchAsync();
+            await RefreshSelectedPlayerAsync(
+                manual: true,
+                expectedGeneration: generation);
         };
         _refreshButton.Click += async (_, _) =>
             await RefreshSelectedPlayerAsync(manual: true);
@@ -345,28 +375,256 @@ internal sealed class MainForm : Form
             await ExecuteAsync(PlayerCommand.Next);
         _playSelectedButton.Click += async (_, _) =>
             await ExecuteAsync(PlayerCommand.PlaySelected);
+        _armNextGuardButton.Click += async (_, _) =>
+            await ExecuteAsync(PlayerCommand.ArmNextGuard);
         _insertNextButton.Click += async (_, _) =>
             await ExecuteAsync(PlayerCommand.InsertNext);
     }
 
-    private async Task RefreshSelectedPlayerAsync(bool manual)
+    private async Task<long> RestartSelectedAdapterWatchAsync()
     {
-        if (_busy || _polling || IsDisposed)
+        var generation = Interlocked.Increment(ref _adapterGeneration);
+        await StopSelectedAdapterWatchAsync();
+        _lastAppliedWatchSequence = 0;
+        _fallbackPolling = false;
+        _pollTimer.Stop();
+
+        if (_closing)
+        {
+            return generation;
+        }
+
+        var adapter = SelectedAdapter;
+        if (adapter is not IPlayerSnapshotEventSource eventSource)
+        {
+            ActivatePollingFallback(
+                adapter,
+                generation,
+                "连接器未提供事件源");
+            return generation;
+        }
+
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetime.Token);
+        _watchCancellation = cancellation;
+        _eventStreamActive = true;
+        _fallbackPolling = false;
+        SetOperation(
+            $"{adapter.DisplayName}：协议事件流已启动，1 秒轮询已停止",
+            PrimaryColor);
+        AppendLog(
+            $"{adapter.DisplayName}：协议事件流已启动 "
+            + $"（generation={generation}）");
+        _watchTask = WatchSnapshotsAsync(
+            adapter,
+            eventSource,
+            generation,
+            cancellation);
+        return generation;
+    }
+
+    private async Task StopSelectedAdapterWatchAsync()
+    {
+        var cancellation = Interlocked.Exchange(
+            ref _watchCancellation,
+            null);
+        var watchTask = Interlocked.Exchange(ref _watchTask, null);
+        cancellation?.Cancel();
+        if (watchTask is not null)
+        {
+            try
+            {
+                await watchTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected when switching adapters or closing the form.
+            }
+            catch (Exception exception)
+            {
+                if (!_closing)
+                {
+                    AppendLog(
+                        $"停止快照事件流失败："
+                        + $"{exception.GetType().Name}: {exception.Message}");
+                }
+            }
+        }
+
+        cancellation?.Dispose();
+        _eventStreamActive = false;
+    }
+
+    private async Task WatchSnapshotsAsync(
+        IPlayerAdapter adapter,
+        IPlayerSnapshotEventSource eventSource,
+        long generation,
+        CancellationTokenSource owner)
+    {
+        try
+        {
+            await foreach (var snapshot in eventSource
+                               .WatchSnapshotsAsync(owner.Token)
+                               .WithCancellation(owner.Token)
+                               .ConfigureAwait(false))
+            {
+                var sequence = Interlocked.Increment(ref _watchSequence);
+                PostToUi(() =>
+                {
+                    if (_closing
+                        || owner.IsCancellationRequested
+                        || generation != Volatile.Read(ref _adapterGeneration)
+                        || !ReferenceEquals(adapter, SelectedAdapter)
+                        || sequence <= _lastAppliedWatchSequence)
+                    {
+                        return;
+                    }
+
+                    _lastAppliedWatchSequence = sequence;
+                    UpdateSnapshot(snapshot);
+                    SetOperation(
+                        $"{adapter.DisplayName}：协议事件快照 #{sequence}",
+                        PrimaryColor);
+                    AppendLog(
+                        $"{adapter.DisplayName}：协议事件快照 #{sequence} "
+                        + $"status={snapshot.Status}");
+                });
+            }
+
+            if (!owner.IsCancellationRequested)
+            {
+                PostToUi(() => ActivatePollingFallback(
+                    adapter,
+                    generation,
+                    "事件流已结束"));
+            }
+        }
+        catch (OperationCanceledException)
+            when (owner.IsCancellationRequested)
+        {
+            // Expected when switching adapters or closing the form.
+        }
+        catch (Exception exception)
+        {
+            PostToUi(() => ActivatePollingFallback(
+                adapter,
+                generation,
+                $"事件流异常：{exception.GetType().Name}"));
+        }
+    }
+
+    private void ActivatePollingFallback(
+        IPlayerAdapter adapter,
+        long generation,
+        string reason)
+    {
+        if (_closing
+            || generation != Volatile.Read(ref _adapterGeneration)
+            || !ReferenceEquals(adapter, SelectedAdapter))
+        {
+            return;
+        }
+
+        _eventStreamActive = false;
+        _fallbackPolling = true;
+        _pollTimer.Start();
+        SetOperation(
+            $"{adapter.DisplayName}：{reason}；每 1 秒兼容探测",
+            WarningColor);
+        AppendLog(
+            $"{adapter.DisplayName}：{reason}；已恢复兼容探测 "
+            + $"（generation={generation}）");
+        _ = RefreshSelectedPlayerAsync(
+            manual: true,
+            expectedAdapter: adapter,
+            expectedGeneration: generation);
+    }
+
+    private void PostToUi(Action action)
+    {
+        if (_closing || IsDisposed || Disposing || !IsHandleCreated)
+        {
+            return;
+        }
+
+        void SafeInvoke()
+        {
+            if (_closing || IsDisposed || Disposing)
+            {
+                return;
+            }
+
+            try
+            {
+                action();
+            }
+            catch (Exception exception)
+            {
+                if (!_closing)
+                {
+                    AppendLog(
+                        $"协议事件更新 UI 失败："
+                        + $"{exception.GetType().Name}: {exception.Message}");
+                }
+            }
+        }
+
+        try
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke((Action)SafeInvoke);
+            }
+            else
+            {
+                SafeInvoke();
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // The form is already disposed.
+        }
+        catch (InvalidOperationException)
+        {
+            // The handle may be tearing down.
+        }
+    }
+
+    private async Task RefreshSelectedPlayerAsync(
+        bool manual,
+        IPlayerAdapter? expectedAdapter = null,
+        long expectedGeneration = 0)
+    {
+        if (_busy || _polling || IsDisposed || _closing
+            || (_eventStreamActive && !manual))
         {
             return;
         }
 
         _polling = true;
+        var adapter = expectedAdapter ?? SelectedAdapter;
+        var generation = expectedGeneration == 0
+            ? Volatile.Read(ref _adapterGeneration)
+            : expectedGeneration;
         try
         {
-            var adapter = SelectedAdapter;
             var snapshot = await adapter.ProbeAsync(_lifetime.Token);
-            if (!ReferenceEquals(adapter, SelectedAdapter))
+            if (_closing
+                || generation != Volatile.Read(ref _adapterGeneration)
+                || !ReferenceEquals(adapter, SelectedAdapter))
             {
                 return;
             }
 
             UpdateSnapshot(snapshot);
+            var source = _eventStreamActive
+                ? "协议事件"
+                : _fallbackPolling
+                    ? "兼容探测"
+                    : "主动探测";
+            SetOperation(
+                $"{adapter.DisplayName}：{source}快照已更新",
+                _fallbackPolling ? WarningColor : PrimaryColor);
             var statusChanged =
                 !_lastAdapterStatuses.TryGetValue(
                     adapter.Key,
@@ -383,6 +641,18 @@ internal sealed class MainForm : Form
                     $"{adapter.DisplayName}：{snapshot.Status}；"
                     + $"version={snapshot.Version}，pid={snapshot.ProcessId}。");
             }
+
+            if (_fallbackPolling
+                && adapter is ConnectorProcessAdapter
+                {
+                    SnapshotEventsSubscribed: true
+                })
+            {
+                AppendLog(
+                    $"{adapter.DisplayName}：连接器已恢复事件订阅，"
+                    + "正在退出 1 秒兼容探测。");
+                await RestartSelectedAdapterWatchAsync();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -390,6 +660,12 @@ internal sealed class MainForm : Form
         }
         catch (Exception exception)
         {
+            if (_closing
+                || generation != Volatile.Read(ref _adapterGeneration)
+                || !ReferenceEquals(adapter, SelectedAdapter))
+            {
+                return;
+            }
             _connectionLabel.Text = "● 连接检测异常";
             _connectionLabel.ForeColor = ErrorColor;
             if (manual)
@@ -418,7 +694,7 @@ internal sealed class MainForm : Form
         using var searchTimeout =
             CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         searchTimeout.CancelAfter(
-            adapter is QQMusicPlayerAdapter
+            string.Equals(adapter.Key, "qqmusic", StringComparison.OrdinalIgnoreCase)
                 ? TimeSpan.FromSeconds(12)
                 : TimeSpan.FromSeconds(20));
         try
@@ -482,7 +758,8 @@ internal sealed class MainForm : Form
         }
 
         var requiresTrack = command is PlayerCommand.PlaySelected
-            or PlayerCommand.InsertNext;
+            or PlayerCommand.InsertNext
+            or PlayerCommand.ArmNextGuard;
         var track = requiresTrack ? GetSelectedTrack() : null;
         if (requiresTrack && track is null)
         {
@@ -530,34 +807,39 @@ internal sealed class MainForm : Form
 
     private void UpdateSnapshot(PlayerSnapshot snapshot)
     {
-        _connectionLabel.Text = snapshot.Connected
-            ? $"● 已连接 · PID {snapshot.ProcessId}"
-            : "● 未连接";
         _connectionLabel.ForeColor = snapshot.Connected
             ? SuccessColor
             : ErrorColor;
 
         var adapter = SelectedAdapter;
-        var version = string.IsNullOrWhiteSpace(snapshot.Version)
+        var playerName = string.IsNullOrWhiteSpace(snapshot.Player)
+            ? adapter.DisplayName
+            : snapshot.Player;
+        var displayVersion = string.IsNullOrWhiteSpace(snapshot.Version)
             ? "未知"
-            : snapshot.Version;
-        var versionVerified = string.Equals(
-            version,
-            adapter.TestedVersion,
-            StringComparison.OrdinalIgnoreCase);
+            : snapshot.Version.Trim();
+        var versionMatches = IsVersionInTestedList(
+            displayVersion,
+            adapter.TestedVersion);
+        _connectionLabel.Text = snapshot.Connected
+            ? $"● 已连接 {playerName} · PID {snapshot.ProcessId}"
+            : $"● 未连接 {playerName}";
         _versionLabel.Text =
-            $"当前 {version} · 实测基准 {adapter.TestedVersion}"
-            + (versionVerified
+            $"当前 {displayVersion} · 实测基准 {adapter.TestedVersion}"
+            + (versionMatches
                 ? " · 已验证版本"
                 : " · 未验证版本，使用能力探测");
-        _versionLabel.ForeColor = versionVerified
+        _versionLabel.ForeColor = versionMatches
             ? SuccessColor
             : WarningColor;
         _trackLabel.Text = snapshot.Current?.DisplayName ?? "—";
-        _trackIdLabel.Text =
-            string.IsNullOrWhiteSpace(snapshot.Current?.Id)
-                ? "未解析"
-                : snapshot.Current.Id;
+        _trackIdLabel.Text = string.IsNullOrWhiteSpace(snapshot.Current?.Id)
+            ? "未解析"
+            : snapshot.Current.Id;
+        _nextTrackLabel.Text = snapshot.Next?.DisplayName ?? "—";
+        _nextSourceLabel.Text = string.IsNullOrWhiteSpace(snapshot.NextSource)
+            ? "—"
+            : snapshot.NextSource;
         _capabilitiesLabel.Text =
             BuildCapabilitiesText(adapter.Capabilities);
         ApplyCapabilities();
@@ -566,32 +848,25 @@ internal sealed class MainForm : Form
     private void ApplyCapabilities()
     {
         var capabilities = SelectedAdapter.Capabilities;
-        var isQqMusic = SelectedAdapter is QQMusicPlayerAdapter;
-        _unsafeQqNextCheckBox.Visible = isQqMusic;
-        _previousButton.Enabled = !_busy && capabilities.Previous;
-        _pauseButton.Enabled = !_busy && capabilities.Pause;
-        _resumeButton.Enabled = !_busy && capabilities.Resume;
-        _toggleButton.Enabled = !_busy && capabilities.Toggle;
-        _nextButton.Enabled = !_busy && capabilities.Next;
-        _searchButton.Enabled =
-            !_busy && !_searching && capabilities.Search;
-        _searchButton.Text = _searching ? "搜索中…" : "搜索";
-        _searchTextBox.Enabled =
-            !_busy && !_searching && capabilities.Search;
+        var operationsEnabled = !_busy && !_searching;
+        _previousButton.Enabled = operationsEnabled && capabilities.Previous;
+        _pauseButton.Enabled = operationsEnabled && capabilities.Pause;
+        _resumeButton.Enabled = operationsEnabled && capabilities.Resume;
+        _toggleButton.Enabled = operationsEnabled && capabilities.Toggle;
+        _nextButton.Enabled = operationsEnabled && capabilities.Next;
         _playSelectedButton.Enabled =
-            !_busy && capabilities.PlaySelected;
+            operationsEnabled && capabilities.PlaySelected;
+        _armNextGuardButton.Enabled =
+            operationsEnabled && capabilities.InsertNext;
         _insertNextButton.Enabled =
-            !_busy
-            && capabilities.InsertNext;
-        _insertNextButton.Text =
-            !isQqMusic
-                ? "守卫设为下一首"
-                : _unsafeQqNextCheckBox.Checked
-                    ? "原生+守卫下一首（风险）"
-                    : "守卫设为下一首";
+            operationsEnabled && capabilities.InsertNext;
+        _searchButton.Enabled = operationsEnabled && capabilities.Search;
+        _searchButton.Text = _searching ? "搜索中…" : "搜索";
+        _searchTextBox.Enabled = operationsEnabled && capabilities.Search;
+        _armNextGuardButton.Text = "仅挂下一首守卫";
+        _insertNextButton.Text = "原生插入下一首";
         _refreshButton.Enabled = !_busy && !_searching;
         _playerSelector.Enabled = !_busy && !_searching;
-        _unsafeQqNextCheckBox.Enabled = !_busy;
     }
 
     private void SetSearching(bool searching, string? message = null)
@@ -702,6 +977,27 @@ internal sealed class MainForm : Form
         });
     }
 
+    private static bool IsVersionInTestedList(
+        string version,
+        string testedVersions)
+    {
+        if (string.IsNullOrWhiteSpace(version)
+            || string.IsNullOrWhiteSpace(testedVersions))
+        {
+            return false;
+        }
+
+        return testedVersions
+            .Split(
+                ['/', ',', ';', '|'],
+                StringSplitOptions.RemoveEmptyEntries)
+            .Select(candidate => candidate.Trim())
+            .Any(candidate => string.Equals(
+                candidate,
+                version.Trim(),
+                StringComparison.OrdinalIgnoreCase));
+    }
+
     private static string BuildCapabilitiesText(
         PlayerCapabilities capabilities)
     {
@@ -715,6 +1011,7 @@ internal sealed class MainForm : Form
         if (capabilities.Next) values.Add("下一首");
         if (capabilities.InsertNext)
         {
+            values.Add("单独挂守卫");
             values.Add($"插入下一首（{capabilities.InsertNextLevel}）");
         }
 

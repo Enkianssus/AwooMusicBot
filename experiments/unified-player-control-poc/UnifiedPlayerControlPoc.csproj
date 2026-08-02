@@ -6,21 +6,20 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
-    <PlatformTarget>x86</PlatformTarget>
+    <PlatformTarget>AnyCPU</PlatformTarget>
     <RootNamespace>UnifiedPlayerControlPoc</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- This is the exact control core linked by kugou-control-ui-poc/Release-patched. -->
-    <Compile Include="..\kugou-control-poc\KugouNativeController.cs"
-             Link="Vendor\KugouNativeController.cs" />
-
-    <!-- QQ title/catalog readers are non-invasive. NativeNext is opt-in in the UI. -->
-    <Compile Include="..\qqmusic-control-poc\QQMusicNativeController.cs"
-             Link="Vendor\QQMusicNativeController.cs" />
-    <Compile Include="..\qqmusic-control-poc\QQMusicCatalogClient.cs"
-             Link="Vendor\QQMusicCatalogClient.cs" />
-    <Compile Include="..\qqmusic-control-poc\QQMusicNativeNextTransport.cs"
-             Link="Vendor\QQMusicNativeNextTransport.cs" />
+    <!--
+      The workbench talks to independent connector processes.  Keep the old
+      in-process adapters and vendor probes on disk for historical reference,
+      but compile only the protocol shell and its process adapter.
+    -->
+    <Compile Include="Program.cs" />
+    <Compile Include="MainForm.cs" />
+    <Compile Include="PlayerContracts.cs" />
+    <Compile Include="ConnectorProcessAdapter.cs" />
   </ItemGroup>
 </Project>

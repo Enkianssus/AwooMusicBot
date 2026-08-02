@@ -1,126 +1,182 @@
-# 三合一播放器连接测试
+# Unified Player Control POC — connector protocol acceptance workbench
 
-这是一个独立于 BiliNCM-TS 主程序的 WinForms 测试项目。它把网易云音乐、
-酷狗音乐和 QQ 音乐放在同一个界面中，可以选择一个播放器后连接、查看
-版本和当前歌曲，并执行该播放器实际支持的操作。
+This project is a Windows Forms acceptance client for the three independent
+player connectors.  It exercises the newline-delimited JSON (NDJSON) protocol
+over each connector process's standard input and output.  Player control code,
+native vendor probes, and player DLLs are not compiled into this workbench.
+The older experimental sources remain in this directory as historical
+references only.
 
-## 启动
+The default entry point opens the GUI.  `--smoke-test` is a non-UI protocol
+check that creates the NetEase, KuGou, and QQ Music process adapters in order,
+probes each one, prints `connected`, `version`, and `status`, and returns a
+non-zero exit code if any adapter or disposal fails.
 
-先启动要测试的播放器，然后在仓库根目录运行：
+## Build
+
+Build the connectors independently before building the workbench.  This keeps
+connector compatibility fixes isolated from the acceptance client:
 
 ```powershell
-dotnet run --project .\experiments\unified-player-control-poc
+dotnet build .\BiliNCM-Connectors\src\Netease\BiliNCM.Connector.Netease.csproj -c Release
+dotnet build .\BiliNCM-Connectors\src\Kugou\BiliNCM.Connector.Kugou.csproj -c Release
+dotnet build .\BiliNCM-Connectors\src\QQMusic\BiliNCM.Connector.QQMusic.csproj -c Release
+dotnet build .\experiments\unified-player-control-poc\UnifiedPlayerControlPoc.csproj -c Release
 ```
 
-Release 构建：
+The workbench targets `net8.0-windows10.0.19041.0` with WinForms and uses an
+`AnyCPU` host.  A connector may be x86 or x64; the host only starts it as a
+child process and does not load its native dependencies.
+
+Run the GUI with:
 
 ```powershell
-dotnet build .\experiments\unified-player-control-poc -c Release
+dotnet run --project .\experiments\unified-player-control-poc\UnifiedPlayerControlPoc.csproj
 ```
 
-构建输出：
+Run the no-UI smoke check with:
+
+```powershell
+dotnet run --project .\experiments\unified-player-control-poc\UnifiedPlayerControlPoc.csproj -- --smoke-test
+```
+
+Expected smoke output has one line per connector, for example:
 
 ```text
-experiments\unified-player-control-poc\bin\Release\
-  net8.0-windows10.0.19041.0\UnifiedPlayerControlPoc.exe
+netease: connected=False version=... status=...
+kugou: connected=False version=... status=...
+qqmusic: connected=False version=... status=...
 ```
 
-项目为 `x86 / .NET 8 Windows Desktop`，当前构建不是 self-contained。
-运行机器需要安装 .NET 8 Desktop Runtime x86。
+`connected=False` is a valid probe result when the player is not running.  A
+missing executable, malformed protocol response, timeout, or disposal error
+is reported on stderr and makes the command fail.
 
-## 结果状态
+## Protocol acceptance surface
 
-- `Accepted`：播放器或操作系统接受了命令，但缺少可靠状态字段继续验证。
-- `Applied`：观察到播放器状态或歌曲发生变化。
-- `Verified`：精确观察到目标歌曲。
-- `Indeterminate`：命令被接收，但队列或歌曲结果无法准确证明。
-- `Rejected`：发送失败、版本不匹配或安全检查未通过。
-- `Unsupported`：该播放器没有相应的安全能力。
+Every connector speaks protocol version 1 using one JSON object per line.  The
+acceptance sequence is:
 
-界面不会把“消息投递成功”直接显示成“歌曲操作成功”。
+1. `ping` negotiates the connector id, version, capabilities, and optional
+   features.
+2. `probe` obtains the current snapshot and remains the compatibility fallback.
+3. `search` returns connector-native `PlayerTrack` data, including the opaque
+   native payload needed by `PlaySelected` or `InsertNext`.
+4. `execute` sends a player command and returns an explicit outcome such as
+   `Accepted`, `Applied`, `Verified`, `Indeterminate`, `Rejected`, or
+   `Unsupported`.
+5. `shutdown` asks the child process to exit cleanly.
 
-## 网易云音乐
+Connectors that advertise `snapshot-events-v1` accept `subscribe` and emit
+`event`/`snapshot` envelopes.  The host consumes exact event snapshots while
+the subscription is healthy and falls back to `probe` when a connector does
+not advertise the feature, the stream closes, or the event source restarts.
+Event snapshots include `Next` and `NextSource` when the connector can identify
+the pending/next track; an empty value means that no reliable next-track
+identity is available.
 
-实测基准：`3.1.37.205354`。
+## Player-specific checks
 
-- 使用 `orpheus_ipc_window + 共享内存 + 0x8001`。
-- 使用 `SendMessageTimeout`，网易云窗口卡死不会永久卡住本程序。
-- 发送前记录网易云窗口的可见、最小化和前台状态；发送后若客户端把自己
-  弹出或抢到前台，会尽量恢复原状态。
-- 共享内存名称串行生成并处理同一毫秒冲突。
-- 当前歌曲来自窗口标题和 `webdata/file/playingList`。
-- 相同标题对应多个 ID 时保持“未解析”，不随便选择第一个 ID。
-- 支持搜索、指定播放、暂停、恢复、上下曲和 `addToNext`。
-- “守卫设为下一首”会先发送 `addToNext`，同时监测实际切歌；若实际
-  下一首不匹配，则先暂停错误歌曲，再立即指定播放目标。
+### NetEase Cloud Music
 
-## 酷狗音乐
+Verify that `ping` reports the connector capabilities, then check `probe`,
+search, `PlaySelected`, `Toggle`, `Previous`, `Next`, and `InsertNext`.  If
+`snapshot-events-v1` is advertised, subscribe before changing tracks and check
+that the UI receives an event without requiring a tight status loop.  Stop the
+player and confirm that the host reports a disconnected snapshot rather than
+crashing.
 
-实测基准：`20.0.81.27563`。
+### KuGou Music
 
-控制核心与 `kugou-control-ui-poc/Release-patched` 使用同一份
-`KugouNativeController.cs`。
+Search uses two HTTPS paths: the mobile catalog endpoint first and the signed
+`gateway.kugou.com` mixed-search compatibility path second.  Plain HTTP search
+is disabled by default.  It is only permitted after an explicit opt-in:
 
-- 上下曲和播放/暂停使用酷狗内部 `WM_HOTKEY` ID。
-- 在线点歌使用 `Local\KuGouDataExchange` 公布的 `TaskListener` 窗口。
-- 投递前会验证窗口类名和目标进程确实属于 `KuGou`。
-- 搜索优先使用 HTTPS；遇到 TLS、连接失败或服务端拒绝时，自动回退到
-  原可用 PoC 使用的 HTTP 接口，并在连接状态中显示“HTTP 兼容回退”。
-- 把选中的精确搜索结果构造成点歌负载；HTTP 只用于无凭据的公开搜索，
-  本机播放器控制仍然全部走本地 IPC。
-- 不执行旧 PoC 的自动 `Stop → 重试`，避免弱网时中断正在加载的歌曲。
-- 不自动扫描或关闭会员弹窗。
-- 酷狗没有可靠的播放/暂停状态，所以只开放 Toggle，不伪装成明确 Pause/Resume。
-- “守卫设为下一首”在实验队列负载之外增加切歌监测；若实际下一首
-  不匹配，会使用明确的 Stop 命令先静音，再立即投递目标点歌负载。
+```powershell
+$env:BILINCM_KUGOU_ALLOW_HTTP_SEARCH_FALLBACK = "1"
+dotnet run --project .\experiments\unified-player-control-poc\UnifiedPlayerControlPoc.csproj
+```
 
-## QQ 音乐
+Player control remains local KuGou IPC; the search opt-in does not authorize a
+remote control path.  Verify the status text identifies the HTTPS path or the
+explicit HTTP fallback.
 
-实测基准：`22.22`。
+`InsertNext` means “insert this selected track after the current item.”
+`ArmNextGuard` is a separate, idempotent guard operation for a target that is
+already pending; it must not insert a second queue row.  Exercise both a normal
+insert and a wrong-song transition, and check that the result is bounded and
+reported as `Accepted`, `Verified`, or `Indeterminate` rather than silently
+duplicating the track.  `Next` is the direct next-track command.  The
+`NextSource` snapshot field records where the connector obtained next-track
+metadata (or is empty when no reliable source exists).
 
-- 普通播放控制使用 QQMusic.exe 自己的 `/playcontrol` 单实例命令。
-- 指定播放使用 `/playbysongid`。
-- 普通命令只等待单实例辅助进程 400 ms；上下曲快速验证 1.4 秒，指定
-  播放快速验证 2.2 秒，之后释放界面并由后台轮询继续更新状态。
-- QQ 搜索总等待时间限制为 12 秒；超时或异常后会强制恢复默认鼠标、
-  播放控制和搜索按钮，不会让界面一直停在忙碌状态。
-- 搜索为独立后台状态，不再锁住暂停、恢复、上下曲和下一首按钮。
-- QQMusic.exe 优先从运行进程发现，不再把普通控制绑定到固定安装目录。
-- 当前歌曲使用窗口标题，避免默认把私有 `QQMusicApi.dll` 加载到测试程序。
+### QQ Music
 
-默认的“守卫设为下一首”由测试程序自己保存目标歌曲，并在登记时取得
-QQMusic 当前的 Windows 音频会话、记住每个会话原来的静音状态。守卫直接
-每 2 ms 读取已知 QQ 主窗口标题，不再在每轮枚举全部窗口；标题一发生变化，
-先静音 QQ 音频，再判断新歌曲。若新歌曲错误，则在静音期间发送
-`/playcontrol 'pause'` 和 `/playbysongid`，确认窗口标题已经变成目标歌曲后
-才恢复原来的静音状态（原本就是静音的会继续保持静音）。
+The connector uses exact, versioned compatibility profiles for QQ Music 22.22
+and 22.41.  A build, architecture, or DLL hash outside a tested profile must be
+rejected safely; it must not fall through to an unverified native operation.
+Verify this by probing an unsupported installation (or a deliberately mismatched
+profile fixture) and checking for a clear `Rejected`/unsupported status.  Keep
+the normal `InsertNext` and guarded-next checks separate from any profile-gated
+native capability.
 
-若 QQ 同时提供 Windows 系统媒体时间线，守卫会在自然切歌前约 180 ms
-预静音，以覆盖“声音先开始、窗口标题随后才更新”的竞态；两秒内没有发生
-切歌会自动恢复，避免 QQ 一直无声。若系统没有发现 QQ 音频会话，则自动
-退回标题监测加 `pause` 接管。该方法不修改 QQ 进程，跨小版本适应性与普通
-指定播放接近；它仍不是真正的 QQ 内部队列，手动瞬间切歌且标题通知晚于
-音频输出时只能尽量缩短竞态。测试程序退出后，待命任务会丢失并恢复静音状态。
+## Manual acceptance checklist
 
-勾选红色风险开关后，会在守卫之外叠加 QQ 22.22 原生“下一首播放”。
-该方法会临时修改 QQMusic.dll 目标进程代码，因此仍严格要求：
+1. Build all three connectors and this project.
+2. Set connector paths (see below), start one supported player, and run the
+   smoke test.  Confirm that all three lines are present and that failures are
+   non-zero.
+3. Open the GUI, select each connector, and press **连接 / 刷新**. Check
+   process id, version, connection state, and capability text.
+4. Check the log: the UI automatically sends `ping` and `subscribe`. Verify an
+   initial `snapshot-events-v1` snapshot plus another snapshot after a title or
+   queue change. Test an older connector without the feature to verify the
+   one-second `probe` fallback.
+5. Search for a known song, play the selected result, and verify the reported
+   operation outcome and current-track identity.
+6. Exercise `Toggle`, `Previous`, and `Next`; confirm that the host remains
+   responsive when the player is closed or refuses a command.
+7. Exercise `InsertNext`, then `ArmNextGuard` for an already pending target.
+   Confirm that the queue is not duplicated and that `Next`/`NextSource` fields
+   update when the target is observed.
+8. For KuGou, repeat search once with HTTP fallback disabled and once with
+   `BILINCM_KUGOU_ALLOW_HTTP_SEARCH_FALLBACK=1`; record which status is shown.
+9. For QQ Music, verify that an unknown profile is refused and that no native
+   mutation is attempted.
+10. Send `shutdown` and confirm that each child connector exits without a
+    lingering process.
 
-- QQ 音乐 `22.22`；
-- `F:\Program Files\QQMusic` 的实验环境；
-- `QQMusic.dll` SHA-256、目标机器码和所有底层阶段完全匹配。
+## Connector path configuration
 
-任何一项不匹配都会拒绝执行。这个能力只用于保留原 PoC 的现场验证，
-不代表适合直接放进正式点歌机。
+The process adapter searches the configured connector root and supports a
+per-connector executable override.  Use a root containing `netease`, `kugou`,
+and `qqmusic` connector output directories:
 
-## 软件更新后的测试顺序
+```powershell
+$env:BILINCM_CONNECTOR_ROOT = "C:\path\to\connector-root"
+```
 
-播放器更新后先做以下测试，不要直接从“设为下一首”开始：
+For a precise executable path, set one or more overrides (the value is the
+complete path to the `.exe`):
 
-1. 选择播放器并确认进程、版本和连接状态。
-2. 确认当前歌曲标题正确。
-3. 测试暂停/恢复或 Toggle。
-4. 准备至少两首普通非 VIP 歌曲，测试上下曲。
-5. 搜索并立即播放一首明确的“歌手 + 歌名”。
-6. 最后测试插入下一首，并根据 `Accepted/Verified/Indeterminate` 判断结果。
+```powershell
+$env:BILINCM_CONNECTOR_NETEASE_PATH = "C:\path\to\BiliNCM.Connector.Netease.exe"
+$env:BILINCM_CONNECTOR_KUGOU_PATH = "C:\path\to\BiliNCM.Connector.Kugou.exe"
+$env:BILINCM_CONNECTOR_QQMUSIC_PATH = "C:\path\to\BiliNCM.Connector.QQMusic.exe"
+```
 
-QQ 原生下一首在 DLL 更新后应保持关闭，直到重新完成版本适配。
+The per-connector variables take precedence over `BILINCM_CONNECTOR_ROOT`.
+These variables are intentionally external to the project; no installation
+drive or player path is hard-coded in the acceptance UI.
+
+## Troubleshooting
+
+- If a smoke line reports an executable error, set the corresponding
+  `BILINCM_CONNECTOR_*_PATH` to the published executable and run again.
+- If `ping` succeeds but `subscribe` is rejected, continue with `probe`; this
+  is the protocol-v1 compatibility path.
+- If a connector emits malformed JSON or exits early, preserve its stderr and
+  the acceptance log with the operation outcome.  Do not infer success from a
+  transport write alone.
+- Keep `BILINCM_KUGOU_ALLOW_HTTP_SEARCH_FALLBACK` unset unless the insecure
+  compatibility path is an intentional test condition.

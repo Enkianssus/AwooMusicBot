@@ -97,6 +97,17 @@ internal sealed record BackgroundOpenResult(
     int Attempts = 1,
     int Privilege = 0);
 
+internal sealed record KugouResolvedSearchTrack(
+    string Query,
+    string FileName,
+    string Hash,
+    long DurationMilliseconds,
+    string SongName,
+    string SingerName,
+    long AudioId,
+    long MixSongId,
+    int Privilege);
+
 internal sealed record KugouPlaybackState(
     string Source,
     string WindowTitle,
@@ -1092,11 +1103,153 @@ internal static class KugouNativeController
             timeout: timeout);
     }
 
+    public static Task<BackgroundOpenResult> SearchAsNextWithFreshContextAsync(
+        string query,
+        TimeSpan? timeout = null)
+    {
+        var context = $"KugouControlPoc-{Guid.NewGuid():N}";
+        return SearchBackgroundAsync(
+            query,
+            playImmediately: false,
+            forceRecovery: false,
+            timeout: timeout,
+            payloadOverride: new Dictionary<string, object?>
+            {
+                ["Source"] = context,
+                ["From"] = context,
+                ["QueueSource"] = context
+            },
+            allowRecovery: false);
+    }
+
+    public static async Task<KugouResolvedSearchTrack> ResolveSearchTrackAsync(
+        string query)
+    {
+        query = query.Trim();
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            throw new ArgumentException("Search query cannot be empty.", nameof(query));
+        }
+
+        var endpoint =
+            "http://mobilecdn.kugou.com/api/v3/search/song"
+            + "?format=json"
+            + $"&keyword={Uri.EscapeDataString(query)}"
+            + "&page=1&pagesize=1&showtype=1";
+        using var response = await HttpClient.GetAsync(endpoint).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        await using var content = await response.Content.ReadAsStreamAsync()
+            .ConfigureAwait(false);
+        using var document = await JsonDocument.ParseAsync(content)
+            .ConfigureAwait(false);
+
+        if (!document.RootElement.TryGetProperty("data", out var data)
+            || !data.TryGetProperty("info", out var info)
+            || info.ValueKind != JsonValueKind.Array
+            || info.GetArrayLength() == 0)
+        {
+            throw new InvalidOperationException(
+                $"KuGou search returned no result for: {query}");
+        }
+
+        var song = info[0];
+        var songName = ReadJsonText(song, "songname");
+        var singerName = ReadJsonText(song, "singername");
+        var fileName = ReadJsonText(song, "filename");
+        if (string.IsNullOrWhiteSpace(fileName))
+        {
+            fileName = string.IsNullOrWhiteSpace(singerName)
+                ? songName
+                : $"{singerName} - {songName}";
+        }
+
+        var hash = ReadJsonText(song, "hash").ToUpperInvariant();
+        if (hash.Length != 32)
+        {
+            throw new InvalidOperationException(
+                "KuGou search result did not contain a valid 32-character hash.");
+        }
+
+        var duration = ReadJsonLong(song, "timelength");
+        if (duration <= 0)
+        {
+            duration = ReadJsonLong(song, "duration") * 1000;
+        }
+
+        return new KugouResolvedSearchTrack(
+            query,
+            fileName,
+            hash,
+            duration,
+            songName,
+            singerName,
+            ReadJsonLong(song, "audio_id"),
+            ReadJsonLong(song, "mixsongid"),
+            checked((int)ReadJsonLong(song, "privilege")));
+    }
+
+    public static Task<BackgroundOpenResult> SearchAsAnchoredNextBackgroundAsync(
+        string query,
+        KugouPlaybackState anchor,
+        TimeSpan? timeout = null)
+    {
+        return SearchBackgroundAsync(
+            query,
+            playImmediately: false,
+            forceRecovery: false,
+            timeout: timeout,
+            payloadOverride: new Dictionary<string, object?>
+            {
+                ["playqueuemodeltype"] = anchor.SongTable,
+                ["playqueuelistid"] = anchor.SongList,
+                ["playqueuesongid"] = anchor.SongItem
+            },
+            allowRecovery: false);
+    }
+
+    public static Task<BackgroundOpenResult> SearchWithQueueInfoAsync(
+        string query,
+        string play,
+        string insert,
+        string force,
+        string clear,
+        string index,
+        string addPlayQueue,
+        string addToDefaultList,
+        nuint data = 20,
+        TimeSpan? timeout = null)
+    {
+        return SearchBackgroundAsync(
+            query,
+            playImmediately: play == "1",
+            forceRecovery: false,
+            timeout: timeout,
+            queueInfoOverride: new Dictionary<string, string>
+            {
+                ["Play"] = play,
+                ["Insert"] = insert,
+                ["Force"] = force,
+                ["Clear"] = clear,
+                ["Index"] = index,
+                ["AddToDefaultList"] = addToDefaultList
+            },
+            payloadOverride: new Dictionary<string, object?>
+            {
+                ["AddPlayQueue"] = addPlayQueue == "1" ? 1 : 0
+            },
+            deliveryData: data,
+            allowRecovery: false);
+    }
+
     private static async Task<BackgroundOpenResult> SearchBackgroundAsync(
         string query,
         bool playImmediately,
         bool forceRecovery,
-        TimeSpan? timeout)
+        TimeSpan? timeout,
+        IReadOnlyDictionary<string, string>? queueInfoOverride = null,
+        IReadOnlyDictionary<string, object?>? payloadOverride = null,
+        nuint deliveryData = 20,
+        bool allowRecovery = true)
     {
         query = query.Trim();
         if (string.IsNullOrWhiteSpace(query))
@@ -1201,18 +1354,29 @@ internal static class KugouNativeController
             ["NoPlayAds"] = 1,
             ["QueueInfo"] = new Dictionary<string, string>
             {
-                ["Play"] = playImmediately ? "1" : "0",
+                ["Play"] = queueInfoOverride?.GetValueOrDefault("Play")
+                    ?? (playImmediately ? "1" : "0"),
                 ["PlayAll"] = "0",
-                ["Clear"] = "0",
-                ["Insert"] = playImmediately ? "0" : "1",
-                ["Force"] = playImmediately ? "1" : "0",
+                ["Clear"] = queueInfoOverride?.GetValueOrDefault("Clear") ?? "0",
+                ["Insert"] = queueInfoOverride?.GetValueOrDefault("Insert")
+                    ?? (playImmediately ? "0" : "1"),
+                ["Force"] = queueInfoOverride?.GetValueOrDefault("Force")
+                    ?? (playImmediately ? "1" : "0"),
                 ["IsMV"] = "0",
-                ["Index"] = "0",
-                ["AddToDefaultList"] = "1",
+                ["Index"] = queueInfoOverride?.GetValueOrDefault("Index") ?? "0",
+                ["AddToDefaultList"] =
+                    queueInfoOverride?.GetValueOrDefault("AddToDefaultList") ?? "1",
                 ["climax"] = "0"
             },
             ["QueueSource"] = string.Empty
         };
+        if (payloadOverride is not null)
+        {
+            foreach (var pair in payloadOverride)
+            {
+                payloadObject[pair.Key] = pair.Value;
+            }
+        }
         var payload = JsonSerializer.Serialize(payloadObject);
         if (playImmediately && forceRecovery)
         {
@@ -1250,12 +1414,12 @@ internal static class KugouNativeController
         var first = SendBackgroundUtf8Payload(
             $"{filename} [{hash}]",
             payload,
-            20,
+            deliveryData,
             playImmediately ? TimeSpan.FromSeconds(3) : timeout,
             identifySender: false,
             expectTrackChange: playImmediately);
         first = first with { Privilege = privilege };
-        if (!playImmediately || first.TrackChanged)
+        if (!allowRecovery || !playImmediately || first.TrackChanged)
         {
             return first;
         }

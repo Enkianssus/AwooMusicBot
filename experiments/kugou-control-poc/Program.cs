@@ -57,9 +57,438 @@ internal static class Program
             return 0;
         }
 
+        if (command == "inspect-window-objects")
+        {
+            WriteJson(KugouWindowObjectProbe.Inspect());
+            return 0;
+        }
+
+        if (command == "inspect-ipc-window-object")
+        {
+            WriteJson(KugouWindowObjectProbe.InspectIpcWindow());
+            return 0;
+        }
+
+        if (command == "inspect-playback-listeners")
+        {
+            WriteJson(KugouWindowObjectProbe.InspectPlaybackListeners());
+            return 0;
+        }
+
+        if (command == "inspect-playback-directions")
+        {
+            WriteJson(
+                KugouWindowObjectProbe.InspectPlaybackDirectionCandidates());
+            return 0;
+        }
+
+        if (command == "inspect-playback-mode-listeners")
+        {
+            WriteJson(
+                KugouWindowObjectProbe.InspectPlaybackModeListeners());
+            return 0;
+        }
+
+        if (command == "inspect-playback-insertion-anchor")
+        {
+            WriteJson(KugouPlaybackAnchorResetProbe.Inspect());
+            return 0;
+        }
+
+        if (command == "reset-playback-insertion-anchor")
+        {
+            if (args.Length != 2
+                || !int.TryParse(args[1], out var expectedCurrentItem)
+                || expectedCurrentItem <= 0)
+            {
+                Console.Error.WriteLine(
+                    "Usage: reset-playback-insertion-anchor <expected-current-item-id>");
+                return 2;
+            }
+
+            var result = KugouPlaybackAnchorResetProbe.ResetToCurrent(
+                expectedCurrentItem);
+            WriteJson(result);
+            return result.Applied ? 0 : 5;
+        }
+
+        if (command == "set-playback-insertion-anchor-id")
+        {
+            if (args.Length != 3
+                || !int.TryParse(args[1], out var expectedAnchorItem)
+                || !int.TryParse(args[2], out var requestedAnchorItem)
+                || expectedAnchorItem <= 0
+                || requestedAnchorItem <= 0)
+            {
+                Console.Error.WriteLine(
+                    "Usage: set-playback-insertion-anchor-id <expected-anchor-item-id> <requested-anchor-item-id>");
+                return 2;
+            }
+
+            var result = KugouPlaybackAnchorResetProbe.SetForExperiment(
+                expectedAnchorItem,
+                requestedAnchorItem);
+            WriteJson(result);
+            return result.Applied ? 0 : 5;
+        }
+
+        if (command == "set-playback-direction")
+        {
+            if (args.Length != 3
+                || !int.TryParse(args[1], out var listenerIndex)
+                || !int.TryParse(args[2], out var direction))
+            {
+                Console.Error.WriteLine(
+                    "Usage: set-playback-direction <41|81> <0|1|2>");
+                return 2;
+            }
+
+            var result = KugouWindowObjectProbe.SetPlaybackDirection(
+                listenerIndex,
+                direction);
+            WriteJson(result);
+            return result.Written ? 0 : 5;
+        }
+
         if (command == "inspect-ipc")
         {
             WriteJson(KugouNativeController.InspectIpcEndpoint());
+            return 0;
+        }
+
+        if (command == "inspect-modules")
+        {
+            var processes = Process.GetProcessesByName("KuGou")
+                .Select(process =>
+                {
+                    try
+                    {
+                        return new
+                        {
+                            process.Id,
+                            MainWindowHandle = process.MainWindowHandle.ToInt64(),
+                            process.MainWindowTitle,
+                            Modules = process.Modules
+                                .Cast<ProcessModule>()
+                                .Select(module => new
+                                {
+                                    module.ModuleName,
+                                    module.FileName,
+                                    BaseAddress = module.BaseAddress.ToInt64(),
+                                    module.ModuleMemorySize
+                                })
+                                .ToArray()
+                        };
+                    }
+                    catch (Exception exception)
+                    {
+                        return new
+                        {
+                            process.Id,
+                            MainWindowHandle = process.MainWindowHandle.ToInt64(),
+                            process.MainWindowTitle,
+                            Modules = new[]
+                            {
+                                new
+                                {
+                                    ModuleName = "<error>",
+                                    FileName = $"{exception.GetType().Name}: {exception.Message}",
+                                    BaseAddress = 0L,
+                                    ModuleMemorySize = 0
+                                }
+                            }
+                        };
+                    }
+                })
+                .ToArray();
+            WriteJson(processes);
+            return 0;
+        }
+
+        if (command == "inspect-queue-controller")
+        {
+            WriteJson(KugouQueueNativeProbe.InspectController());
+            return 0;
+        }
+
+        if (command == "inspect-queue-insertion-state")
+        {
+            WriteJson(KugouQueueNativeProbe.InspectInsertionState());
+            return 0;
+        }
+
+        if (command == "inspect-insertion-cursor-resolution")
+        {
+            WriteJson(KugouQueueNativeProbe.InspectInsertionCursorResolution());
+            return 0;
+        }
+
+        if (command == "capture-queue-insert-args")
+        {
+            if (args.Length < 9)
+            {
+                Console.Error.WriteLine(
+                    "Usage: capture-queue-insert-args <Play> <Insert> <Force> <Clear> <Index> <AddPlayQueue> <AddToDefaultList> <query>");
+                return 2;
+            }
+
+            var query = string.Join(' ', args.Skip(8)).Trim();
+            var result = await KugouQueueNativeProbe.CaptureInsertArgumentsAsync(
+                query,
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                args[5],
+                args[6],
+                args[7]);
+            WriteJson(result);
+            return result.OriginalSlotRestored
+                && result.InvocationCount > 0
+                ? 0
+                : 5;
+        }
+
+        if (command == "capture-insertion-cursor")
+        {
+            var query = string.Join(' ', args.Skip(1)).Trim();
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                Console.Error.WriteLine(
+                    "Usage: capture-insertion-cursor <search query>");
+                return 2;
+            }
+
+            var result = await KugouQueueNativeProbe
+                .CaptureInsertionCursorDuringInsertAsync(query);
+            WriteJson(result);
+            return result.OriginalSlotRestored
+                && result.InvocationCount > 0
+                ? 0
+                : 5;
+        }
+
+        if (command == "capture-model-record-insert")
+        {
+            var query = string.Join(' ', args.Skip(1)).Trim();
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                Console.Error.WriteLine(
+                    "Usage: capture-model-record-insert <search query>");
+                return 2;
+            }
+
+            var result = await KugouQueueNativeProbe
+                .CaptureModelRecordInsertionAsync(query);
+            WriteJson(result);
+            return result.OriginalCallRestored
+                && result.InvocationCount > 0
+                && result.CompletionCount > 0
+                ? 0
+                : 5;
+        }
+
+        if (command == "reset-anchor-history")
+        {
+            var result = KugouAnchorHistoryResetProbe.Reset();
+            WriteJson(result);
+            return result.RemoteExitCode == 1
+                && result.ResetToCurrentAnchor
+                && result.TrackUnchanged
+                    ? 0
+                    : 5;
+        }
+
+        if (command == "inspect-ui-queue-controller")
+        {
+            WriteJson(KugouQueueNativeProbe.InspectUiController());
+            return 0;
+        }
+
+        if (command == "read-ui-queue-position")
+        {
+            WriteJson(KugouQueueNativeProbe.ReadUiQueuePosition());
+            return 0;
+        }
+
+        if (command == "probe-playback-position-memory")
+        {
+            WriteJson(KugouPlaybackPositionMemoryProbe.Run());
+            return 0;
+        }
+
+        if (command == "probe-true-insert-next")
+        {
+            var query = string.Join(' ', args.Skip(1)).Trim();
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                Console.Error.WriteLine(
+                    "Usage: probe-true-insert-next <search query>");
+                return 2;
+            }
+
+            var result = await KugouTrueNextProbe.RunAsync(query);
+            WriteJson(result);
+            return result.TargetBecameCurrent ? 0 : 5;
+        }
+
+        if (command == "resolve-search-track")
+        {
+            var query = string.Join(' ', args.Skip(1)).Trim();
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                Console.Error.WriteLine("Usage: resolve-search-track <search query>");
+                return 2;
+            }
+
+            WriteJson(await KugouNativeController.ResolveSearchTrackAsync(query));
+            return 0;
+        }
+
+        if (command == "probe-insertion-anchor")
+        {
+            var separator = Array.IndexOf(args, "--then");
+            if (separator <= 1 || separator >= args.Length - 1)
+            {
+                Console.Error.WriteLine(
+                    "Usage: probe-insertion-anchor <first query> --then <second query>");
+                return 2;
+            }
+
+            var firstQuery = string.Join(' ', args.Skip(1).Take(separator - 1));
+            var secondQuery = string.Join(' ', args.Skip(separator + 1));
+            var result = await KugouInsertionAnchorProbe.RunAsync(
+                firstQuery,
+                secondQuery);
+            WriteJson(result);
+            return result.Candidates.Count == 1 ? 0 : 5;
+        }
+
+        if (command == "probe-insertion-anchor-values")
+        {
+            var separator = Array.IndexOf(args, "--then");
+            if (separator <= 1 || separator >= args.Length - 1)
+            {
+                Console.Error.WriteLine(
+                    "Usage: probe-insertion-anchor-values <first query> --then <second query>");
+                return 2;
+            }
+
+            var firstQuery = string.Join(' ', args.Skip(1).Take(separator - 1));
+            var secondQuery = string.Join(' ', args.Skip(separator + 1));
+            var result = await KugouInsertionAnchorValueProbe.RunAsync(
+                firstQuery,
+                secondQuery);
+            WriteJson(result);
+            return result.Candidates.Count == 1 ? 0 : 5;
+        }
+
+        if (command == "reset-insertion-anchor")
+        {
+            var result = KugouQueueNativeProbe.ResetInsertionAnchor();
+            WriteJson(result);
+            return result.Reset ? 0 : 5;
+        }
+
+        if (command == "inspect-insertion-anchors")
+        {
+            WriteJson(KugouQueueNativeProbe.CaptureInsertionAnchors());
+            return 0;
+        }
+
+        if (command == "probe-reset-anchor-insert-next")
+        {
+            var separator = Array.IndexOf(args, "--then");
+            if (separator <= 1 || separator >= args.Length - 1)
+            {
+                Console.Error.WriteLine(
+                    "Usage: probe-reset-anchor-insert-next <dirty query> --then <expected next query>");
+                return 2;
+            }
+
+            var dirtyQuery = string.Join(' ', args.Skip(1).Take(separator - 1));
+            var expectedQuery = string.Join(' ', args.Skip(separator + 1));
+            var result = await KugouResetAnchorInsertProbe.RunAsync(
+                dirtyQuery,
+                expectedQuery);
+            WriteJson(result);
+            return result.ExpectedTrackPlayed ? 0 : 5;
+        }
+
+        if (command == "query-queue-ids-by-hash")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine(
+                    "用法：query-queue-ids-by-hash <32位歌曲hash> [modelType]。");
+                return 2;
+            }
+
+            var modelType = args.Length >= 3
+                && int.TryParse(args[2], out var parsedModelType)
+                    ? parsedModelType
+                    : 6;
+            var vtableOffset = args.Length >= 4
+                ? Convert.ToInt32(args[3], 16)
+                : 0xA8;
+            WriteJson(KugouQueueNativeProbe.QueryQueueIdsByHash(
+                args[1],
+                modelType,
+                vtableOffset));
+            return 0;
+        }
+
+        if (command == "scan-hash-memory")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine(
+                    "用法：scan-hash-memory <32位歌曲hash>。");
+                return 2;
+            }
+
+            WriteJson(KugouProcessHashScanner.Scan(args[1]));
+            return 0;
+        }
+
+        if (command == "scan-pointer-memory")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine(
+                    "用法：scan-pointer-memory <十进制或 0x 十六进制地址>。");
+                return 2;
+            }
+
+            var address = args[1].StartsWith(
+                "0x",
+                StringComparison.OrdinalIgnoreCase)
+                    ? Convert.ToInt64(args[1][2..], 16)
+                    : Convert.ToInt64(args[1]);
+            WriteJson(KugouProcessHashScanner.ScanPointer(address));
+            return 0;
+        }
+
+        if (command == "read-memory-dwords")
+        {
+            if (args.Length < 3)
+            {
+                Console.Error.WriteLine(
+                    "用法：read-memory-dwords <地址> <数量>。");
+                return 2;
+            }
+
+            var address = args[1].StartsWith(
+                "0x",
+                StringComparison.OrdinalIgnoreCase)
+                    ? Convert.ToInt64(args[1][2..], 16)
+                    : Convert.ToInt64(args[1]);
+            var count = Convert.ToInt32(args[2]);
+            WriteJson(new
+            {
+                Address = address,
+                Values = KugouProcessHashScanner.ReadDwords(address, count)
+            });
             return 0;
         }
 
@@ -165,6 +594,56 @@ internal static class Program
                 && searchResult.ForegroundUnchanged
                 ? 0
                 : 5;
+        }
+
+        if (command == "background-search-fresh-next")
+        {
+            var query = string.Join(' ', args.Skip(1)).Trim();
+            var searchResult =
+                await KugouNativeController.SearchAsNextWithFreshContextAsync(query);
+            WriteJson(searchResult);
+            return searchResult.Sent
+                && searchResult.ForegroundUnchanged
+                ? 0
+                : 5;
+        }
+
+        if (command == "background-search-anchor-next")
+        {
+            var query = string.Join(' ', args.Skip(1)).Trim();
+            var anchor = KugouNativeController.ReadPlaybackState();
+            var searchResult =
+                await KugouNativeController.SearchAsAnchoredNextBackgroundAsync(
+                    query,
+                    anchor);
+            WriteJson(new { Anchor = anchor, Result = searchResult });
+            return searchResult.Sent
+                && searchResult.ForegroundUnchanged
+                ? 0
+                : 5;
+        }
+
+        if (command == "background-search-custom")
+        {
+            if (args.Length < 9)
+            {
+                Console.Error.WriteLine(
+                    "用法：background-search-custom <Play> <Insert> <Force> <Clear> <Index> <AddPlayQueue> <AddToDefaultList> <关键词>");
+                return 2;
+            }
+
+            var query = string.Join(' ', args.Skip(8)).Trim();
+            var result = await KugouNativeController.SearchWithQueueInfoAsync(
+                query,
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                args[5],
+                args[6],
+                args[7]);
+            WriteJson(result);
+            return result.Sent ? 0 : 5;
         }
 
         if (command == "background-open-file")
@@ -489,6 +968,7 @@ internal static class Program
               KugouControlPoc background-hotkey-next
               KugouControlPoc direct-next
               KugouControlPoc direct-previous
+              KugouControlPoc reset-anchor-history
               KugouControlPoc direct-toggle
               KugouControlPoc direct-stop
             """);

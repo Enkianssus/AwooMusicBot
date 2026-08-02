@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  planImmediatePlaybackCommand,
+  planObservedNextAction,
   planQueueHeadMutation,
-  queueSongIdentity
+  queueSongIdentity,
+  shouldDeferManagedTrackObservation,
+  shouldPreserveGuardAfterImmediate,
+  shouldRepairObservedNext,
+  tracksHaveDifferentStableIds,
+  tracksRepresentSameSong
 } from '../electron/queue-head-policy.ts';
 
 const song = id => queueSongIdentity(
@@ -62,4 +69,211 @@ test('changing an already inserted head while paused only retargets its guard', 
     hadRegisteredNext: true,
     isPlaying: false
   }), 'arm-only');
+});
+
+test('observed fallback ID still matches the numeric queue item metadata', () => {
+  assert.equal(tracksRepresentSameSong(
+    {
+      Id: '3404096928',
+      SongName: 'WannaCry',
+      ArtistName: 'Ninajirachi / Porter Robinson'
+    },
+    {
+      id: 'WannaCry|Ninajirachi、Porter Robinson',
+      title: 'WannaCry',
+      artist: 'Ninajirachi、Porter Robinson'
+    }
+  ), true);
+});
+
+test('different stable IDs are an authoritative track transition', () => {
+  assert.equal(tracksHaveDifferentStableIds(
+    { id: '1839140774', title: 'Musician', artist: 'Porter Robinson' },
+    { id: '3404096928', title: 'Musician', artist: 'Porter Robinson' }
+  ), true);
+});
+
+test('title fallback becoming a stable ID is metadata enrichment, not a transition', () => {
+  assert.equal(tracksHaveDifferentStableIds(
+    { id: 'Musician|Porter Robinson', title: 'Musician', artist: 'Porter Robinson' },
+    { id: '1839140774', title: 'Musician', artist: 'Porter Robinson' }
+  ), false);
+});
+
+test('same title from a different artist is not treated as the queue head', () => {
+  assert.equal(tracksRepresentSameSong(
+    { Id: '1', SongName: 'Home', ArtistName: 'Artist A' },
+    { id: 'Home|Artist B', title: 'Home', artist: 'Artist B' }
+  ), false);
+});
+
+test('different stable IDs stay different even when metadata is identical', () => {
+  assert.equal(tracksRepresentSameSong(
+    { Id: '111', SongName: 'Same', ArtistName: 'Artist' },
+    { id: '222', title: 'Same', artist: 'Artist' }
+  ), false);
+});
+
+test('exact platform ID remains authoritative when metadata is incomplete', () => {
+  assert.equal(tracksRepresentSameSong(
+    { Id: '218338', SongName: '开不了口', ArtistName: '周杰伦' },
+    { id: '218338', title: '', artist: '' }
+  ), true);
+});
+
+test('real next-track observation suppresses duplicate insertion', () => {
+  const expected = {
+    Id: '3404096928',
+    SongName: 'WannaCry',
+    ArtistName: 'Ninajirachi/Porter Robinson'
+  };
+  assert.equal(shouldRepairObservedNext(expected, {
+    id: '3404096928',
+    title: 'WannaCry',
+    artist: 'Ninajirachi/Porter Robinson'
+  }), false);
+});
+
+test('missing or mismatched next-track observation requests repair', () => {
+  const expected = {
+    Id: '3404096928',
+    SongName: 'WannaCry',
+    ArtistName: 'Ninajirachi/Porter Robinson'
+  };
+  assert.equal(shouldRepairObservedNext(expected, null), true);
+  assert.equal(shouldRepairObservedNext(expected, {
+    id: 'other',
+    title: 'Shelter',
+    artist: 'Porter Robinson/Madeon'
+  }), true);
+});
+
+test('unknown QQ next-track state never requests a speculative reinsert', () => {
+  const expected = {
+    Id: '3404096928',
+    SongName: 'WannaCry',
+    ArtistName: 'Ninajirachi/Porter Robinson'
+  };
+
+  assert.equal(
+    shouldRepairObservedNext(expected, null, 'unknown'),
+    false
+  );
+  assert.equal(
+    shouldRepairObservedNext(expected, null, 'empty'),
+    true
+  );
+});
+
+test('normal A followed by immediate B only rearms preserved A', () => {
+  const shelter = {
+    Id: '201423402',
+    SongName: 'Shelter',
+    ArtistName: 'Porter Robinson/Madeon'
+  };
+
+  assert.equal(planObservedNextAction({
+    expected: shelter,
+    observedNext: null,
+    nextObservation: 'unknown',
+    preserveInsertedHead: true,
+    expectedAlreadyGuarded: false
+  }), 'arm-only');
+});
+
+test('unknown QQ next does not reinsert an already guarded queue head', () => {
+  const shelter = {
+    Id: '201423402',
+    SongName: 'Shelter',
+    ArtistName: 'Porter Robinson/Madeon'
+  };
+
+  assert.equal(planObservedNextAction({
+    expected: shelter,
+    observedNext: null,
+    nextObservation: 'unknown',
+    preserveInsertedHead: false,
+    expectedAlreadyGuarded: true
+  }), 'none');
+});
+
+test('unknown QQ next inserts a newly advanced unguarded queue head once', () => {
+  assert.equal(planObservedNextAction({
+    expected: {
+      Id: 'next-b',
+      SongName: 'Next B',
+      ArtistName: 'Artist'
+    },
+    observedNext: null,
+    nextObservation: 'unknown',
+    preserveInsertedHead: false,
+    expectedAlreadyGuarded: false
+  }), 'insert');
+});
+
+test('confirmed mismatched next still requests native repair', () => {
+  assert.equal(planObservedNextAction({
+    expected: {
+      Id: '201423402',
+      SongName: 'Shelter',
+      ArtistName: 'Porter Robinson/Madeon'
+    },
+    observedNext: {
+      id: '80605719',
+      title: 'Mirror',
+      artist: 'Porter Robinson'
+    },
+    nextObservation: 'track',
+    preserveInsertedHead: false,
+    expectedAlreadyGuarded: false
+  }), 'insert');
+});
+
+test('QQ interrupt uses the preserve-current native transaction', () => {
+  assert.equal(planImmediatePlaybackCommand({
+    playerKey: 'qqmusic',
+    mode: 'interrupt',
+    hasCurrentSong: true
+  }), 'InterruptSelected');
+  assert.equal(planImmediatePlaybackCommand({
+    playerKey: 'qqmusic',
+    mode: 'play-now',
+    hasCurrentSong: true
+  }), 'PlaySelected');
+  assert.equal(planImmediatePlaybackCommand({
+    playerKey: 'kugou',
+    mode: 'interrupt',
+    hasCurrentSong: true
+  }), 'PlaySelected');
+});
+
+test('managed previous-track transition is deferred until the final target', () => {
+  const mirror = {
+    Id: '80605719',
+    SongName: 'Mirror',
+    ArtistName: 'Porter Robinson'
+  };
+  assert.equal(shouldDeferManagedTrackObservation(mirror, {
+    id: 'previous-native-song',
+    title: 'Previous native song',
+    artist: 'Artist'
+  }), true);
+  assert.equal(shouldDeferManagedTrackObservation(mirror, {
+    id: '80605719',
+    title: 'Mirror',
+    artist: 'Porter Robinson'
+  }), false);
+});
+
+test('QQ interrupt always preserves the displaced current song as guard', () => {
+  assert.equal(shouldPreserveGuardAfterImmediate({
+    command: 'InterruptSelected',
+    hadRegisteredGuard: false,
+    hasDisplacedCurrentSong: true
+  }), true);
+  assert.equal(shouldPreserveGuardAfterImmediate({
+    command: 'PlaySelected',
+    hadRegisteredGuard: false,
+    hasDisplacedCurrentSong: true
+  }), false);
 });

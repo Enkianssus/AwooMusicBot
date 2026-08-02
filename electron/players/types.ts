@@ -3,6 +3,7 @@ import type {
   PlayerSnapshot,
   PlayerTrack
 } from '../player-bridge-client';
+import type { NextObservation } from '../queue-head-policy';
 
 export type PlayerKey = 'netease' | 'kugou' | 'qqmusic' | 'folia';
 
@@ -13,6 +14,7 @@ export type PlayerCommand =
   | 'Next'
   | 'InsertNext'
   | 'ArmNextGuard'
+  | 'InterruptSelected'
   | 'PlaySelected';
 
 export interface PlayerSongInput {
@@ -47,6 +49,8 @@ export interface PlayerConnectionState {
 
 export interface PlayerTrackObservation {
   track: PlayerTrack | null;
+  nextTrack?: PlayerTrack | null;
+  nextObservation: NextObservation;
   coverUrl?: string;
   nextDescription: string;
 }

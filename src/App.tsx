@@ -42,16 +42,46 @@ interface SongArtworkImageProps {
     className?: string;
 }
 
-const SongArtworkImage: React.FC<SongArtworkImageProps> = ({ song, source, className = '' }) => {
-    const primaryUrl = source === 'cover' ? song.CoverUrl || '' : song.OrderedByAvatar || '';
+function getArtworkCandidates(
+    song: SongInfo,
+    source: 'avatar' | 'cover'
+): string[] {
+    const primaryUrl = source === 'cover'
+        ? song.CoverUrl || ''
+        : song.OrderedByAvatar || '';
     const avatarFallback = source === 'avatar' && song.OrderedByUid
         ? `https://api.dicebear.com/7.x/identicon/svg?seed=${encodeURIComponent(song.OrderedByUid)}`
         : '';
-    const [imageUrl, setImageUrl] = useState(primaryUrl || avatarFallback);
+    const candidates = [primaryUrl, avatarFallback].filter(Boolean);
+
+    if (source === 'cover' && primaryUrl) {
+        try {
+            const parsed = new URL(primaryUrl);
+            if (/^p\d+\.music\.126\.net$/i.test(parsed.hostname)) {
+                for (const host of ['p1.music.126.net', 'p2.music.126.net', 'p3.music.126.net', 'p4.music.126.net']) {
+                    const alternative = new URL(parsed.toString());
+                    alternative.hostname = host;
+                    if (!alternative.search) alternative.search = '?param=256y256';
+                    candidates.push(alternative.toString());
+                }
+            }
+        } catch {
+            // A malformed external URL will fail once and then use the icon.
+        }
+    }
+
+    return [...new Set(candidates)];
+}
+
+const SongArtworkImage: React.FC<SongArtworkImageProps> = ({ song, source, className = '' }) => {
+    const candidates = getArtworkCandidates(song, source);
+    const candidateKey = candidates.join('\n');
+    const [candidateIndex, setCandidateIndex] = useState(0);
+    const imageUrl = candidates[candidateIndex] || '';
 
     useEffect(() => {
-        setImageUrl(primaryUrl || avatarFallback);
-    }, [primaryUrl, avatarFallback]);
+        setCandidateIndex(0);
+    }, [candidateKey]);
 
     if (!imageUrl) return <span className="w-full h-full flex items-center justify-center text-lg" aria-label="暂无歌曲封面">🎵</span>;
 
@@ -61,10 +91,7 @@ const SongArtworkImage: React.FC<SongArtworkImageProps> = ({ song, source, class
             alt={source === 'cover' ? `${song.SongName} 封面` : `${song.OrderedBy} 头像`}
             referrerPolicy="no-referrer"
             className={`w-full h-full object-cover ${className}`}
-            onError={() => {
-                if (source === 'avatar' && avatarFallback && imageUrl !== avatarFallback) setImageUrl(avatarFallback);
-                else setImageUrl('');
-            }}
+            onError={() => setCandidateIndex(index => index + 1)}
         />
     );
 };
@@ -118,6 +145,10 @@ interface ConnectorStatus {
     minimumCoreVersion: string | null;
     compatible: boolean;
     updateAvailable: boolean;
+    autoUpdateAvailable: boolean;
+    manualUpdateAvailable: boolean;
+    updateKind: 'none' | 'install' | 'patch' | 'player' | 'major';
+    supportedPlayerVersion: string | null;
     updating: boolean;
     checkedAt: string;
     error: string | null;
@@ -214,6 +245,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
     const [dragInfo, setDragInfo] = useState<DragInfo | null>(null);
     const [showSettings, setShowSettings] = useState<boolean>(false);
+    const [titleBarActionsOpen, setTitleBarActionsOpen] = useState<boolean>(false);
 
     // ⭐ 新增: 全局 UI 500ms 冷却锁定
     const [actionLock, setActionLock] = useState<boolean>(false);
@@ -729,20 +761,26 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             <h1 className="font-bold text-[15px] tracking-wide pointer-events-none whitespace-nowrap shrink-0" style={{ color: theme.titleColor }}>嗷呜点歌机</h1>
                         </div>
 
-                        <div className="no-drag flex items-center relative h-6 flex-1 justify-end min-w-0">
+                        <div className="flex items-center relative h-6 flex-1 justify-end min-w-0">
                             <div
-                                className={`absolute right-0 text-xs font-medium max-w-[150px] truncate pointer-events-none transition-all duration-300 ${isElectron ? 'group-hover:-translate-x-[115px] group-hover:opacity-50' : ''} ${getStatusAnimation(data.status)}`}
+                                className={`absolute right-0 text-xs font-medium max-w-[150px] truncate pointer-events-none transition-all duration-150 ${isElectron && titleBarActionsOpen ? '-translate-x-[118px] opacity-50' : ''} ${getStatusAnimation(data.status)}`}
                                 style={{ color: !isConnected ? theme.subTextColor : getStatusColor(data.status) }}
                             >
                                 {!isConnected ? '等待后端...' : (data.status || '点歌就绪')}
                             </div>
 
                             {isElectron && (
-                                <div className="absolute right-0 flex gap-2 items-center opacity-0 transform translate-x-3 group-hover:translate-x-0 group-hover:opacity-100 transition-all duration-300 z-20">
-                                    <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="控制面板">⚙️</button>
-                                    <button onMouseDown={e => e.stopPropagation()} onClick={() => setShowSettings(!showSettings)} className="text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="外观设置">🎨</button>
-                                    <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-white hover:bg-white/20 text-xs font-bold" title="最小化">—</button>
-                                    <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-red-400 hover:bg-red-500/20 text-xs" title="关闭本窗口">✖</button>
+                                <div
+                                    onMouseEnter={() => setTitleBarActionsOpen(true)}
+                                    onMouseLeave={() => setTitleBarActionsOpen(false)}
+                                    className={`no-drag absolute right-0 top-1/2 -translate-y-1/2 h-8 overflow-hidden z-20 transition-[width] duration-150 ease-out ${titleBarActionsOpen ? 'w-[116px]' : 'w-8'}`}
+                                >
+                                    <div className={`ml-auto flex h-full w-[112px] items-center justify-end gap-2 transition-all duration-150 ${titleBarActionsOpen ? 'translate-x-0 opacity-100' : 'translate-x-2 opacity-0 pointer-events-none'}`}>
+                                        <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="no-drag text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="控制面板">⚙️</button>
+                                        <button onMouseDown={e => e.stopPropagation()} onClick={() => setShowSettings(!showSettings)} className="no-drag text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="外观设置">🎨</button>
+                                        <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-white hover:bg-white/20 text-xs font-bold" title="最小化">−</button>
+                                        <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-red-400 hover:bg-red-500/20 text-xs" title="关闭本窗口">✖</button>
+                                    </div>
                                 </div>
                             )}
                         </div>
@@ -1285,6 +1323,97 @@ const AdminWidget: React.FC = () => {
                 playerConnecting: false
             }) : prev);
             showAdminToast("❌ 发送指令失败");
+        }
+    };
+
+    const handleConnectorUpdate = async (
+        connectorId: NativeConnectorId
+    ) => {
+        if (connectorUpdating) return;
+        const status = connectorStatuses[connectorId];
+        if (!status?.updateAvailable) {
+            showAdminToast('当前连接器没有可安装的更新。');
+            return;
+        }
+
+        if (status.manualUpdateAvailable) {
+            const confirmed = window.confirm(
+                `${status.name}连接器将从 v${status.currentVersion || '未安装'} `
+                + `更新到 v${status.latestVersion || '未知'}。\n\n`
+                + '该版本属于不同的播放器兼容分支，不会自动安装。\n'
+                + `目标连接器支持的播放器版本：${status.supportedPlayerVersion || '清单未注明'}\n\n`
+                + '请确认你正在使用对应的播放器版本。是否继续手动更新？'
+            );
+            if (!confirmed) return;
+        }
+
+        const playerTypeByConnector: Record<NativeConnectorId, string> = {
+            netease: 'NCM',
+            kugou: 'Kugou',
+            qqmusic: 'QQMusic',
+            folia: 'Folia'
+        };
+        const updatesSelectedPlayer =
+            config?.config?.PlayerType === playerTypeByConnector[connectorId];
+        setConnectorUpdating(connectorId);
+        if (updatesSelectedPlayer) {
+            setConfig((previous: any) => previous ? ({
+                ...previous,
+                playerConnecting: true
+            }) : previous);
+        }
+
+        try {
+            const response = await fetch(
+                'http://localhost:5555/api/connectors/update',
+                {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ connectorId })
+                }
+            );
+            const result = await response.json();
+            if (!result.success) {
+                throw new Error(result.message || '连接器更新失败');
+            }
+            if (result.status) {
+                setConnectorStatuses(previous => ({
+                    ...previous,
+                    [connectorId]: result.status
+                }));
+            }
+
+            let selectedConnected = result.reconnected === true;
+            if (updatesSelectedPlayer) {
+                if (!selectedConnected) {
+                    selectedConnected = await waitForPlayerConnection();
+                }
+                setConfig((previous: any) => previous ? ({
+                    ...previous,
+                    playerConnected: selectedConnected,
+                    cdpConnected: selectedConnected,
+                    playerConnecting: false
+                }) : previous);
+            }
+            await loadConnectorStatuses(false);
+            showAdminToast(
+                updatesSelectedPlayer && !selectedConnected
+                    ? '⚠️ 连接器已更新，后台正在等待播放器连接。'
+                    : `✅ ${result.message || '连接器更新完成'}`
+            );
+        } catch (error: unknown) {
+            const message = error instanceof Error
+                ? error.message
+                : '连接器更新失败';
+            showAdminToast(`❌ ${message}`);
+            if (updatesSelectedPlayer) {
+                setConfig((previous: any) => previous ? ({
+                    ...previous,
+                    playerConnecting: false
+                }) : previous);
+            }
+        } finally {
+            setConnectorUpdating(null);
         }
     };
 
@@ -2025,7 +2154,7 @@ const AdminWidget: React.FC = () => {
                                                 💻 播放器设置
                                             </h3>
                                             <span className="px-3 py-1.5 bg-green-500/10 text-green-300 text-[11px] rounded-lg font-bold border border-green-500/30">
-                                                {connectorChecking ? '⏳ 正在同步版本' : '♨️ 兼容优先更新已开启'}
+                                                {connectorChecking ? '⏳ 正在同步版本' : '♨️ 同播放器版本自动更新'}
                                             </span>
                                         </div>
 
@@ -2064,9 +2193,21 @@ const AdminWidget: React.FC = () => {
                                                         </div>
                                                         <div className="md:col-span-2">
                                                             {selected ? (
-                                                                <span className={`text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${connecting ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/30' : connected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
-                                                                    {connecting ? '⏳ 连接中' : connected ? '✅ 已连接' : '❌ 未连接'}
-                                                                </span>
+                                                                <div className="space-y-1.5">
+                                                                    <span className={`inline-flex text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${connecting ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/30' : connected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
+                                                                        {connecting ? '⏳ 连接中' : connected ? '✅ 已连接' : '❌ 未连接'}
+                                                                    </span>
+                                                                    <div className="text-[10px] text-gray-400">
+                                                                        播放器版本：
+                                                                        <span className="font-mono text-gray-200">
+                                                                            {connected && config.playerSnapshot?.version
+                                                                                ? config.playerSnapshot.version
+                                                                                : connecting
+                                                                                    ? '正在检测'
+                                                                                    : '未检测到'}
+                                                                        </span>
+                                                                    </div>
+                                                                </div>
                                                             ) : (
                                                                 <span className="text-[10px] px-2.5 py-1 rounded-full font-bold bg-gray-600/20 text-gray-500 border border-gray-500/30">未启用</span>
                                                             )}
@@ -2074,6 +2215,19 @@ const AdminWidget: React.FC = () => {
                                                         <div className="md:col-span-3 min-w-0">
                                                             {connectorStatus ? (
                                                                     <div className="space-y-1">
+                                                                        {connectorStatus.manualUpdateAvailable && (
+                                                                            <div className="text-[10px] text-orange-300 font-bold">
+                                                                                新播放器版本分支：仅手动更新
+                                                                                <span className="block text-orange-200/70 font-normal mt-0.5">
+                                                                                    支持播放器版本：{connectorStatus.supportedPlayerVersion || '清单未注明'}
+                                                                                </span>
+                                                                            </div>
+                                                                        )}
+                                                                        {connectorStatus.autoUpdateAvailable && connectorStatus.installed && (
+                                                                            <div className="text-[10px] text-cyan-300 font-bold">
+                                                                                同播放器版本补丁，将自动更新
+                                                                            </div>
+                                                                        )}
                                                                         <div className="text-[11px] text-gray-300">
                                                                             当前：
                                                                             <span className="font-mono text-white">
@@ -2126,11 +2280,29 @@ const AdminWidget: React.FC = () => {
                                                             <div className="text-[10px] text-gray-500 mt-1">{player.detail}</div>
                                                         </div>
                                                         <div className="md:col-span-3 flex flex-wrap justify-end gap-2">
+                                                            {connectorStatus?.updateAvailable && (
+                                                                <button
+                                                                    disabled={
+                                                                        connectorUpdating !== null
+                                                                        || connectorStatus.updating === true
+                                                                        || connectorStatus.compatible === false
+                                                                    }
+                                                                    onClick={() => void handleConnectorUpdate(player.connectorId)}
+                                                                    className="px-3 py-1.5 bg-cyan-700 hover:bg-cyan-600 text-white text-[11px] rounded-lg font-bold shadow transition-colors border border-cyan-400/40 disabled:opacity-30 disabled:cursor-not-allowed"
+                                                                >
+                                                                    {reinstalling
+                                                                        ? '⏳ 更新中'
+                                                                        : connectorStatus.manualUpdateAvailable
+                                                                            ? '⚠️ 手动更新'
+                                                                            : '⬆️ 立即更新'}
+                                                                </button>
+                                                            )}
                                                             <button
                                                                 disabled={
                                                                     connectorUpdating !== null
                                                                     || connectorStatus?.updating === true
                                                                     || connectorStatus?.compatible === false
+                                                                    || connectorStatus?.manualUpdateAvailable === true
                                                                 }
                                                                 onClick={() => void handleConnectorReinstall(player.connectorId)}
                                                                 className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-[11px] rounded-lg font-bold shadow transition-colors border border-amber-400/40 disabled:opacity-30 disabled:cursor-not-allowed"
@@ -2188,7 +2360,7 @@ const AdminWidget: React.FC = () => {
                                         <div className="text-xs text-gray-500 mt-2 italic flex gap-2 leading-relaxed">
                                             <span className="shrink-0">💡</span>
                                             <span>
-                                                本体会自动补齐缺少的连接器，并每 30 分钟检查新版本。当前连接器能正常连接时只提示、不强制替换；连接失败且有兼容更新时才自动升级并重连。“重新安装”用于手动修复。
+                                                本体会自动补齐缺少的连接器，并每 30 分钟检查新版本。同一播放器兼容分支只提高第三位的补丁会自动更新；第二位提高代表播放器兼容版本变化，只会提示并等待手动确认。跨分支手动更新前会显示目标连接器支持的播放器版本。“重新安装”只用于当前兼容分支的手动修复。
                                             </span>
                                         </div>
                                     </div>

@@ -43,8 +43,8 @@ internal static class QQMusicNativeNextProfiles
             "22.41",
             "A5F3E917A5233D925268C34656E49096B6223B74631C5002DB606AD4B2C7A3F3",
             "36775378403DB33D049EE87BCAD654BA3A041B7D41259CD7EDFE65457D7E2A06",
-            0x0048C090,
-            [0xE8, 0x2B, 0x30, 0x16, 0x00],
+            0x0048C124,
+            [0xE8, 0x67, 0x55, 0x16, 0x00],
             0x0000F0ED,
             0x0002E089,
             0x0004B800,
@@ -55,7 +55,7 @@ internal static class QQMusicNativeNextProfiles
             0x00614450,
             0x004ED5D0,
             0xA0,
-            "2026-07-31 从 playsong/addsong、右键菜单、导出表和调用图静态恢复")
+            "2026-08-01 校准 cmd_count=1 单曲分支并现场动态验证")
     ];
 
     public static IReadOnlyList<QQMusicNativeNextProfile> All =>

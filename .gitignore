@@ -23,6 +23,11 @@ experiments/**/bin/
 experiments/**/obj/
 BiliNCM-Connectors/
 .codex-tests/
+.tmp/
+.playwright-mcp/
+connector-backups/
+**/__pycache__/
+*.pyc
 
 # Editor directories and files
 .vscode/*

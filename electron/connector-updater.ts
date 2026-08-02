@@ -1,9 +1,10 @@
-import { app } from 'electron';
+import { app, net } from 'electron';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import extract from 'extract-zip';
+import { downloadBufferWithRanges } from './connector-download';
 import {
   canAutoUpdateConnector,
   classifyConnectorUpdate,
@@ -594,22 +595,24 @@ export class ConnectorUpdater {
     let movedPreviousDirectory = false;
 
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 120000);
-      let archive: Buffer;
-      try {
-        const response = await fetch(entry.downloadUrl, {
-          method: 'GET',
-          cache: 'no-store',
-          signal: controller.signal
-        });
-        if (!response.ok) {
-          throw new Error(`下载 HTTP ${response.status}`);
+      const archive = await downloadBufferWithRanges({
+        url: entry.downloadUrl,
+        expectedSize: entry.size,
+        fetchImpl: (input, init) => net.fetch(input, init),
+        onProgress: progress => {
+          this.onLog(
+            `[连接器更新] ${connectorId} 下载进度 ${progress.percent}% `
+            + `(${progress.received}/${progress.total})`
+          );
+        },
+        onRetry: retry => {
+          this.onLog(
+            `[连接器更新] ${connectorId} 分块 ${retry.start}-${retry.end} `
+            + `下载中断，第 ${retry.attempt}/${retry.maxAttempts} 次重试：`
+            + retry.error
+          );
         }
-        archive = Buffer.from(await response.arrayBuffer());
-      } finally {
-        clearTimeout(timeout);
-      }
+      });
 
       if (archive.length !== entry.size) {
         throw new Error(

@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import test from 'node:test';
-import { downloadBufferWithRanges } from '../electron/connector-download.ts';
+import {
+  downloadBufferWithRanges,
+  downloadWholeBufferWithRetries
+} from '../electron/connector-download.ts';
 
 function partialResponse(payload, rangeHeader) {
   const match = String(rangeHeader).match(/^bytes=(\d+)-(\d+)$/);
@@ -100,4 +103,29 @@ test('rejects a mismatched content range', async () => {
     }),
     /下载分块范围不匹配/
   );
+});
+
+test('retries a whole-file download and verifies its exact size', async () => {
+  const payload = Buffer.from('small framework-dependent package');
+  const retries = [];
+  let calls = 0;
+  const archive = await downloadWholeBufferWithRetries({
+    url: 'https://example.test/framework-dependent.zip',
+    expectedSize: payload.length,
+    maxAttempts: 2,
+    retryDelayMs: 0,
+    fetchImpl: async (_url, init) => {
+      calls += 1;
+      assert.equal(init?.headers, undefined);
+      if (calls === 1) return new Response('temporary', { status: 503 });
+      return new Response(payload, { status: 200 });
+    },
+    onRetry: retry => retries.push(retry)
+  });
+
+  assert.deepEqual(archive, payload);
+  assert.equal(calls, 2);
+  assert.equal(retries.length, 1);
+  assert.equal(retries[0].start, 0);
+  assert.equal(retries[0].end, payload.length - 1);
 });

@@ -4,7 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import extract from 'extract-zip';
-import { downloadBufferWithRanges } from './connector-download';
+import {
+  downloadBufferWithRanges,
+  downloadWholeBufferWithRetries
+} from './connector-download';
 import {
   buildPrivateDotnetEnvironment,
   PrivateDotnetRuntimeManager,
@@ -630,17 +633,41 @@ export class ConnectorUpdater {
           framework.runtime,
           framework.runtimeChannel
         );
-        return await this.installPackage(
-          connectorId,
-          entry,
-          framework,
-          {
-            deployment: 'framework-dependent',
-            runtimeRid: framework.runtime,
-            runtimeRoot
-          },
-          forceReinstall
-        );
+        const activation: ConnectorPackageActivation = {
+          deployment: 'framework-dependent',
+          runtimeRid: framework.runtime,
+          runtimeRoot
+        };
+        try {
+          return await this.installPackage(
+            connectorId,
+            entry,
+            framework,
+            activation,
+            forceReinstall
+          );
+        } catch (proxyError: unknown) {
+          const directPackage: ConnectorPackageEntry = {
+            ...framework,
+            downloadUrl: buildConnectorGitHubReleaseUrl(
+              connectorId,
+              entry.version,
+              framework.asset
+            )
+          };
+          this.onLog(
+            `[连接器更新] ${connectorId} 本站小体积包下载失败，`
+            + `尝试 GitHub Release 签名资产地址：${getErrorMessage(proxyError)}`
+          );
+          return await this.installPackage(
+            connectorId,
+            entry,
+            directPackage,
+            activation,
+            forceReinstall,
+            true
+          );
+        }
       } catch (error: unknown) {
         this.onLog(
           `[连接器更新] ${connectorId} 小体积包或私有 .NET Runtime 安装失败，`
@@ -663,7 +690,8 @@ export class ConnectorUpdater {
     entry: ConnectorCatalogEntry,
     packageEntry: ConnectorPackageEntry,
     activation: ConnectorPackageActivation,
-    forceReinstall = false
+    forceReinstall = false,
+    wholeFileDownload = false
   ): Promise<string> {
     const connectorRoot = this.getConnectorRoot(connectorId);
     const versionDirectory = path.join(connectorRoot, entry.version);
@@ -729,7 +757,9 @@ export class ConnectorUpdater {
     let movedPreviousDirectory = false;
 
     try {
-      const archive = await downloadBufferWithRanges({
+      const downloadOptions: Parameters<
+        typeof downloadBufferWithRanges
+      >[0] = {
         url: packageEntry.downloadUrl,
         expectedSize: packageEntry.size,
         fetchImpl: (input, init) => net.fetch(input, init),
@@ -746,7 +776,10 @@ export class ConnectorUpdater {
             + retry.error
           );
         }
-      });
+      };
+      const archive = wholeFileDownload
+        ? await downloadWholeBufferWithRetries(downloadOptions)
+        : await downloadBufferWithRanges(downloadOptions);
 
       if (archive.length !== packageEntry.size) {
         throw new Error(
@@ -1306,6 +1339,16 @@ function isPathInside(parent: string, target: string): boolean {
     : value;
   const parentPath = normalize(`${path.resolve(parent)}${path.sep}`);
   return normalize(path.resolve(target)).startsWith(parentPath);
+}
+
+function buildConnectorGitHubReleaseUrl(
+  connectorId: NativeConnectorId,
+  version: string,
+  asset: string
+): string {
+  const tag = `${connectorId}-v${version}`;
+  return 'https://github.com/Enkianssus/BiliNCM-Connectors/releases/download/'
+    + `${encodeURIComponent(tag)}/${encodeURIComponent(asset)}`;
 }
 
 function compareVersions(left: string, right: string): number {

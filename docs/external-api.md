@@ -55,7 +55,7 @@ ws://127.0.0.1:5556/ws
 ```json
 {
   "schemaVersion": 1,
-  "appVersion": "1.1.3",
+  "appVersion": "1.1.4",
   "timestamp": "2026-08-03T04:00:00.000Z",
   "player": {
     "key": "NCM",

@@ -29,6 +29,17 @@ interface DownloadBufferOptions {
   onRetry?: (retry: ConnectorDownloadRetry) => void;
 }
 
+interface DownloadWholeBufferOptions {
+  url: string;
+  expectedSize: number;
+  timeoutMs?: number;
+  maxAttempts?: number;
+  retryDelayMs?: number;
+  fetchImpl?: ConnectorFetch;
+  onProgress?: (progress: ConnectorDownloadProgress) => void;
+  onRetry?: (retry: ConnectorDownloadRetry) => void;
+}
+
 interface DownloadedRange {
   data: Buffer;
   completeArchive: boolean;
@@ -101,6 +112,73 @@ export async function downloadBufferWithRanges(
   }
 
   return Buffer.concat(chunks, expectedSize);
+}
+
+export async function downloadWholeBufferWithRetries(
+  options: DownloadWholeBufferOptions
+): Promise<Buffer> {
+  const {
+    url,
+    expectedSize,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    maxAttempts = DEFAULT_MAX_ATTEMPTS,
+    retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+    fetchImpl = fetch,
+    onProgress,
+    onRetry
+  } = options;
+
+  if (!Number.isSafeInteger(expectedSize) || expectedSize <= 0) {
+    throw new Error(`下载文件大小无效：${expectedSize}`);
+  }
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new Error(`下载重试次数无效：${maxAttempts}`);
+  }
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetchImpl(url, {
+        method: 'GET',
+        cache: 'no-store',
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        throw new Error(`下载 HTTP ${response.status}`);
+      }
+      const archive = Buffer.from(await response.arrayBuffer());
+      if (archive.length !== expectedSize) {
+        throw new Error(
+          `下载文件大小不匹配：${archive.length}/${expectedSize}`
+        );
+      }
+      onProgress?.({
+        received: expectedSize,
+        total: expectedSize,
+        percent: 100
+      });
+      return archive;
+    } catch (error: unknown) {
+      lastError = error;
+      if (attempt >= maxAttempts) break;
+      onRetry?.({
+        attempt,
+        maxAttempts,
+        start: 0,
+        end: expectedSize - 1,
+        error: getErrorMessage(error)
+      });
+      if (retryDelayMs > 0) {
+        await delay(retryDelayMs * attempt);
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw new Error(`完整下载失败：${getErrorMessage(lastError)}`);
 }
 
 async function downloadRange(options: {

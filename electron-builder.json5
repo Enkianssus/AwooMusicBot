@@ -9,7 +9,8 @@
   },
   "files": [
     "dist",
-    "dist-electron"
+    "dist-electron",
+    "examples/obs-overlay"
   ],
   "mac": {
     "target": [

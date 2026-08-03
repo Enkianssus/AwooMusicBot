@@ -2500,7 +2500,8 @@ const AdminWidget: React.FC = () => {
                                             />
                                             <div className="text-xs text-gray-500 mt-2 font-mono break-all">
                                                 HTTP: http://127.0.0.1:{config.config.ExternalApiPort || 5556}/api/v1/state<br/>
-                                                WebSocket: ws://127.0.0.1:{config.config.ExternalApiPort || 5556}/ws
+                                                WebSocket: ws://127.0.0.1:{config.config.ExternalApiPort || 5556}/ws<br/>
+                                                OBS 示例: http://127.0.0.1:{config.config.ExternalApiPort || 5556}/overlay/
                                             </div>
                                         </div>
                                     </div>

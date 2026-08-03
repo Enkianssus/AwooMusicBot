@@ -6,6 +6,11 @@ import { spawn } from 'node:child_process';
 import extract from 'extract-zip';
 import { downloadBufferWithRanges } from './connector-download';
 import {
+  buildPrivateDotnetEnvironment,
+  PrivateDotnetRuntimeManager,
+  type DotnetRuntimeRid
+} from './private-dotnet-runtime';
+import {
   canAutoUpdateConnector,
   classifyConnectorUpdate,
   requiresManualConnectorUpdate,
@@ -43,19 +48,28 @@ export interface ConnectorUpdateResult {
   status: ConnectorUpdateStatus;
 }
 
-interface ConnectorCatalogEntry {
+interface ConnectorPackageEntry {
+  asset: string;
+  size: number;
+  sha256: string;
+  signature: string;
+  downloadUrl: string;
+}
+
+interface FrameworkDependentConnectorPackage extends ConnectorPackageEntry {
+  runtime: DotnetRuntimeRid;
+  runtimeChannel: '8.0';
+}
+
+interface ConnectorCatalogEntry extends ConnectorPackageEntry {
   id: NativeConnectorId;
   version: string;
   protocolVersion: number;
   minimumCoreVersion: string;
   testedPlayerVersion?: string;
   playerVersionPolicy?: string;
-  runtime?: 'win-x86' | 'win-x64';
-  asset: string;
-  size: number;
-  sha256: string;
-  signature: string;
-  downloadUrl: string;
+  runtime?: DotnetRuntimeRid;
+  frameworkDependent?: FrameworkDependentConnectorPackage;
 }
 
 interface ConnectorCatalog {
@@ -68,8 +82,16 @@ interface ActiveConnector {
   id: NativeConnectorId;
   version: string;
   executable: string;
+  deployment?: 'self-contained' | 'framework-dependent';
+  runtimeRid?: DotnetRuntimeRid;
+  runtimeRoot?: string;
   activatedAt: string;
 }
+
+type ConnectorPackageActivation = Pick<
+  ActiveConnector,
+  'deployment' | 'runtimeRid' | 'runtimeRoot'
+>;
 
 interface QQMusicProfileCatalogEntry {
   id: 'qqmusic';
@@ -138,6 +160,7 @@ export class ConnectorUpdater {
   >();
   private readonly validatedExecutables = new Set<string>();
   private qqMusicProfileUpdate: Promise<string | null> | null = null;
+  private privateDotnetRuntime: PrivateDotnetRuntimeManager | null = null;
 
   constructor(
     private readonly onLog: (message: string) => void
@@ -154,19 +177,40 @@ export class ConnectorUpdater {
   async getLaunchEnvironment(
     connectorId: NativeConnectorId
   ): Promise<Record<string, string>> {
-    if (connectorId !== 'qqmusic') return {};
+    const active = await this.readActive(connectorId);
+    const environment = active?.deployment === 'framework-dependent'
+      && active.runtimeRid
+      && active.runtimeRoot
+      ? buildPrivateDotnetEnvironment(active.runtimeRid, active.runtimeRoot)
+      : {};
+    if (connectorId !== 'qqmusic') return environment;
     try {
       const directory = await this.ensureQQMusicProfiles();
       return directory
-        ? { BILINCM_QQMUSIC_PROFILE_DIR: directory }
-        : {};
+        ? { ...environment, BILINCM_QQMUSIC_PROFILE_DIR: directory }
+        : environment;
     } catch (error: unknown) {
       this.onLog(
         `[QQ 画像] 在线画像更新失败，继续使用连接器内置画像：`
         + getErrorMessage(error)
       );
-      return {};
+      return environment;
     }
+  }
+
+  private getPrivateDotnetRuntime(): PrivateDotnetRuntimeManager {
+    if (!this.privateDotnetRuntime) {
+      this.privateDotnetRuntime = new PrivateDotnetRuntimeManager({
+        rootDirectory: this.getPrivateDotnetRuntimeRoot(),
+        fetchImpl: (input, init) => net.fetch(input, init),
+        onLog: message => this.onLog(message)
+      });
+    }
+    return this.privateDotnetRuntime;
+  }
+
+  private getPrivateDotnetRuntimeRoot(): string {
+    return path.join(app.getPath('userData'), 'dotnet-runtimes');
   }
 
   async ensureInstalled(
@@ -181,7 +225,8 @@ export class ConnectorUpdater {
           await validateConnectorExecutable(
             installed,
             connectorId,
-            active.version
+            active.version,
+            await this.getLaunchEnvironment(connectorId)
           );
           this.validatedExecutables.add(resolved);
         } catch (error: unknown) {
@@ -550,6 +595,27 @@ export class ConnectorUpdater {
     ) {
       throw new Error(`${connectorId} 连接器清单字段无效`);
     }
+
+    const framework = entry.frameworkDependent;
+    const runtimeRid = entry.runtime || 'win-x86';
+    if (framework && (
+      framework.runtime !== runtimeRid
+      || framework.runtimeChannel !== '8.0'
+      || !Number.isSafeInteger(framework.size)
+      || framework.size <= 0
+      || !/^[a-f0-9]{64}$/i.test(framework.sha256)
+      || !framework.signature
+      || !framework.downloadUrl.startsWith(
+        'https://app.enkianss.us/connectors/v1/download/'
+      )
+      || path.basename(framework.asset) !== framework.asset
+      || framework.asset !== `bilincm-connector-${connectorId}-${entry.version}-${runtimeRid}-framework-dependent.zip`
+      || path.basename(new URL(framework.downloadUrl).pathname) !== framework.asset
+    )) {
+      throw new Error(
+        `${connectorId} framework-dependent 连接器清单字段无效`
+      );
+    }
   }
 
   private async install(
@@ -557,21 +623,89 @@ export class ConnectorUpdater {
     entry: ConnectorCatalogEntry,
     forceReinstall = false
   ): Promise<string> {
+    const framework = entry.frameworkDependent;
+    if (framework) {
+      try {
+        const runtimeRoot = await this.getPrivateDotnetRuntime().ensure(
+          framework.runtime,
+          framework.runtimeChannel
+        );
+        return await this.installPackage(
+          connectorId,
+          entry,
+          framework,
+          {
+            deployment: 'framework-dependent',
+            runtimeRid: framework.runtime,
+            runtimeRoot
+          },
+          forceReinstall
+        );
+      } catch (error: unknown) {
+        this.onLog(
+          `[连接器更新] ${connectorId} 小体积包或私有 .NET Runtime 安装失败，`
+          + `自动回退完整包：${getErrorMessage(error)}`
+        );
+      }
+    }
+
+    return this.installPackage(
+      connectorId,
+      entry,
+      entry,
+      { deployment: 'self-contained' },
+      forceReinstall
+    );
+  }
+
+  private async installPackage(
+    connectorId: NativeConnectorId,
+    entry: ConnectorCatalogEntry,
+    packageEntry: ConnectorPackageEntry,
+    activation: ConnectorPackageActivation,
+    forceReinstall = false
+  ): Promise<string> {
     const connectorRoot = this.getConnectorRoot(connectorId);
     const versionDirectory = path.join(connectorRoot, entry.version);
     const executableName = EXECUTABLE_NAMES[connectorId];
     const executable = path.join(versionDirectory, executableName);
 
-    if (!forceReinstall && await isFile(executable)) {
+    const currentActive = await this.readActive(connectorId);
+    const currentDeployment = currentActive?.deployment || 'self-contained';
+    const requestedDeployment = activation.deployment || 'self-contained';
+    const canReuse = Boolean(
+      !forceReinstall
+      && currentActive?.version === entry.version
+      && currentDeployment === requestedDeployment
+      && (
+        requestedDeployment !== 'framework-dependent'
+        || (
+          currentActive?.runtimeRid === activation.runtimeRid
+          && currentActive?.runtimeRoot
+          && activation.runtimeRoot
+          && path.resolve(currentActive.runtimeRoot)
+            === path.resolve(activation.runtimeRoot)
+        )
+      )
+      && await isFile(executable)
+    );
+    if (canReuse) {
       await validateConnectorExecutable(
         executable,
         connectorId,
-        entry.version
+        entry.version,
+        activation.runtimeRid && activation.runtimeRoot
+          ? buildPrivateDotnetEnvironment(
+            activation.runtimeRid,
+            activation.runtimeRoot
+          )
+          : {}
       );
       await this.writeActive(connectorId, {
         id: connectorId,
         version: entry.version,
         executable,
+        ...activation,
         activatedAt: new Date().toISOString()
       });
       return executable;
@@ -596,8 +730,8 @@ export class ConnectorUpdater {
 
     try {
       const archive = await downloadBufferWithRanges({
-        url: entry.downloadUrl,
-        expectedSize: entry.size,
+        url: packageEntry.downloadUrl,
+        expectedSize: packageEntry.size,
         fetchImpl: (input, init) => net.fetch(input, init),
         onProgress: progress => {
           this.onLog(
@@ -614,9 +748,9 @@ export class ConnectorUpdater {
         }
       });
 
-      if (archive.length !== entry.size) {
+      if (archive.length !== packageEntry.size) {
         throw new Error(
-          `文件大小不匹配：${archive.length}/${entry.size}`
+          `文件大小不匹配：${archive.length}/${packageEntry.size}`
         );
       }
 
@@ -627,13 +761,13 @@ export class ConnectorUpdater {
       if (
         !crypto.timingSafeEqual(
           Buffer.from(digest, 'hex'),
-          Buffer.from(entry.sha256, 'hex')
+          Buffer.from(packageEntry.sha256, 'hex')
         )
       ) {
         throw new Error('SHA-256 校验失败');
       }
 
-      const signature = Buffer.from(entry.signature, 'base64');
+      const signature = Buffer.from(packageEntry.signature, 'base64');
       if (
         !crypto.verify(
           null,
@@ -660,7 +794,13 @@ export class ConnectorUpdater {
       await validateConnectorExecutable(
         stagedExecutable,
         connectorId,
-        entry.version
+        entry.version,
+        activation.runtimeRid && activation.runtimeRoot
+          ? buildPrivateDotnetEnvironment(
+            activation.runtimeRid,
+            activation.runtimeRoot
+          )
+          : {}
       );
 
       if (await pathExists(versionDirectory)) {
@@ -673,6 +813,7 @@ export class ConnectorUpdater {
         id: connectorId,
         version: entry.version,
         executable,
+        ...activation,
         activatedAt: new Date().toISOString()
       });
       if (movedPreviousDirectory) {
@@ -909,9 +1050,41 @@ export class ConnectorUpdater {
       ) {
         return null;
       }
+
+      const deployment = active.deployment || 'self-contained';
+      let runtimeRoot: string | undefined;
+      let runtimeRid: DotnetRuntimeRid | undefined;
+      if (deployment === 'framework-dependent') {
+        if (
+          !active.runtimeRoot
+          || (
+            active.runtimeRid !== 'win-x86'
+            && active.runtimeRid !== 'win-x64'
+          )
+        ) {
+          return null;
+        }
+        runtimeRid = active.runtimeRid;
+        runtimeRoot = path.resolve(active.runtimeRoot);
+        const expectedRuntimeParent = path.resolve(
+          this.getPrivateDotnetRuntimeRoot(),
+          runtimeRid
+        );
+        if (
+          !isPathInside(expectedRuntimeParent, runtimeRoot)
+          || !await isFile(path.join(runtimeRoot, 'dotnet.exe'))
+        ) {
+          return null;
+        }
+      } else if (deployment !== 'self-contained') {
+        return null;
+      }
       return {
         ...active,
-        executable: expected
+        executable: expected,
+        deployment,
+        runtimeRid,
+        runtimeRoot
       };
     } catch {
       return null;
@@ -1006,7 +1179,8 @@ async function pathExists(filePath: string): Promise<boolean> {
 async function validateConnectorExecutable(
   executable: string,
   connectorId: NativeConnectorId,
-  expectedVersion?: string
+  expectedVersion?: string,
+  launchEnvironment: Record<string, string> = {}
 ): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const requestId = `health-${process.pid}-${Date.now()}`;
@@ -1016,6 +1190,7 @@ async function validateConnectorExecutable(
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
+        ...launchEnvironment,
         BILINCM_FOLIA_TOKEN: ''
       }
     });
@@ -1123,6 +1298,14 @@ async function removeInside(
     recursive: true,
     force: true
   });
+}
+
+function isPathInside(parent: string, target: string): boolean {
+  const normalize = (value: string) => process.platform === 'win32'
+    ? value.toLowerCase()
+    : value;
+  const parentPath = normalize(`${path.resolve(parent)}${path.sep}`);
+  return normalize(path.resolve(target)).startsWith(parentPath);
 }
 
 function compareVersions(left: string, right: string): number {

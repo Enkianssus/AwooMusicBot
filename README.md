@@ -1,6 +1,6 @@
 # 嗷呜点歌机
 
-嗷呜点歌机是一款面向 Bilibili 主播的 Windows 弹幕点歌工具。1.1.2
+嗷呜点歌机是一款面向 Bilibili 主播的 Windows 弹幕点歌工具。1.1.3
 开始支持网易云音乐、酷狗音乐、QQ 音乐和 Folia，并把各播放器的搜索、
 状态读取和控制实现拆成可独立更新的连接器。
 
@@ -26,6 +26,9 @@
   队列修改互相冲突。
 - 四个播放器连接器按需自动安装并在后台检查更新；更新包经过
   SHA-256 与 Ed25519 签名校验，健康检查通过后才会激活。
+- 1.1.3 起优先使用小体积的框架依赖连接器，并按 x86/x64 架构一次性安装
+  点歌机私有的共享 .NET 8 Runtime；失败时自动回退 SelfContained 完整包。
+  旧版点歌机继续使用同一清单中的完整包，不要求用户自行安装 .NET。
 - 播放器切换后自动启动对应连接器并持续探测连接状态。
 - 点歌机只把本地待播队列的第一首预插入播放器。该歌曲真正开始播放后，
   才会插入下一首；后续歌曲不会提前批量写入播放器队列。
@@ -79,8 +82,12 @@
 - `GET /api/v1/current`
 - `GET /api/v1/queue`
 - `ws://127.0.0.1:5556/ws`
+- OBS 浏览器源示例：`http://127.0.0.1:5556/overlay/`
 
 接口只提供播放与队列状态，不接受控制命令。
+完整字段、兼容规则和第三方前端接入方式见
+[`docs/external-api.md`](docs/external-api.md)；可直接修改的零构建示例源码位于
+[`examples/obs-overlay`](examples/obs-overlay)。
 
 ## 本地开发
 
@@ -101,7 +108,7 @@ dotnet build .\BiliNCM-Connectors\BiliNCM.Connectors.slnx -c Release
 ## 技术栈
 
 - Electron、Node.js、React、Vite、TypeScript、Tailwind CSS
-- .NET 8 Windows x86 独立播放器连接器
+- .NET 8 Windows x86/x64 独立播放器连接器与私有共享 Runtime
 - Bilibili 原生弹幕 WebSocket
 - Velopack、GitHub Actions、Cloudflare 下载代理
 

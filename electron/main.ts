@@ -35,6 +35,7 @@ import {
   sanitizeFeedbackLog,
   submitFeedback
 } from './feedback-service';
+import { buildExternalApiState } from './external-api-state';
 import {
   isSuccessfulPlayerResult,
   PLAYER_LABELS,
@@ -2165,26 +2166,9 @@ function isAllowedInternalOrigin(origin: string | undefined): boolean {
   }
 }
 
-function sanitizeExternalSong(song: any): any {
-  if (!song) return null;
-  return {
-    id: String(song.Id || ''),
-    title: song.SongName || '',
-    artist: song.ArtistName || '',
-    album: song.Album || '',
-    coverUrl: song.CoverUrl || '',
-    requestedBy: song.OrderedBy || '',
-    requestedByUid: String(song.OrderedByUid || ''),
-    requestedByAvatar: song.OrderedByAvatar || '',
-    guardLevel: Number(song.GuardLevel || 0)
-  };
-}
-
 function buildExternalState() {
-  return {
-    schemaVersion: 1,
+  return buildExternalApiState({
     appVersion: app.getVersion(),
-    timestamp: new Date().toISOString(),
     player: {
       key: getSelectedPlayerKey(),
       name: getSelectedPlayerLabel(),
@@ -2194,17 +2178,66 @@ function buildExternalState() {
       version: activePlayerSnapshot?.version || '',
       status: activePlayerSnapshot?.status || ''
     },
-    current: sanitizeExternalSong(currentPlayingSong || playerCurrentTrack),
+    currentSong: currentPlayingSong || playerCurrentTrack,
     currentIsRequested: Boolean(currentPlayingSong),
-    queue: targetQueue.map(sanitizeExternalSong),
-    accepting: isAccepting,
-    playing: isPlaying,
+    queue: targetQueue,
+    acceptingRequests: isAccepting,
+    queuePlaybackEnabled: isPlaying,
     pausedAfterRequests: playerPausedAfterRequests,
     commandQueue: {
       pending: danmakuCommandQueue.length,
       processing: processingDanmakuCommand
     }
-  };
+  });
+}
+
+const OBS_OVERLAY_FILES = new Map<string, {
+  fileName: string;
+  contentType: string;
+}>([
+  ['/overlay/', {
+    fileName: 'index.html',
+    contentType: 'text/html; charset=utf-8'
+  }],
+  ['/overlay/index.html', {
+    fileName: 'index.html',
+    contentType: 'text/html; charset=utf-8'
+  }],
+  ['/overlay/styles.css', {
+    fileName: 'styles.css',
+    contentType: 'text/css; charset=utf-8'
+  }],
+  ['/overlay/app.js', {
+    fileName: 'app.js',
+    contentType: 'text/javascript; charset=utf-8'
+  }]
+]);
+
+function serveObsOverlay(pathname: string, res: http.ServerResponse): boolean {
+  const resource = OBS_OVERLAY_FILES.get(pathname);
+  if (!resource) return false;
+
+  const filePath = path.join(
+    app.getAppPath(),
+    'examples',
+    'obs-overlay',
+    resource.fileName
+  );
+  try {
+    const content = fs.readFileSync(filePath);
+    res.setHeader('Content-Type', resource.contentType);
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*; img-src http: https: data:; style-src 'self'; script-src 'self'; font-src 'self'"
+    );
+    res.end(content);
+  } catch (error: unknown) {
+    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(
+      `OBS overlay unavailable: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  return true;
 }
 
 async function buildFeedbackContext(
@@ -2345,6 +2378,8 @@ async function restartExternalApiServer(): Promise<void> {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
       res.end();
@@ -2357,9 +2392,16 @@ async function restartExternalApiServer(): Promise<void> {
     }
 
     const url = new URL(req.url || '/', `http://${req.headers.host || `127.0.0.1:${port}`}`);
+    if (url.pathname === '/overlay') {
+      res.writeHead(302, { Location: `/overlay/${url.search}` });
+      res.end();
+      return;
+    }
+    if (serveObsOverlay(url.pathname, res)) return;
+
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     if (url.pathname === '/health') {
-      res.end(JSON.stringify({ ok: true, version: app.getVersion() }));
+      res.end(JSON.stringify({ ok: true, schemaVersion: 1, version: app.getVersion() }));
       return;
     }
 
@@ -2370,17 +2412,24 @@ async function restartExternalApiServer(): Promise<void> {
     }
     if (url.pathname === '/api/v1/current') {
       res.end(JSON.stringify({
+        schemaVersion: state.schemaVersion,
+        appVersion: state.appVersion,
         timestamp: state.timestamp,
         player: state.player,
         current: state.current,
-        currentIsRequested: state.currentIsRequested
+        currentIsRequested: state.currentIsRequested,
+        service: state.service
       }));
       return;
     }
     if (url.pathname === '/api/v1/queue') {
       res.end(JSON.stringify({
+        schemaVersion: state.schemaVersion,
+        appVersion: state.appVersion,
         timestamp: state.timestamp,
-        queue: state.queue
+        queue: state.queue,
+        queueLength: state.queueLength,
+        service: state.service
       }));
       return;
     }

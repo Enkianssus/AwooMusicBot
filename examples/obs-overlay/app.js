@@ -17,6 +17,8 @@
   var elements = {
     connection: document.getElementById('connection-status'),
     connectionLabel: document.getElementById('connection-label'),
+    playbackRegion: document.getElementById('playback-region'),
+    queueRegion: document.getElementById('queue-region'),
     playerStatus: document.getElementById('player-status'),
     playerLabel: document.getElementById('player-label'),
     currentTitle: document.getElementById('current-title'),
@@ -25,7 +27,9 @@
     currentRequesterName: document.getElementById('current-requester-name'),
     currentCover: document.getElementById('current-cover'),
     currentCoverFallback: document.getElementById('current-cover-fallback'),
+    playbackAlert: document.getElementById('playback-alert'),
     playbackState: document.getElementById('playback-state'),
+    requestAlert: document.getElementById('request-alert'),
     requestState: document.getElementById('request-state'),
     queueCount: document.getElementById('queue-count'),
     queueList: document.getElementById('queue-list'),
@@ -49,7 +53,7 @@
 
   function readMaxQueue(value) {
     var parsed = Number.parseInt(value || '', 10);
-    if (!Number.isInteger(parsed)) return 6;
+    if (!Number.isInteger(parsed)) return 3;
     return Math.min(30, Math.max(1, parsed));
   }
 
@@ -136,11 +140,14 @@
       : (state.playerConnecting ? '播放器连接中' : '播放器未连接');
     elements.playerStatus.dataset.state = playerState;
     elements.playerLabel.textContent = label;
+    elements.playerStatus.hidden = state.playerConnected || state.playerConnecting;
   }
 
-  function setSwitch(element, enabled) {
+  function setSwitch(element, alertElement, regionElement, enabled) {
     element.dataset.enabled = enabled ? 'true' : 'false';
     element.textContent = enabled ? '运行中' : '已暂停';
+    alertElement.hidden = enabled;
+    regionElement.dataset.paused = enabled ? 'false' : 'true';
   }
 
   function safeCoverUrl(value) {
@@ -235,8 +242,8 @@
     lastState = state;
     renderCurrent(state);
     setPlayerConnection(state);
-    setSwitch(elements.playbackState, state.playing);
-    setSwitch(elements.requestState, state.accepting);
+    setSwitch(elements.playbackState, elements.playbackAlert, elements.playbackRegion, state.playing);
+    setSwitch(elements.requestState, elements.requestAlert, elements.queueRegion, state.accepting);
     renderQueue(state);
     elements.lastUpdated.textContent = formatTimestamp(state.timestamp);
 
@@ -265,15 +272,18 @@
     }
   }
 
-  function pollState() {
-    if (websocketConnected) return;
+  function pollState(forceSnapshot) {
+    var force = forceSnapshot === true;
+    if (websocketConnected && !force) return;
     fetch(stateUrl, { method: 'GET', cache: 'no-store' })
       .then(function (response) {
         if (!response.ok) throw new Error('HTTP ' + response.status);
         return response.json();
       })
       .then(function (payload) {
-        if (!websocketConnected) renderState(payload, 'http');
+        if (!websocketConnected || force) {
+          renderState(payload, websocketConnected ? 'websocket' : 'http');
+        }
       })
       .catch(function () {
         if (!websocketConnected) setConnection('offline', '接口未连接');
@@ -313,6 +323,9 @@
       stopPolling();
       setConnection('connected', 'WebSocket 已连接');
       if (lastState) renderState(lastState, 'websocket');
+      // A newly connected WebSocket may not receive a message until state
+      // changes, so always seed it with one current read-only HTTP snapshot.
+      pollState(true);
     });
     socket.addEventListener('message', function (event) {
       var payload = parseStateMessage(event.data);

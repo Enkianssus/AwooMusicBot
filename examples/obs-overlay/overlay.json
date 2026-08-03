@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "us.enkianss.awoo.default",
+  "name": "嗷呜默认组件",
+  "version": "1.0.0",
+  "entry": "index.html",
+  "author": "Enkianssus",
+  "description": "透明的当前播放与待播队列组件，暂停区域变红，正常状态保持安静。",
+  "homepage": "https://github.com/Enkianssus/AwooMusicBot-Overlay-Default",
+  "minAppVersion": "1.1.5"
+}

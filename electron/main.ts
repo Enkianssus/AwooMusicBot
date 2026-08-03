@@ -1,10 +1,11 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, session } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import http from 'http';
 import fs from 'fs';
 import os from 'os';
 import zlib from 'zlib';
+import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { createRequire } from 'module';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -36,6 +37,10 @@ import {
   submitFeedback
 } from './feedback-service';
 import { buildExternalApiState } from './external-api-state';
+import {
+  MAX_OVERLAY_ARCHIVE_BYTES,
+  OverlayModManager
+} from './overlay-mod-manager';
 import {
   isSuccessfulPlayerResult,
   PLAYER_LABELS,
@@ -69,6 +74,20 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const INTERNAL_HTTP_PORT = Number(process.env['BILINCM_INTERNAL_PORT']) || 5555;
 const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+const INTERNAL_API_BROWSER_TOKEN = randomBytes(32).toString('base64url');
+let overlayModManager: OverlayModManager | null = null;
+
+function getOverlayModManager(): OverlayModManager {
+  if (!overlayModManager) {
+    overlayModManager = new OverlayModManager(
+      path.join(app.getPath('userData'), 'overlay-mods'),
+      path.join(app.getAppPath(), 'examples', 'obs-overlay'),
+      app.getVersion(),
+      fetchWithTimeout
+    );
+  }
+  return overlayModManager;
+}
 
 async function fetchWithTimeout(
   input: string | URL | Request,
@@ -258,7 +277,7 @@ let appConfig: any = {
     FoliaToken: '',
     Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 },
     IdleWaitNext: true,
-    ShowPlayerCurrentTrack: false,
+    ShowPlayerCurrentTrack: true,
     PauseAfterRequests: false,
     RequestedSongArtwork: 'bili_avatar',
     ShowAllDanmaku: false,
@@ -276,11 +295,11 @@ function loadConfig() {
       appConfig = { ...appConfig, ...saved };
 
       if (!appConfig.sysConfig) {
-        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowPlayerCurrentTrack: false, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], ExternalHttpEnabled: false, ExternalWebSocketEnabled: false, ExternalApiPort: 5556 };
+        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowPlayerCurrentTrack: true, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], ExternalHttpEnabled: false, ExternalWebSocketEnabled: false, ExternalApiPort: 5556 };
       }
       if (!['NCM', 'Kugou', 'QQMusic', 'Folia'].includes(appConfig.sysConfig.PlayerType)) appConfig.sysConfig.PlayerType = 'NCM';
       if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
-      if (appConfig.sysConfig.ShowPlayerCurrentTrack === undefined) appConfig.sysConfig.ShowPlayerCurrentTrack = false;
+      if (appConfig.sysConfig.ShowPlayerCurrentTrack === undefined) appConfig.sysConfig.ShowPlayerCurrentTrack = true;
       if (appConfig.sysConfig.PauseAfterRequests === undefined) appConfig.sysConfig.PauseAfterRequests = false;
       if (!['bili_avatar', 'song_cover'].includes(appConfig.sysConfig.RequestedSongArtwork)) appConfig.sysConfig.RequestedSongArtwork = 'bili_avatar';
       if (appConfig.sysConfig.ExternalHttpEnabled === undefined) appConfig.sysConfig.ExternalHttpEnabled = false;
@@ -2089,6 +2108,48 @@ async function startBiliQrLogin() {
 
 const MAX_INTERNAL_REQUEST_BODY_BYTES = 1024 * 1024;
 
+function readBinaryRequest(
+  req: http.IncomingMessage,
+  maximumBytes: number
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const declaredLength = Number(req.headers['content-length']);
+    if (
+      Number.isFinite(declaredLength)
+      && declaredLength > maximumBytes
+    ) {
+      reject(new Error('上传的 ZIP 超过 20 MiB 限制'));
+      req.resume();
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    req.on('data', chunk => {
+      if (settled) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buffer.length;
+      if (totalBytes > maximumBytes) {
+        fail(new Error('上传的 ZIP 超过 20 MiB 限制'));
+        return;
+      }
+      chunks.push(buffer);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks, totalBytes));
+    });
+    req.on('error', error => fail(error));
+  });
+}
+
 function readRequestBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const declaredLength = Number(req.headers['content-length']);
@@ -2166,6 +2227,50 @@ function isAllowedInternalOrigin(origin: string | undefined): boolean {
   }
 }
 
+function isTrustedInternalMutationRequest(
+  req: http.IncomingMessage
+): boolean {
+  if (
+    req.headers['x-awoo-internal-token']
+    === INTERNAL_API_BROWSER_TOKEN
+  ) {
+    return true;
+  }
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    const internalOrigin =
+      `${parsed.protocol}//${parsed.hostname}:${parsed.port || (parsed.protocol === 'https:' ? '443' : '80')}`;
+    if (
+      internalOrigin === `http://localhost:${INTERNAL_HTTP_PORT}`
+      || internalOrigin === `http://127.0.0.1:${INTERNAL_HTTP_PORT}`
+    ) {
+      return true;
+    }
+    const devUrl = getDevUrl();
+    return Boolean(devUrl && new URL(devUrl).origin === parsed.origin);
+  } catch {
+    return false;
+  }
+}
+
+function attachInternalApiTokenToAppSession(): void {
+  session.defaultSession.webRequest.onBeforeSendHeaders(
+    {
+      urls: [
+        `http://localhost:${INTERNAL_HTTP_PORT}/*`,
+        `http://127.0.0.1:${INTERNAL_HTTP_PORT}/*`
+      ]
+    },
+    (details, callback) => {
+      details.requestHeaders['X-Awoo-Internal-Token'] =
+        INTERNAL_API_BROWSER_TOKEN;
+      callback({ requestHeaders: details.requestHeaders });
+    }
+  );
+}
+
 function buildExternalState() {
   return buildExternalApiState({
     appVersion: app.getVersion(),
@@ -2191,44 +2296,97 @@ function buildExternalState() {
   });
 }
 
-const OBS_OVERLAY_FILES = new Map<string, {
-  fileName: string;
-  contentType: string;
-}>([
-  ['/overlay/', {
-    fileName: 'index.html',
-    contentType: 'text/html; charset=utf-8'
-  }],
-  ['/overlay/index.html', {
-    fileName: 'index.html',
-    contentType: 'text/html; charset=utf-8'
-  }],
-  ['/overlay/styles.css', {
-    fileName: 'styles.css',
-    contentType: 'text/css; charset=utf-8'
-  }],
-  ['/overlay/app.js', {
-    fileName: 'app.js',
-    contentType: 'text/javascript; charset=utf-8'
-  }]
-]);
+const OBS_OVERLAY_HOST_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>嗷呜点歌机 Mod UI</title>
+  <link rel="stylesheet" href="/overlay/host.css">
+  <script src="/overlay/host.js" defer></script>
+</head>
+<body>
+  <iframe id="awoo-overlay-frame" title="嗷呜点歌机 Mod UI" sandbox="allow-scripts"></iframe>
+  <div id="awoo-overlay-status">正在载入 Mod UI…</div>
+</body>
+</html>`;
 
-function serveObsOverlay(pathname: string, res: http.ServerResponse): boolean {
-  const resource = OBS_OVERLAY_FILES.get(pathname);
-  if (!resource) return false;
+const OBS_OVERLAY_HOST_CSS = `
+html,body,#awoo-overlay-frame{width:100%;height:100%;margin:0;background:transparent}
+body{overflow:hidden}
+#awoo-overlay-frame{display:block;border:0;opacity:0;transition:opacity .16s ease}
+#awoo-overlay-frame[data-ready="true"]{opacity:1}
+#awoo-overlay-status{position:fixed;left:16px;top:16px;padding:8px 11px;border:1px solid rgba(120,190,255,.35);border-radius:10px;background:rgba(12,24,40,.72);color:#bfe3ff;font:12px/1.4 system-ui,sans-serif}
+#awoo-overlay-frame[data-ready="true"]+#awoo-overlay-status{display:none}
+`;
 
-  const filePath = path.join(
-    app.getAppPath(),
-    'examples',
-    'obs-overlay',
-    resource.fileName
-  );
+const OBS_OVERLAY_HOST_JS = `
+(function(){
+  var frame=document.getElementById('awoo-overlay-frame');
+  var status=document.getElementById('awoo-overlay-status');
+  var revision='';
+  function refresh(){
+    fetch('/api/v1/overlay',{cache:'no-store'}).then(function(response){
+      if(!response.ok)throw new Error('HTTP '+response.status);
+      return response.json();
+    }).then(function(state){
+      var active=state&&state.active?state.active:{};
+      var next=[active.id||'builtin',active.version||'',active.installedAt||''].join('@');
+      if(next===revision)return;
+      revision=next;
+      frame.dataset.ready='false';
+      status.textContent='正在载入 '+(active.name||'Mod UI')+'…';
+      frame.src='/overlay/content/?revision='+encodeURIComponent(next);
+    }).catch(function(error){
+      status.textContent='Mod UI 无法载入：'+error.message;
+    });
+  }
+  frame.addEventListener('load',function(){frame.dataset.ready='true'});
+  refresh();
+  window.setInterval(refresh,2000);
+}());
+`;
+
+async function serveObsOverlay(
+  pathname: string,
+  res: http.ServerResponse
+): Promise<boolean> {
   try {
-    const content = fs.readFileSync(filePath);
-    res.setHeader('Content-Type', resource.contentType);
+    if (pathname === '/overlay/' || pathname === '/overlay/index.html') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'self'; frame-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'"
+      );
+      res.end(OBS_OVERLAY_HOST_HTML);
+      return true;
+    }
+    if (pathname === '/overlay/host.css') {
+      res.setHeader('Content-Type', 'text/css; charset=utf-8');
+      res.end(OBS_OVERLAY_HOST_CSS);
+      return true;
+    }
+    if (pathname === '/overlay/host.js') {
+      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      res.end(OBS_OVERLAY_HOST_JS);
+      return true;
+    }
+    if (!pathname.startsWith('/overlay/content/')) return false;
+    const relativePath = decodeURIComponent(
+      pathname.slice('/overlay/content/'.length)
+    );
+    const asset = await getOverlayModManager().resolveActiveAsset(relativePath);
+    if (!asset) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Mod UI asset not found');
+      return true;
+    }
+    const content = await fs.promises.readFile(asset.filePath);
+    res.setHeader('Content-Type', asset.contentType);
+    res.setHeader('X-Awoo-Overlay-Revision', asset.revision);
     res.setHeader(
       'Content-Security-Policy',
-      "default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*; img-src http: https: data:; style-src 'self'; script-src 'self'; font-src 'self'"
+      "default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; img-src http: https: data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
     );
     res.end(content);
   } catch (error: unknown) {
@@ -2374,7 +2532,7 @@ async function restartExternalApiServer(): Promise<void> {
   }
 
   const port = getExternalApiPort();
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -2397,11 +2555,16 @@ async function restartExternalApiServer(): Promise<void> {
       res.end();
       return;
     }
-    if (serveObsOverlay(url.pathname, res)) return;
+    if (await serveObsOverlay(url.pathname, res)) return;
 
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     if (url.pathname === '/health') {
       res.end(JSON.stringify({ ok: true, schemaVersion: 1, version: app.getVersion() }));
+      return;
+    }
+
+    if (url.pathname === '/api/v1/overlay') {
+      res.end(JSON.stringify(await getOverlayModManager().getPublicState()));
       return;
     }
 
@@ -2498,17 +2661,89 @@ function startBackendServer() {
         res.setHeader('Vary', 'Origin');
       }
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, X-Awoo-File-Name, X-Awoo-Internal-Token'
+      );
       if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+      if (
+        req.method !== 'GET'
+        && req.method !== 'HEAD'
+        && !isTrustedInternalMutationRequest(req)
+      ) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          success: false,
+          message: 'Mod UI 只能读取状态，不能调用点歌机控制接口'
+        }));
+        return;
+      }
 
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
     if (url.pathname === '/data') {
-      const showPlayerCurrentTrack = appConfig.sysConfig?.ShowPlayerCurrentTrack === true;
+      const showPlayerCurrentTrack = appConfig.sysConfig?.ShowPlayerCurrentTrack !== false;
       const displayCurrent = currentPlayingSong || (showPlayerCurrentTrack ? playerCurrentTrack : null);
       const requestedSongArtwork = appConfig.sysConfig?.RequestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar';
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({ current: displayCurrent, currentIsRequested: !!currentPlayingSong, playerPausedAfterRequests, requestedSongArtwork, queue: targetQueue, status: connectorMaintenanceStatus || currentStatusMessage, accepting: isAccepting, playing: isPlaying, uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isPlayerConnected, playerConnected: isPlayerConnected, playerConnecting, commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand } }));
+      return;
+    }
+
+    if (url.pathname === '/api/overlays' && req.method === 'GET') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({
+        success: true,
+        ...(await getOverlayModManager().getPublicState())
+      }));
+      return;
+    }
+
+    if (url.pathname === '/api/overlays/install-url' && req.method === 'POST') {
+      const body = await readJsonRequest(req);
+      const state = await getOverlayModManager().installFromUrl(
+        String(body.url || '')
+      );
+      writeLog(`✅ [Mod UI] 已从网址安装并启用 ${state.active.name} ${state.active.version}`, 'Green');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ success: true, ...state }));
+      return;
+    }
+
+    if (url.pathname === '/api/overlays/install-zip' && req.method === 'POST') {
+      const archive = await readBinaryRequest(req, MAX_OVERLAY_ARCHIVE_BYTES);
+      const encodedName = String(req.headers['x-awoo-file-name'] || 'local-zip');
+      let sourceName = encodedName;
+      try {
+        sourceName = decodeURIComponent(encodedName);
+      } catch { /* 保留原始安全文本 */ }
+      const installed = await getOverlayModManager().installArchive(
+        archive,
+        `local:${path.basename(sourceName).slice(0, 120)}`
+      );
+      const state = await getOverlayModManager().getPublicState();
+      writeLog(`✅ [Mod UI] 已从 ZIP 安装并启用 ${installed.name} ${installed.version}`, 'Green');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ success: true, ...state }));
+      return;
+    }
+
+    if (url.pathname === '/api/overlays/activate' && req.method === 'POST') {
+      const body = await readJsonRequest(req);
+      const state = await getOverlayModManager().activate(String(body.id || ''));
+      writeLog(`🎨 [Mod UI] 已切换到 ${state.active.name} ${state.active.version}`, 'Cyan');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ success: true, ...state }));
+      return;
+    }
+
+    if (url.pathname === '/api/overlays/remove' && req.method === 'POST') {
+      const body = await readJsonRequest(req);
+      const state = await getOverlayModManager().remove(String(body.id || ''));
+      writeLog(`🗑️ [Mod UI] 已删除 ${String(body.id || '')}`, 'DarkGray');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ success: true, ...state }));
       return;
     }
 
@@ -2675,6 +2910,9 @@ function startBackendServer() {
         playerSnapshot: activePlayerSnapshot,
         connectorMaintenanceStatus,
         commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand },
+        current: currentPlayingSong || playerCurrentTrack,
+        currentIsRequested: Boolean(currentPlayingSong),
+        playerPausedAfterRequests,
         externalApi: {
           running: externalApiRunning,
           httpEnabled: appConfig.sysConfig?.ExternalHttpEnabled === true,
@@ -3080,6 +3318,7 @@ function startBackendServer() {
 app.whenReady().then(() => {
   writeLog('=== 嗷呜点歌机内部日志已连接 ===', 'Cyan');
   loadConfig();
+  attachInternalApiTokenToAppSession();
   void startPlayerBridge();
   connectorMaintenanceTimer = setInterval(
     () => void maintainPlayerConnectors(true),

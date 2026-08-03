@@ -3,76 +3,73 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
-    <title>嗷呜点歌机 OBS 展示</title>
+    <title>嗷呜点歌机 OBS 组件</title>
     <link rel="stylesheet" href="styles.css">
     <script src="app.js" defer></script>
   </head>
   <body>
-    <main class="overlay" aria-live="polite">
-      <header class="overlay-header">
-        <div class="brand">
-          <span class="brand-mark" aria-hidden="true">♫</span>
-          <span>嗷呜点歌机</span>
-        </div>
-        <div class="header-status">
-          <div class="connection" id="connection-status" data-state="offline">
-            <span class="connection-dot" aria-hidden="true"></span>
-            <span id="connection-label">接口未连接</span>
-          </div>
-          <div class="connection" id="player-status" data-state="offline">
-            <span class="connection-dot" aria-hidden="true"></span>
-            <span id="player-label">播放器未连接</span>
-          </div>
-        </div>
-      </header>
-
-      <section class="current-card" aria-labelledby="current-heading">
-        <div class="section-heading">
-          <span class="section-kicker">NOW PLAYING</span>
-          <h1 id="current-heading">正在播放</h1>
-        </div>
-        <div class="current-content">
+    <main class="widget" aria-live="polite">
+      <article class="widget-card">
+        <section class="now-playing" id="playback-region" data-paused="false" aria-labelledby="current-heading">
           <div class="cover-frame" id="current-cover-frame">
             <img id="current-cover" alt="" hidden>
             <span class="cover-fallback" id="current-cover-fallback" aria-hidden="true">♫</span>
           </div>
+
           <div class="current-copy">
-            <p class="current-title" id="current-title">等待播放</p>
-            <p class="current-artist" id="current-artist">暂无歌曲</p>
-            <p class="current-requester" id="current-requester" hidden>
-              点歌人：<span id="current-requester-name"></span>
-            </p>
+            <div class="widget-topline">
+              <div class="brand">
+                <span class="brand-mark" aria-hidden="true">♫</span>
+                <span>嗷呜点歌机</span>
+              </div>
+              <div class="connection" id="connection-status" data-state="offline">
+                <span class="connection-dot" aria-hidden="true"></span>
+                <span id="connection-label">接口未连接</span>
+              </div>
+            </div>
+
+            <div class="song-copy">
+              <span class="section-kicker">NOW PLAYING</span>
+              <h1 class="current-title" id="current-heading">
+                <span id="current-title">等待播放</span>
+              </h1>
+              <p class="current-artist" id="current-artist">暂无歌曲</p>
+              <p class="current-requester" id="current-requester" hidden>
+                点歌人：<span id="current-requester-name"></span>
+              </p>
+            </div>
+
+            <div class="state-row" aria-label="点歌机异常状态">
+              <div class="switch-chip" id="playback-alert" hidden>
+                <span class="switch-label">代播</span>
+                <span class="switch-state" id="playback-state" data-enabled="false">已暂停</span>
+              </div>
+              <div class="switch-chip" id="request-alert" hidden>
+                <span class="switch-label">点歌</span>
+                <span class="switch-state" id="request-state" data-enabled="false">已暂停</span>
+              </div>
+              <div class="connection player-connection" id="player-status" data-state="offline" hidden>
+                <span class="alert-mark" aria-hidden="true">!</span>
+                <span id="player-label">播放器未连接</span>
+              </div>
+            </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section class="switch-grid" aria-label="点歌机状态">
-        <div class="switch-card">
-          <span class="switch-label">播放</span>
-          <span class="switch-state" id="playback-state" data-enabled="false">已暂停</span>
-        </div>
-        <div class="switch-card">
-          <span class="switch-label">点歌</span>
-          <span class="switch-state" id="request-state" data-enabled="false">已暂停</span>
-        </div>
-      </section>
-
-      <section class="queue-card" aria-labelledby="queue-heading">
-        <div class="queue-heading-row">
-          <div class="section-heading compact">
-            <span class="section-kicker">UP NEXT</span>
-            <h2 id="queue-heading">待播队列</h2>
+        <section class="queue" id="queue-region" data-paused="false" aria-labelledby="queue-heading">
+          <div class="queue-heading-row">
+            <div>
+              <span class="section-kicker">UP NEXT</span>
+              <h2 id="queue-heading">待播队列</h2>
+            </div>
+            <span class="queue-count" id="queue-count">0 首</span>
           </div>
-          <span class="queue-count" id="queue-count">0 首</span>
-        </div>
-        <ol class="queue-list" id="queue-list"></ol>
-        <p class="queue-empty" id="queue-empty">暂无待播歌曲</p>
-      </section>
+          <ol class="queue-list" id="queue-list"></ol>
+          <p class="queue-empty" id="queue-empty">暂无待播歌曲</p>
+        </section>
+      </article>
 
-      <footer class="overlay-footer">
-        <span id="last-updated">等待接口数据</span>
-      </footer>
+      <span class="last-updated" id="last-updated">等待接口数据</span>
     </main>
   </body>
 </html>

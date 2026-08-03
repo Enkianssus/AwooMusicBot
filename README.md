@@ -1,6 +1,10 @@
 # 嗷呜点歌机
 
-嗷呜点歌机是一款面向 Bilibili 主播的 Windows 弹幕点歌工具。1.1.4
+<p align="center">
+  <img src="docs/images/awoo-musicbot-1.1.5.png" alt="嗷呜点歌机控制面板与 OBS 展示页面" width="100%">
+</p>
+
+嗷呜点歌机是一款面向 Bilibili 主播的 Windows 弹幕点歌工具。1.1.5
 开始支持网易云音乐、酷狗音乐、QQ 音乐和 Folia，并把各播放器的搜索、
 状态读取和控制实现拆成可独立更新的连接器。
 
@@ -39,6 +43,10 @@
 - 可选择展示主播歌单当前歌曲，并可选择点歌人头像或歌曲封面。
 - 可选的本机只读 HTTP 与 WebSocket 接口，供 OBS、插件或其它本地工具
   实时读取当前歌曲和待播队列。
+- 1.1.5 起支持可安装、切换的 OBS Mod UI：可以识别 GitHub 仓库，也可以
+  选择或拖入本地 ZIP；切换 UI 后 OBS 浏览器源地址保持不变。
+- “运行状态”会显示播放器当前歌曲、当前启用的 Mod UI，并可直接跳转到
+  Mod 设置。内置 UI 和官方示例均采用透明组件布局。
 
 ## 快速开始
 
@@ -47,8 +55,10 @@
 3. 第一次选择某个播放器时，点歌机会自动下载并安装对应连接器；不需要
    为网易云添加调试端口，也不会为此重启播放器。
 4. 在“运行状态”填写 B站直播间房间号并连接。扫码登录不是必需步骤。
-5. 在 OBS 或直播姬中添加浏览器源
-   `http://127.0.0.1:5555/`，推荐尺寸为 320 × 480。
+5. 在 OBS 或直播姬中添加浏览器源。原有整页地址为
+   `http://127.0.0.1:5555/`，Mod UI 地址默认为
+   `http://127.0.0.1:5556/overlay/`；若修改了外部接口端口，请使用界面中
+   “运行状态”显示的实际地址。
 
 连接器是非公开播放器协议的适配层。播放器更新后，如果某项私有能力发生
 变化，只需发布对应连接器的新版本，不需要同步发布点歌机本体。
@@ -90,6 +100,19 @@
 完整字段、兼容规则和第三方前端接入方式见
 [`docs/external-api.md`](docs/external-api.md)；可直接修改的零构建示例源码位于
 [`examples/obs-overlay`](examples/obs-overlay)。
+
+## OBS Mod UI
+
+在“运行状态 → Mod UI”中可以：
+
+- 输入 GitHub 仓库或发布清单网址，识别并安装 UI。
+- 选择本地 ZIP，或将 Mod UI ZIP 拖到安装区域。
+- 查看当前使用的 UI，并在已安装的 UI 之间切换。
+
+OBS 始终使用同一个 `/overlay/` 地址，安装或切换 UI 后不需要修改浏览器源。
+第三方 UI 的清单、ZIP 结构和安全限制见
+[`docs/overlay-mods.md`](docs/overlay-mods.md)。官方示例仓库为
+[`Enkianssus/AwooMusicBot-Overlay-Default`](https://github.com/Enkianssus/AwooMusicBot-Overlay-Default)。
 
 ## 本地开发
 

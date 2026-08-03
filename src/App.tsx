@@ -154,6 +154,30 @@ interface ConnectorStatus {
     error: string | null;
 }
 
+interface OverlayModRecord {
+    schemaVersion: 1;
+    id: string;
+    name: string;
+    version: string;
+    entry: string;
+    author: string;
+    description: string;
+    homepage: string;
+    minAppVersion: string;
+    installedAt: string;
+    source: string;
+    active: boolean;
+    builtin: boolean;
+}
+
+interface OverlayModState {
+    activeId: string;
+    active: OverlayModRecord;
+    overlays: OverlayModRecord[];
+    officialRepository: string;
+    officialDescriptorProxy: string;
+}
+
 // ==========================================
 // 2. 全局样式
 // ==========================================
@@ -1058,10 +1082,33 @@ const AdminWidget: React.FC = () => {
     const [feedbackLoading, setFeedbackLoading] = useState(false);
     const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
     const [feedbackResult, setFeedbackResult] = useState<any>(null);
+    const [overlayMods, setOverlayMods] = useState<OverlayModState | null>(null);
+    const [overlayUrl, setOverlayUrl] = useState(
+        'https://github.com/Enkianssus/AwooMusicBot-Overlay-Default'
+    );
+    const [overlayBusy, setOverlayBusy] = useState(false);
+    const [overlayDropActive, setOverlayDropActive] = useState(false);
+    const overlayFileInputRef = useRef<HTMLInputElement>(null);
+    const overlaySettingsRef = useRef<HTMLElement>(null);
 
     const showAdminToast = useCallback((msg: string) => {
         setAdminToast(msg);
         setTimeout(() => setAdminToast(''), 3000);
+    }, []);
+
+    const loadOverlayMods = useCallback(async () => {
+        try {
+            const response = await fetch('http://localhost:5555/api/overlays');
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.message || '读取 Mod UI 列表失败');
+            }
+            setOverlayMods(result);
+        } catch (error: unknown) {
+            console.warn(
+                error instanceof Error ? error.message : '读取 Mod UI 列表失败'
+            );
+        }
     }, []);
 
     const loadConnectorStatuses = useCallback(async (forceRefresh = false) => {
@@ -1124,6 +1171,168 @@ const AdminWidget: React.FC = () => {
         );
         return () => clearInterval(timer);
     }, [activeTab, loadConnectorStatuses]);
+
+    useEffect(() => {
+        if (activeTab !== 'status') return;
+        void loadOverlayMods();
+        const timer = setInterval(() => void loadOverlayMods(), 5000);
+        return () => clearInterval(timer);
+    }, [activeTab, loadOverlayMods]);
+
+    const installOverlayFromUrl = useCallback(async () => {
+        const url = overlayUrl.trim();
+        if (!url) {
+            showAdminToast('❌ 请输入 GitHub 仓库或发布清单网址');
+            return;
+        }
+        setOverlayBusy(true);
+        try {
+            const response = await fetch(
+                'http://localhost:5555/api/overlays/install-url',
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                }
+            );
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.message || '安装 Mod UI 失败');
+            }
+            setOverlayMods(result);
+            showAdminToast(`✅ 已安装并启用 ${result.active.name} ${result.active.version}`);
+        } catch (error: unknown) {
+            showAdminToast(
+                `❌ ${error instanceof Error ? error.message : '安装 Mod UI 失败'}`
+            );
+        } finally {
+            setOverlayBusy(false);
+        }
+    }, [overlayUrl, showAdminToast]);
+
+    const installOverlayZip = useCallback(async (file: File) => {
+        if (!/\.zip$/i.test(file.name)) {
+            showAdminToast('❌ 请选择 .zip 格式的 Mod UI 包');
+            return;
+        }
+        if (file.size > 20 * 1024 * 1024) {
+            showAdminToast('❌ Mod UI ZIP 不能超过 20 MiB');
+            return;
+        }
+        setOverlayBusy(true);
+        try {
+            const response = await fetch(
+                'http://localhost:5555/api/overlays/install-zip',
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/zip',
+                        'X-Awoo-File-Name': encodeURIComponent(file.name)
+                    },
+                    body: file
+                }
+            );
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.message || '安装 ZIP 失败');
+            }
+            setOverlayMods(result);
+            showAdminToast(`✅ 已安装并启用 ${result.active.name} ${result.active.version}`);
+        } catch (error: unknown) {
+            showAdminToast(
+                `❌ ${error instanceof Error ? error.message : '安装 ZIP 失败'}`
+            );
+        } finally {
+            setOverlayBusy(false);
+            if (overlayFileInputRef.current) {
+                overlayFileInputRef.current.value = '';
+            }
+        }
+    }, [showAdminToast]);
+
+    const activateOverlay = useCallback(async (id: string) => {
+        setOverlayBusy(true);
+        try {
+            const response = await fetch(
+                'http://localhost:5555/api/overlays/activate',
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                }
+            );
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.message || '切换 Mod UI 失败');
+            }
+            setOverlayMods(result);
+            showAdminToast(`🎨 已切换到 ${result.active.name}`);
+        } catch (error: unknown) {
+            showAdminToast(
+                `❌ ${error instanceof Error ? error.message : '切换 Mod UI 失败'}`
+            );
+        } finally {
+            setOverlayBusy(false);
+        }
+    }, [showAdminToast]);
+
+    const removeOverlay = useCallback(async (id: string) => {
+        setOverlayBusy(true);
+        try {
+            const response = await fetch(
+                'http://localhost:5555/api/overlays/remove',
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                }
+            );
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.message || '删除 Mod UI 失败');
+            }
+            setOverlayMods(result);
+            showAdminToast('🗑️ 已删除 Mod UI；若它正在使用，已切回内置 UI');
+        } catch (error: unknown) {
+            showAdminToast(
+                `❌ ${error instanceof Error ? error.message : '删除 Mod UI 失败'}`
+            );
+        } finally {
+            setOverlayBusy(false);
+        }
+    }, [showAdminToast]);
+
+    const enableOverlayApi = useCallback(async () => {
+        if (!config?.config) return;
+        const nextSysConfig = {
+            ...config.config,
+            ExternalHttpEnabled: true,
+            ExternalWebSocketEnabled: true
+        };
+        try {
+            const response = await fetch('http://localhost:5555/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sysConfig: nextSysConfig })
+            });
+            if (!response.ok) throw new Error('启动只读接口失败');
+            setConfig((previous: any) => previous ? ({
+                ...previous,
+                config: nextSysConfig,
+                externalApi: {
+                    ...(previous.externalApi || {}),
+                    running: true,
+                    httpEnabled: true,
+                    webSocketEnabled: true
+                }
+            }) : previous);
+            showAdminToast('✅ Mod UI 只读接口已启动');
+        } catch (error: unknown) {
+            showAdminToast(
+                `❌ ${error instanceof Error ? error.message : '启动只读接口失败'}`
+            );
+        }
+    }, [config, showAdminToast]);
 
     const isInitialConfigLoad = useRef(true);
     const lastConfigString = useRef('');
@@ -1783,6 +1992,12 @@ const AdminWidget: React.FC = () => {
         { type: 'QQMusic', name: 'QQ 音乐', method: '单实例命令 + 静音守卫', detail: '错误下一首静音、暂停后接管', connectorId: 'qqmusic' },
         { type: 'Folia', name: 'Folia', method: '独立 Stage 连接器', detail: 'HTTP + WebSocket；支持 ID 校验与封面', connectorId: 'folia' }
     ];
+    const classicObsUrl = 'http://localhost:5555/';
+    const externalApiPort = Number(
+        config?.externalApi?.port || config?.config?.ExternalApiPort || 5556
+    );
+    const modObsUrl = `http://127.0.0.1:${externalApiPort}/overlay/`;
+    const currentStatusSong = config?.current as SongInfo | null | undefined;
 
     return (
         <div className="admin-widget-root animate-fade-in text-gray-200 flex flex-col font-sans select-none w-full h-screen overflow-hidden" style={{ backgroundColor: '#0d1117' }}>
@@ -1856,18 +2071,73 @@ const AdminWidget: React.FC = () => {
                             )}
 
                             {activeTab === 'status' && (
-                                <div className="space-y-6 animate-slide-in-right flex flex-col h-full">
+                                <div className="space-y-5 animate-slide-in-right flex flex-col h-full pb-6">
                                     <div>
-                                        <h2 className="text-2xl font-bold text-white mb-6">运行状态</h2>
+                                        <h2 className="text-2xl font-bold text-white mb-2">运行状态</h2>
+                                        <p className="text-sm text-gray-500 mb-5">查看播放器、点歌开关和 OBS 展示页面；Mod UI 只读取公开状态，不能控制点歌机。</p>
 
-                                        <div className="bg-white/5 p-5 rounded-xl border border-white/10 flex justify-between items-center mb-5 shadow-inner">
-                                            <div>
-                                                <div className="text-sm text-gray-400 mb-1">OBS 捕捉地址 / 局域网访问</div>
-                                                <div className="text-lg font-mono text-cyan-400 select-all">http://localhost:5555/</div>
+                                        <div className="grid grid-cols-2 gap-4 mb-5">
+                                            <div className="bg-white/5 p-4 rounded-xl border border-white/10 shadow-inner">
+                                                <div className="flex items-center justify-between gap-3 mb-2">
+                                                    <span className="text-sm font-bold text-gray-200">经典页面</span>
+                                                    <span className="text-[10px] px-2 py-1 rounded-full bg-gray-500/15 text-gray-400">旧场景兼容</span>
+                                                </div>
+                                                <div className="text-xs text-gray-500 mb-3 leading-relaxed">原有整页界面，保留给已经配置好的 OBS 场景；它不是可换主题的 Mod 组件。</div>
+                                                <div className="flex items-center gap-2">
+                                                    <div className="flex-1 min-w-0 text-sm font-mono text-cyan-400 select-all truncate">{classicObsUrl}</div>
+                                                    <button onClick={() => { void navigator.clipboard.writeText(classicObsUrl); showAdminToast('✅ 已复制经典页面地址'); }} className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-xs font-bold border border-white/10">复制</button>
+                                                </div>
                                             </div>
-                                            <button onClick={() => { navigator.clipboard.writeText("http://localhost:5555/"); showAdminToast("✅ 链接复制成功！"); }} className="px-5 py-2.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 rounded-lg text-sm font-bold transition-colors border border-blue-500/30 flex items-center gap-2">
-                                                📋 复制链接
-                                            </button>
+
+                                            <div className="bg-cyan-500/5 p-4 rounded-xl border border-cyan-500/25 shadow-inner">
+                                                <div className="flex items-center justify-between gap-3 mb-2">
+                                                    <span className="text-sm font-bold text-cyan-300">Mod UI 组件</span>
+                                                    <span className="text-[10px] px-2 py-1 rounded-full bg-cyan-500/15 text-cyan-300">OBS 推荐</span>
+                                                </div>
+                                                <div className="text-xs text-gray-400 mb-3 leading-relaxed">透明组件页面。安装或切换 UI 后地址不变，OBS 会自动载入当前启用的主题。</div>
+                                                <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-cyan-400/15 bg-black/15 px-3 py-2">
+                                                    <div className="min-w-0">
+                                                        <div className="text-[10px] text-gray-500">当前使用</div>
+                                                        <div className="truncate text-xs font-bold text-white">
+                                                            {overlayMods?.active ? `${overlayMods.active.name} · v${overlayMods.active.version}` : '正在读取…'}
+                                                        </div>
+                                                    </div>
+                                                    <button
+                                                        onClick={() => overlaySettingsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                                                        className="shrink-0 rounded-lg border border-cyan-400/25 bg-cyan-500/10 px-3 py-2 text-[11px] font-bold text-cyan-300 hover:bg-cyan-500/20"
+                                                    >
+                                                        前往 Mod 设置
+                                                    </button>
+                                                </div>
+                                                <div className="flex items-center gap-2">
+                                                    <div className="flex-1 min-w-0 text-sm font-mono text-cyan-300 select-all truncate">{modObsUrl}</div>
+                                                    <button onClick={() => { void navigator.clipboard.writeText(modObsUrl); showAdminToast('✅ 已复制 Mod UI 地址'); }} className="px-3 py-2 bg-cyan-500/10 hover:bg-cyan-500/20 rounded-lg text-xs font-bold text-cyan-300 border border-cyan-500/25">复制</button>
+                                                </div>
+                                                {!config.externalApi?.httpEnabled && (
+                                                    <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2">
+                                                        <span className="text-[11px] text-amber-300">只读 HTTP 尚未开启，OBS 暂时打不开此地址。</span>
+                                                        <button onClick={enableOverlayApi} className="shrink-0 text-[11px] font-bold text-amber-200 underline">立即开启</button>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        <div className={`p-4 rounded-xl border mb-5 flex items-center gap-4 ${currentStatusSong && !config.currentIsRequested ? 'bg-sky-500/10 border-sky-400/25' : 'bg-white/5 border-white/10'}`}>
+                                            <div className={`w-12 h-12 shrink-0 rounded-xl overflow-hidden grid place-items-center ${currentStatusSong && !config.currentIsRequested ? 'bg-sky-400/15 text-sky-200' : 'bg-white/5 text-gray-400'}`}>
+                                                {currentStatusSong?.CoverUrl ? (
+                                                    <img src={currentStatusSong.CoverUrl} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
+                                                ) : '♫'}
+                                            </div>
+                                            <div className="min-w-0 flex-1">
+                                                <div className={`text-[11px] font-bold mb-1 ${currentStatusSong && !config.currentIsRequested ? 'text-sky-300' : 'text-green-400'}`}>
+                                                    {currentStatusSong ? (config.currentIsRequested ? '点歌播放中' : '播放器当前歌曲 · 主播歌单') : '播放器当前歌曲'}
+                                                </div>
+                                                <div className="font-bold text-white truncate">{currentStatusSong?.SongName || '暂未读取到歌曲'}</div>
+                                                <div className="text-xs text-gray-400 truncate mt-0.5">{currentStatusSong?.ArtistName || '连接播放器后会在这里实时显示'}</div>
+                                            </div>
+                                            <span className={`text-xs px-2.5 py-1 rounded-full border ${config.playerConnected ? 'text-green-300 border-green-500/25 bg-green-500/10' : 'text-red-300 border-red-500/25 bg-red-500/10'}`}>
+                                                {config.playerConnected ? '播放器已连接' : '播放器未连接'}
+                                            </span>
                                         </div>
 
                                         <div className="bg-white/5 p-5 rounded-xl border border-white/10 shadow-inner mb-5">
@@ -1887,7 +2157,7 @@ const AdminWidget: React.FC = () => {
                                             </div>
                                         </div>
 
-                                        <div className="grid grid-cols-2 gap-5">
+                                        <div className="grid grid-cols-2 gap-4 mb-5">
                                             <div className="bg-white/5 p-5 rounded-xl border border-white/10 flex justify-between items-center">
                                                 <div>
                                                     <div className="text-sm text-gray-400 mb-2">点歌功能状态</div>
@@ -1912,6 +2182,85 @@ const AdminWidget: React.FC = () => {
                                                 </button>
                                             </div>
                                         </div>
+
+                                        <section ref={overlaySettingsRef} className="bg-gradient-to-br from-violet-500/[0.08] to-cyan-500/[0.05] rounded-2xl border border-violet-400/25 overflow-hidden scroll-mt-4">
+                                            <div className="p-5 border-b border-white/10 flex items-start justify-between gap-4">
+                                                <div>
+                                                    <div className="flex items-center gap-2">
+                                                        <h3 className="text-lg font-bold text-white">🎨 Mod UI</h3>
+                                                        {overlayMods?.active && <span className="text-[10px] px-2 py-1 rounded-full bg-violet-500/20 text-violet-200 border border-violet-400/20">当前：{overlayMods.active.name}</span>}
+                                                    </div>
+                                                    <p className="text-xs text-gray-400 mt-1 leading-relaxed">支持 GitHub 仓库发布清单，也支持选择或拖入本地 ZIP。包会经过路径、体积和文件类型校验。</p>
+                                                </div>
+                                                <a href="https://github.com/Enkianssus/AwooMusicBot-Overlay-Default" target="_blank" rel="noreferrer" className="text-xs text-cyan-300 hover:text-cyan-200 underline shrink-0">开发示例</a>
+                                            </div>
+
+                                            <div className="p-5 space-y-4">
+                                                <div className="flex gap-2">
+                                                    <input
+                                                        type="url"
+                                                        value={overlayUrl}
+                                                        onChange={event => setOverlayUrl(event.target.value)}
+                                                        placeholder="https://github.com/作者/仓库"
+                                                        className="flex-1 min-w-0 bg-black/30 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:border-violet-400 outline-none"
+                                                    />
+                                                    <button disabled={overlayBusy} onClick={installOverlayFromUrl} className="px-4 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-sm font-bold transition-colors">
+                                                        {overlayBusy ? '处理中…' : '识别并安装'}
+                                                    </button>
+                                                    <button disabled={overlayBusy} onClick={() => overlayFileInputRef.current?.click()} className="px-4 py-2.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50 text-gray-200 text-sm font-bold border border-white/10 transition-colors">＋ 选择 ZIP</button>
+                                                    <input
+                                                        ref={overlayFileInputRef}
+                                                        type="file"
+                                                        accept=".zip,application/zip"
+                                                        hidden
+                                                        onChange={event => {
+                                                            const file = event.target.files?.[0];
+                                                            if (file) void installOverlayZip(file);
+                                                        }}
+                                                    />
+                                                </div>
+
+                                                <div
+                                                    onDragEnter={event => { event.preventDefault(); setOverlayDropActive(true); }}
+                                                    onDragOver={event => { event.preventDefault(); setOverlayDropActive(true); }}
+                                                    onDragLeave={event => { event.preventDefault(); setOverlayDropActive(false); }}
+                                                    onDrop={event => {
+                                                        event.preventDefault();
+                                                        setOverlayDropActive(false);
+                                                        const file = event.dataTransfer.files?.[0];
+                                                        if (file) void installOverlayZip(file);
+                                                    }}
+                                                    className={`rounded-xl border border-dashed px-4 py-3 text-center text-xs transition-colors ${overlayDropActive ? 'border-cyan-300 bg-cyan-400/10 text-cyan-200' : 'border-white/15 bg-black/15 text-gray-500'}`}
+                                                >
+                                                    {overlayDropActive ? '松开即可安装 Mod UI ZIP' : '将 Mod UI ZIP 拖到这里安装'}
+                                                </div>
+
+                                                <div className="space-y-2">
+                                                    {(overlayMods?.overlays || []).map(overlay => (
+                                                        <div key={overlay.id} className={`rounded-xl border p-3 flex items-center gap-3 ${overlay.active ? 'border-violet-400/35 bg-violet-500/10' : 'border-white/10 bg-black/15'}`}>
+                                                            <div className={`w-9 h-9 rounded-lg grid place-items-center shrink-0 ${overlay.active ? 'bg-violet-500/25 text-violet-200' : 'bg-white/5 text-gray-500'}`}>◫</div>
+                                                            <div className="min-w-0 flex-1">
+                                                                <div className="flex items-center gap-2">
+                                                                    <span className="text-sm font-bold text-white truncate">{overlay.name}</span>
+                                                                    <span className="text-[10px] text-gray-500">v{overlay.version}</span>
+                                                                    {overlay.builtin && <span className="text-[10px] text-gray-500">内置</span>}
+                                                                </div>
+                                                                <div className="text-[11px] text-gray-500 truncate mt-0.5">{overlay.description || `${overlay.author} · ${overlay.id}`}</div>
+                                                            </div>
+                                                            {overlay.active ? (
+                                                                <span className="text-xs font-bold text-violet-300 px-3 py-1.5">使用中</span>
+                                                            ) : (
+                                                                <button disabled={overlayBusy} onClick={() => void activateOverlay(overlay.id)} className="text-xs font-bold text-cyan-300 px-3 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 disabled:opacity-50">切换</button>
+                                                            )}
+                                                            {!overlay.builtin && (
+                                                                <button disabled={overlayBusy} onClick={() => void removeOverlay(overlay.id)} title="删除这个 Mod UI" className="text-xs text-red-300/70 hover:text-red-300 px-2 py-1.5 disabled:opacity-50">删除</button>
+                                                            )}
+                                                        </div>
+                                                    ))}
+                                                    {!overlayMods && <div className="text-xs text-gray-500 py-2">正在读取已安装 Mod UI…</div>}
+                                                </div>
+                                            </div>
+                                        </section>
                                     </div>
                                 </div>
                             )}

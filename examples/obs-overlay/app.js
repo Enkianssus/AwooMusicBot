@@ -44,6 +44,16 @@
   var websocketConnected = false;
   var lastState = null;
 
+  window.addEventListener('awoo-overlay-settings', function (event) {
+    var values = event.detail && event.detail.values && typeof event.detail.values === 'object'
+      ? event.detail.values
+      : {};
+    if (Number.isFinite(Number(values.maxQueue))) {
+      maxQueue = readMaxQueue(String(values.maxQueue));
+      if (lastState) renderQueue(lastState);
+    }
+  });
+
   function readPort(value, fallbackPort) {
     var parsed = Number.parseInt(value || '', 10);
     return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535

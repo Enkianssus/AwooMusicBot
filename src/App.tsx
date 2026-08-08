@@ -5,7 +5,8 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 // ==========================================
 const isElectron = new URLSearchParams(window.location.search).get('mode') === 'electron';
 
-const electronAPI = isElectron ? window.electronAPI : undefined;
+const electronAPI = window.electronAPI;
+const SKIN_MARKETPLACE_URL = 'https://awoo-skins.enkianss.us/';
 
 // ==========================================
 // 1. 类型定义
@@ -154,6 +155,25 @@ interface ConnectorStatus {
     error: string | null;
 }
 
+type OverlaySettingValue = string | number | boolean;
+
+interface OverlaySettingDefinition {
+    key: string;
+    label: string;
+    description: string;
+    group: string;
+    type: 'color' | 'range' | 'toggle' | 'select' | 'text';
+    default: OverlaySettingValue;
+    cssVariable: string;
+    cssUnit: string;
+    min?: number;
+    max?: number;
+    step?: number;
+    maxLength?: number;
+    placeholder?: string;
+    options?: Array<{ label: string; value: string }>;
+}
+
 interface OverlayModRecord {
     schemaVersion: 1;
     id: string;
@@ -168,6 +188,8 @@ interface OverlayModRecord {
     source: string;
     active: boolean;
     builtin: boolean;
+    settings: OverlaySettingDefinition[];
+    values: Record<string, OverlaySettingValue>;
 }
 
 interface OverlayModState {
@@ -177,6 +199,120 @@ interface OverlayModState {
     officialRepository: string;
     officialDescriptorProxy: string;
 }
+
+const OverlaySettingControl: React.FC<{
+    definition: OverlaySettingDefinition;
+    value: OverlaySettingValue | undefined;
+    onChange: (value: OverlaySettingValue) => void;
+    onReset: () => void;
+}> = ({ definition, value, onChange, onReset }) => {
+    const currentValue = value ?? definition.default;
+    const isDefault = currentValue === definition.default;
+    const description = definition.description && (
+        <div className="mt-0.5 text-[10px] leading-relaxed text-gray-500">{definition.description}</div>
+    );
+    const resetButton = (
+        <button
+            type="button"
+            aria-label={`恢复${definition.label}默认值`}
+            title="恢复此项默认值"
+            disabled={isDefault}
+            onClick={event => {
+                event.preventDefault();
+                event.stopPropagation();
+                onReset();
+            }}
+            className="grid h-6 w-6 shrink-0 place-items-center rounded-md border border-white/10 bg-white/5 text-sm leading-none text-gray-400 transition-colors hover:border-cyan-400/30 hover:bg-cyan-500/10 hover:text-cyan-200 disabled:cursor-default disabled:opacity-25 disabled:hover:border-white/10 disabled:hover:bg-white/5 disabled:hover:text-gray-400"
+        >
+            ↶
+        </button>
+    );
+    if (definition.type === 'toggle') {
+        const enabled = currentValue === true;
+        return (
+            <div className="flex items-center justify-between gap-4 rounded-lg border border-white/5 bg-black/15 px-3 py-2.5">
+                <div className="min-w-0">
+                    <div className="text-xs font-medium text-gray-200">{definition.label}</div>
+                    {description}
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                    {resetButton}
+                    <button aria-label={definition.label} onClick={() => onChange(!enabled)} className={`h-6 w-10 shrink-0 rounded-full p-1 transition-colors ${enabled ? 'bg-cyan-500' : 'bg-white/15'}`}>
+                        <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${enabled ? 'translate-x-4' : 'translate-x-0'}`} />
+                    </button>
+                </div>
+            </div>
+        );
+    }
+    if (definition.type === 'color') {
+        const color = typeof currentValue === 'string' ? currentValue : String(definition.default);
+        return (
+            <div className="flex items-center justify-between gap-4 rounded-lg border border-white/5 bg-black/15 px-3 py-2.5">
+                <span className="min-w-0">
+                    <span className="block text-xs font-medium text-gray-200">{definition.label}</span>
+                    {description}
+                </span>
+                <span className="flex shrink-0 items-center gap-2 font-mono text-[10px] text-gray-500">
+                    {resetButton}
+                    {color}
+                    <input aria-label={definition.label} type="color" value={color} onChange={event => onChange(event.target.value)} className="h-8 w-8 cursor-pointer rounded bg-transparent" />
+                </span>
+            </div>
+        );
+    }
+    if (definition.type === 'range') {
+        const numericValue = typeof currentValue === 'number' ? currentValue : Number(definition.default);
+        const isFractionalOpacity = definition.key.toLowerCase().includes('opacity') && Number(definition.max) <= 1;
+        const displayValue = isFractionalOpacity
+            ? `${Math.round(numericValue * 100)}%`
+            : `${numericValue}${definition.cssUnit === 's' ? ' 秒' : definition.cssUnit || ''}`;
+        return (
+            <div className="block rounded-lg border border-white/5 bg-black/15 px-3 py-2.5">
+                <span className="flex items-center justify-between gap-3">
+                    <span className="text-xs font-medium text-gray-200">{definition.label}</span>
+                    <span className="flex items-center gap-2">
+                        <span className="text-[11px] font-bold text-cyan-300">{displayValue}</span>
+                        {resetButton}
+                    </span>
+                </span>
+                {description}
+                <span className="mt-2 flex items-center gap-2">
+                    <input aria-label={definition.label} type="range" min={definition.min} max={definition.max} step={definition.step} value={numericValue} onChange={event => onChange(Number(event.target.value))} className="min-w-0 flex-1 accent-cyan-500" />
+                    <input aria-label={`${definition.label}数值`} type="number" min={definition.min} max={definition.max} step={definition.step} value={numericValue} onChange={event => {
+                        const next = Number(event.target.value);
+                        if (Number.isFinite(next)) {
+                            onChange(Math.min(Number(definition.max), Math.max(Number(definition.min), next)));
+                        }
+                    }} className="w-16 rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-right text-[10px] text-gray-300 outline-none focus:border-cyan-400" />
+                </span>
+            </div>
+        );
+    }
+    if (definition.type === 'select') {
+        return (
+            <div className="block rounded-lg border border-white/5 bg-black/15 px-3 py-2.5">
+                <span className="flex items-center justify-between gap-3">
+                    <span className="text-xs font-medium text-gray-200">{definition.label}</span>
+                    {resetButton}
+                </span>
+                {description}
+                <select aria-label={definition.label} value={String(currentValue)} onChange={event => onChange(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black px-2.5 py-2 text-xs text-white outline-none focus:border-cyan-400">
+                    {(definition.options || []).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+            </div>
+        );
+    }
+    return (
+        <div className="block rounded-lg border border-white/5 bg-black/15 px-3 py-2.5">
+            <span className="flex items-center justify-between gap-3">
+                <span className="text-xs font-medium text-gray-200">{definition.label}</span>
+                {resetButton}
+            </span>
+            {description}
+            <input aria-label={definition.label} type="text" maxLength={definition.maxLength} placeholder={definition.placeholder} value={String(currentValue)} onChange={event => onChange(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/30 px-2.5 py-2 text-xs text-white outline-none focus:border-cyan-400" />
+        </div>
+    );
+};
 
 // ==========================================
 // 2. 全局样式
@@ -254,9 +390,10 @@ const defaultTheme: Theme = {
 // ==========================================
 interface OverlayWidgetProps {
     onToggleAdmin: () => void;
+    onOpenAppearance: () => void;
 }
 
-const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
+const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppearance }) => {
     const [data, setData] = useState<{ current: SongInfo | null; currentIsRequested: boolean; playerPausedAfterRequests: boolean; requestedSongArtwork: RequestedSongArtwork; queue: SongInfo[]; status: string }>({ current: null, currentIsRequested: false, playerPausedAfterRequests: false, requestedSongArtwork: 'bili_avatar', queue: [], status: '' });
     const [isConnected, setIsConnected] = useState<boolean>(true);
     const [isCdpConnected, setIsCdpConnected] = useState<boolean>(true);
@@ -268,7 +405,6 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [newItemsIds, setNewItemsIds] = useState<Set<string>>(new Set());
 
     const [dragInfo, setDragInfo] = useState<DragInfo | null>(null);
-    const [showSettings, setShowSettings] = useState<boolean>(false);
     const [titleBarActionsOpen, setTitleBarActionsOpen] = useState<boolean>(false);
 
     // ⭐ 新增: 全局 UI 500ms 冷却锁定
@@ -314,14 +450,47 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     });
 
     useEffect(() => {
-        const isFirstTime = localStorage.getItem('bili-first-launch') === null;
-        if (isFirstTime && isElectron) {
-            localStorage.setItem('bili-first-launch', 'false');
-            setTimeout(() => {
+        if (!isElectron) return;
+
+        let cancelled = false;
+        let welcomeTimer: ReturnType<typeof setTimeout> | undefined;
+        const legacyHintWasShown = (() => {
+            try {
+                return localStorage.getItem('bili-first-launch') !== null;
+            } catch {
+                return false;
+            }
+        })();
+
+        const showWelcomeHint = async () => {
+            let shouldShow = !legacyHintWasShown;
+            try {
+                if (electronAPI?.claimWelcomeHint) {
+                    shouldShow = await electronAPI.claimWelcomeHint(legacyHintWasShown);
+                }
+            } catch {
+                // 旧版 preload 或本地存储不可用时，保留原有的一次性行为。
+            }
+
+            try {
+                localStorage.setItem('bili-first-launch', 'false');
+            } catch {
+                // 主进程配置仍会负责跨版本持久化。
+            }
+
+            if (!shouldShow || cancelled) return;
+            welcomeTimer = setTimeout(() => {
+                if (cancelled) return;
                 triggerToast("🎉 欢迎使用！已自动为您打开控制面板。如果您关闭了它，可随时点击右上角的 ⚙️ 按钮呼出！");
                 electronAPI?.openAdmin();
             }, 1000);
-        }
+        };
+
+        void showWelcomeHint();
+        return () => {
+            cancelled = true;
+            if (welcomeTimer) clearTimeout(welcomeTimer);
+        };
     }, []);
 
     // 外观设置自动保存机制 (防抖 0.5s)
@@ -343,7 +512,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             };
 
             lastSyncTimeRef.current = timestamp;
-            fetch('http://localhost:5555/api/config', {
+            fetch('http://127.0.0.1:5555/api/config', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ widgetStyle: widgetStyleToSave })
             }).catch(()=>{});
@@ -367,7 +536,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     useEffect(() => {
         const fetchData = async () => {
             try {
-                const res = await fetch('http://localhost:5555/data');
+                const res = await fetch('http://127.0.0.1:5555/data');
                 if (!res.ok) throw new Error("Network response was not ok");
                 const json: any = await res.json();
 
@@ -431,7 +600,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         if (!isElectron || actionLock) return;
         triggerActionLock();
         try {
-            await fetch('http://localhost:5555/api/queue/action', {
+            await fetch('http://127.0.0.1:5555/api/queue/action', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action, ...payload })
@@ -535,7 +704,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         e?.stopPropagation?.();
         triggerActionLock();
         try {
-            await fetch('http://localhost:5555/api/state/toggle', { method: 'POST' });
+            await fetch('http://127.0.0.1:5555/api/state/toggle', { method: 'POST' });
             setAccepting(!accepting);
         } catch(err) { console.error(err); }
     };
@@ -545,14 +714,14 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         e?.stopPropagation?.();
         triggerActionLock();
         try {
-            await fetch('http://localhost:5555/api/state/toggle_play', { method: 'POST' });
+            await fetch('http://127.0.0.1:5555/api/state/toggle_play', { method: 'POST' });
             setPlaying(!playing);
         } catch(err) { console.error(err); }
     };
 
     const handleWindowClose = () => {
         if (isElectron) electronAPI?.closeWindow();
-        else { fetch('http://localhost:5555/api/exit', { method: 'POST' }); window.close(); }
+        else { fetch('http://127.0.0.1:5555/api/exit', { method: 'POST' }); window.close(); }
     };
 
     const handleWindowMinimize = () => {
@@ -674,15 +843,19 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         return '';
     };
 
+    // 后端暂时不可用时不要把控制入口藏在悬停动画里，确保用户仍能打开设置自救。
+    const titleBarActionsVisible = titleBarActionsOpen || !isConnected;
+
     return (
         <div className={isElectron
             ? "w-full h-screen p-5 flex flex-col font-sans select-none group box-border overflow-hidden bg-transparent pointer-events-none no-drag"
             : "react-widget-root absolute p-4 flex flex-col font-sans select-none z-[50] group cursor-grab active:cursor-grabbing"
         }>
-            <div className="fixed top-8 left-1/2 transform -translate-x-1/2 z-[9999] flex flex-col gap-2 pointer-events-none w-max">
+            <div className="fixed top-14 left-1/2 z-[9999] flex w-[calc(100%-2rem)] max-w-[430px] -translate-x-1/2 flex-col gap-2 pointer-events-none">
                 {toasts.map(t => (
-                    <div key={t.id} className="animate-toast bg-gradient-to-r from-blue-600 to-cyan-500 border border-cyan-400/50 text-white px-5 py-2.5 rounded-full shadow-[0_10px_30px_rgba(6,182,212,0.4)] text-sm font-bold flex items-center gap-2.5">
-                        <span className="text-xl">🔔</span> {t.msg}
+                    <div key={t.id} className="animate-toast flex w-full min-w-0 items-start gap-2.5 rounded-2xl border border-cyan-400/50 bg-gradient-to-r from-blue-600 to-cyan-500 px-4 py-3 text-sm font-bold leading-relaxed text-white shadow-[0_10px_30px_rgba(6,182,212,0.4)]">
+                        <span className="shrink-0 text-xl leading-5">🔔</span>
+                        <span className="min-w-0 flex-1 whitespace-normal break-words">{t.msg}</span>
                     </div>
                 ))}
             </div>
@@ -763,7 +936,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 {!theme.showTitleBar && isElectron && (
                     <div className="no-drag absolute top-3 right-3 flex gap-2 z-50 drop-shadow-md opacity-0 group-hover:opacity-100 transition-opacity duration-300">
                         <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="控制面板">⚙️</button>
-                        <button onMouseDown={e => e.stopPropagation()} onClick={() => setShowSettings(!showSettings)} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="外观设置">🎨</button>
+                        <button onMouseDown={e => e.stopPropagation()} onClick={onOpenAppearance} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="在控制面板打开外观设置">🎨</button>
 
                         <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="flex items-center justify-center w-6 h-6 rounded-full transition-colors text-white/50 hover:text-white hover:bg-white/20 text-md font-bold" title="最小化">—</button>
                         <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="flex items-center justify-center w-6 h-6 rounded-full transition-colors text-white/50 hover:text-red-400 hover:bg-red-500/20 text-md" title="关闭点歌机">✖</button>
@@ -787,7 +960,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
                         <div className="flex items-center relative h-6 flex-1 justify-end min-w-0">
                             <div
-                                className={`absolute right-0 text-xs font-medium max-w-[150px] truncate pointer-events-none transition-all duration-150 ${isElectron && titleBarActionsOpen ? '-translate-x-[118px] opacity-50' : ''} ${getStatusAnimation(data.status)}`}
+                                className={`absolute right-0 text-xs font-medium max-w-[150px] truncate pointer-events-none transition-all duration-150 ${isElectron && titleBarActionsVisible ? '-translate-x-[118px] opacity-50' : ''} ${getStatusAnimation(data.status)}`}
                                 style={{ color: !isConnected ? theme.subTextColor : getStatusColor(data.status) }}
                             >
                                 {!isConnected ? '等待后端...' : (data.status || '点歌就绪')}
@@ -797,11 +970,11 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                                 <div
                                     onMouseEnter={() => setTitleBarActionsOpen(true)}
                                     onMouseLeave={() => setTitleBarActionsOpen(false)}
-                                    className={`no-drag absolute right-0 top-1/2 -translate-y-1/2 h-8 overflow-hidden z-20 transition-[width] duration-150 ease-out ${titleBarActionsOpen ? 'w-[116px]' : 'w-8'}`}
+                                    className={`no-drag absolute right-0 top-1/2 -translate-y-1/2 h-8 overflow-hidden z-20 transition-[width] duration-150 ease-out ${titleBarActionsVisible ? 'w-[116px]' : 'w-8'}`}
                                 >
-                                    <div className={`ml-auto flex h-full w-[112px] items-center justify-end gap-2 transition-all duration-150 ${titleBarActionsOpen ? 'translate-x-0 opacity-100' : 'translate-x-2 opacity-0 pointer-events-none'}`}>
+                                    <div className={`ml-auto flex h-full w-[112px] items-center justify-end gap-2 transition-all duration-150 ${titleBarActionsVisible ? 'translate-x-0 opacity-100' : 'translate-x-2 opacity-0 pointer-events-none'}`}>
                                         <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="no-drag text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="控制面板">⚙️</button>
-                                        <button onMouseDown={e => e.stopPropagation()} onClick={() => setShowSettings(!showSettings)} className="no-drag text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="外观设置">🎨</button>
+                                        <button onMouseDown={e => e.stopPropagation()} onClick={onOpenAppearance} className="no-drag text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="在控制面板打开外观设置">🎨</button>
                                         <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-white hover:bg-white/20 text-xs font-bold" title="最小化">−</button>
                                         <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-red-400 hover:bg-red-500/20 text-xs" title="关闭本窗口">✖</button>
                                     </div>
@@ -974,62 +1147,6 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                     </div>
                 </div>
 
-                {/* 界面设置抽屉 */}
-                {isElectron && showSettings && (
-                    <div
-                        onMouseDown={e => e.stopPropagation()}
-                        className="no-drag absolute top-0 right-0 bottom-0 w-[220px] bg-black/85 backdrop-blur-xl z-[70] border-l border-white/10 p-4 flex flex-col gap-4 animate-slide-in-right shadow-2xl custom-scrollbar overflow-y-auto"
-                        style={{ transform: 'translateZ(0)', backfaceVisibility: 'hidden' }}
-                    >
-                        <div className="flex justify-between items-center border-b border-white/10 pb-2">
-                            <h2 className="font-bold text-sm text-white">🎨 外观设置</h2>
-                            <button onClick={() => setShowSettings(false)} className="text-white/50 hover:text-white text-lg leading-none cursor-pointer">×</button>
-                        </div>
-
-                        <div className="flex flex-col gap-3 pb-3 border-b border-white/10">
-                            <div className="flex justify-between items-center">
-                                <label className="text-[11px] text-white/70 font-medium">极简待播队列 (Mini模式)</label>
-                                <button onClick={() => setTheme({...theme, compactQueue: !theme.compactQueue})} className={`w-7 h-4 rounded-full p-0.5 transition-colors ${theme.compactQueue ? 'bg-blue-500' : 'bg-white/20'}`}><div className={`w-3 h-3 rounded-full bg-white transition-transform ${theme.compactQueue ? 'translate-x-3' : 'translate-x-0'}`}></div></button>
-                            </div>
-                            <div className="flex justify-between items-center">
-                                <label className="text-[11px] text-white/70 font-medium">显示标题栏</label>
-                                <button onClick={() => setTheme({...theme, showTitleBar: !theme.showTitleBar})} className={`w-7 h-4 rounded-full p-0.5 transition-colors ${theme.showTitleBar ? 'bg-blue-500' : 'bg-white/20'}`}><div className={`w-3 h-3 rounded-full bg-white transition-transform ${theme.showTitleBar ? 'translate-x-3' : 'translate-x-0'}`}></div></button>
-                            </div>
-                            {theme.showTitleBar && (
-                                <>
-                                    <div className="flex justify-between items-center">
-                                        <label className="text-[11px] text-white/70 font-medium">标题栏融入背景</label>
-                                        <button onClick={() => setTheme({...theme, syncTitleBarWithBg: !theme.syncTitleBarWithBg})} className={`w-7 h-4 rounded-full p-0.5 transition-colors ${theme.syncTitleBarWithBg ? 'bg-blue-500' : 'bg-white/20'}`}><div className={`w-3 h-3 rounded-full bg-white transition-transform ${theme.syncTitleBarWithBg ? 'translate-x-3' : 'translate-x-0'}`}></div></button>
-                                    </div>
-                                    {!theme.syncTitleBarWithBg && (
-                                        <div className="flex justify-between items-center">
-                                            <label className="text-[11px] text-white/70 font-medium">背景色</label>
-                                            <input type="color" value={theme.titleBarBgColor} onChange={e => setTheme({...theme, titleBarBgColor: e.target.value})} className="w-5 h-5 rounded cursor-pointer shrink-0" />
-                                        </div>
-                                    )}
-                                </>
-                            )}
-                        </div>
-
-                        <div className="flex flex-col gap-2.5 pb-3 border-b border-white/10">
-                            <div className="flex justify-between items-center"><label className="text-[11px] text-white/70 font-medium">标题/高亮字</label><input type="color" value={theme.titleColor} onChange={e => setTheme({...theme, titleColor: e.target.value})} className="w-5 h-5 rounded cursor-pointer shrink-0" /></div>
-                            <div className="flex justify-between items-center"><label className="text-[11px] text-white/70 font-medium">主体文字</label><input type="color" value={theme.textColor} onChange={e => setTheme({...theme, textColor: e.target.value})} className="w-5 h-5 rounded cursor-pointer shrink-0" /></div>
-                            <div className="flex justify-between items-center"><label className="text-[11px] text-white/70 font-medium">次要文字</label><input type="color" value={theme.subTextColor} onChange={e => setTheme({...theme, subTextColor: e.target.value})} className="w-5 h-5 rounded cursor-pointer shrink-0" /></div>
-                        </div>
-
-                        <div className="flex flex-col gap-2.5">
-                            <div className="flex justify-between items-center"><label className="text-[11px] text-white/70 font-medium">全局背景色</label><input type="color" value={theme.bgColor} onChange={e => setTheme({...theme, bgColor: e.target.value})} className="w-5 h-5 rounded cursor-pointer shrink-0" /></div>
-                            <div className="flex flex-col gap-1.5 mb-2">
-                                <label className="text-[11px] text-white/70 font-medium flex justify-between"><span>不透明度</span><span className="text-white/90">{Math.round(theme.bgOpacity * 100)}%</span></label>
-                                <input type="range" min="0" max="1" step="0.05" value={theme.bgOpacity} onChange={e => setTheme({...theme, bgOpacity: parseFloat(e.target.value)})} className="w-full h-1 bg-white/20 rounded-lg appearance-none cursor-pointer accent-white" />
-                            </div>
-                        </div>
-
-                        <div className="mt-auto flex flex-col gap-2">
-                            <button className="py-2 w-full bg-white/10 hover:bg-white/20 rounded-lg text-white text-[11px] font-medium transition-colors" onClick={() => setTheme(defaultTheme)}>恢复默认外观</button>
-                        </div>
-                    </div>
-                )}
             </div>
         </div>
     );
@@ -1041,7 +1158,12 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
 const AdminWidget: React.FC = () => {
     const [config, setConfig] = useState<any>(null);
-    const [activeTab, setActiveTab] = useState<string>('settings');
+    const [activeTab, setActiveTab] = useState<string>(() => (
+        new URLSearchParams(window.location.search).get('tab') === 'appearance'
+            ? 'appearance'
+            : 'settings'
+    ));
+    const [supportMenuOpen, setSupportMenuOpen] = useState(false);
 
     const [updateInfo, setUpdateInfo] = useState<UpdateInfo>({ checking: false, info: null });
     const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
@@ -1084,21 +1206,129 @@ const AdminWidget: React.FC = () => {
     const [feedbackResult, setFeedbackResult] = useState<any>(null);
     const [overlayMods, setOverlayMods] = useState<OverlayModState | null>(null);
     const [overlayUrl, setOverlayUrl] = useState(
-        'https://github.com/Enkianssus/AwooMusicBot-Overlay-Default'
+        'https://app.enkianss.us/mods/v1/retro-cmd/manifest.json'
     );
     const [overlayBusy, setOverlayBusy] = useState(false);
     const [overlayDropActive, setOverlayDropActive] = useState(false);
+    const [overlayPreviewNonce, setOverlayPreviewNonce] = useState(0);
+    const [overlayPreviewBackground, setOverlayPreviewBackground] = useState<'checker' | 'dark' | 'light'>('checker');
     const overlayFileInputRef = useRef<HTMLInputElement>(null);
-    const overlaySettingsRef = useRef<HTMLElement>(null);
+    const appearanceSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const overlaySettingsSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const pendingOverlaySettingsRef = useRef<{
+        id: string;
+        values: Record<string, OverlaySettingValue>;
+    } | null>(null);
+    const roomSetupRef = useRef<HTMLDivElement>(null);
+    const modUiSetupRef = useRef<HTMLElement>(null);
+    const playerSetupRef = useRef<HTMLDivElement>(null);
+    const permissionSetupRef = useRef<HTMLDivElement>(null);
+    const firstRunGuidePending = (() => {
+        try {
+            return localStorage.getItem('awoo-admin-onboarding-v1') !== 'completed';
+        } catch {
+            return true;
+        }
+    })();
+    const [onboardingActive, setOnboardingActive] = useState(firstRunGuidePending);
+    const [onboardingOpen, setOnboardingOpen] = useState(firstRunGuidePending);
+    const [onboardingStep, setOnboardingStep] = useState(0);
+    const [pendingOnboardingTarget, setPendingOnboardingTarget] = useState<'room' | 'mod-ui' | 'player' | 'permission' | null>(null);
+
+    useEffect(() => {
+        return electronAPI?.onAdminNavigate(tab => {
+            if (tab === 'appearance') setActiveTab('appearance');
+        });
+    }, []);
 
     const showAdminToast = useCallback((msg: string) => {
         setAdminToast(msg);
         setTimeout(() => setAdminToast(''), 3000);
     }, []);
 
+    const finishOnboarding = useCallback(() => {
+        try {
+            localStorage.setItem('awoo-admin-onboarding-v1', 'completed');
+        } catch {
+            // 本地存储不可用时仍允许用户关闭引导。
+        }
+        setOnboardingOpen(false);
+        setOnboardingActive(false);
+    }, []);
+
+    const restartOnboarding = useCallback(() => {
+        setOnboardingStep(0);
+        setOnboardingActive(true);
+        setOnboardingOpen(true);
+    }, []);
+
+    const openOnboardingDestination = useCallback((
+        tab: 'login' | 'status' | 'appearance' | 'settings',
+        target: 'room' | 'mod-ui' | 'player' | 'permission' | null,
+        advance: boolean
+    ) => {
+        setActiveTab(tab);
+        setPendingOnboardingTarget(target);
+        setOnboardingOpen(false);
+        setOnboardingActive(true);
+        if (advance) {
+            setOnboardingStep(previous => Math.min(previous + 1, 3));
+        }
+    }, []);
+
+    useEffect(() => {
+        if (!pendingOnboardingTarget) return;
+        const timer = setTimeout(() => {
+            const target = pendingOnboardingTarget === 'room'
+                ? roomSetupRef.current
+                : pendingOnboardingTarget === 'mod-ui'
+                    ? modUiSetupRef.current
+                    : pendingOnboardingTarget === 'player'
+                        ? playerSetupRef.current
+                        : permissionSetupRef.current;
+            target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            setPendingOnboardingTarget(null);
+        }, 120);
+        return () => clearTimeout(timer);
+    }, [activeTab, pendingOnboardingTarget]);
+
+    const updateControlTheme = useCallback((nextTheme: Theme) => {
+        if (!config) return;
+        const nextWidgetStyle = {
+            ...(config.widgetStyle || {}),
+            theme: nextTheme,
+            timestamp: Date.now()
+        };
+        setConfig((previous: any) => previous ? ({
+            ...previous,
+            widgetStyle: nextWidgetStyle
+        }) : previous);
+        if (appearanceSaveTimerRef.current) {
+            clearTimeout(appearanceSaveTimerRef.current);
+        }
+        appearanceSaveTimerRef.current = setTimeout(() => {
+            fetch('http://127.0.0.1:5555/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ widgetStyle: nextWidgetStyle })
+            }).catch(() => {
+                showAdminToast('❌ 主播控制 UI 外观保存失败');
+            });
+        }, 300);
+    }, [config, showAdminToast]);
+
+    useEffect(() => () => {
+        if (appearanceSaveTimerRef.current) {
+            clearTimeout(appearanceSaveTimerRef.current);
+        }
+        if (overlaySettingsSaveTimerRef.current) {
+            clearTimeout(overlaySettingsSaveTimerRef.current);
+        }
+    }, []);
+
     const loadOverlayMods = useCallback(async () => {
         try {
-            const response = await fetch('http://localhost:5555/api/overlays');
+            const response = await fetch('http://127.0.0.1:5555/api/overlays');
             const result = await response.json();
             if (!response.ok || !result.success) {
                 throw new Error(result.message || '读取 Mod UI 列表失败');
@@ -1111,13 +1341,84 @@ const AdminWidget: React.FC = () => {
         }
     }, []);
 
+    const updateOverlaySetting = useCallback((
+        id: string,
+        key: string,
+        value: OverlaySettingValue
+    ) => {
+        setOverlayMods(previous => {
+            if (!previous) return previous;
+            const updateRecord = (record: OverlayModRecord) => record.id === id
+                ? { ...record, values: { ...(record.values || {}), [key]: value } }
+                : record;
+            return {
+                ...previous,
+                active: updateRecord(previous.active),
+                overlays: previous.overlays.map(updateRecord)
+            };
+        });
+
+        const pending = pendingOverlaySettingsRef.current;
+        pendingOverlaySettingsRef.current = {
+            id,
+            values: pending?.id === id
+                ? { ...pending.values, [key]: value }
+                : { [key]: value }
+        };
+        if (overlaySettingsSaveTimerRef.current) {
+            clearTimeout(overlaySettingsSaveTimerRef.current);
+        }
+        overlaySettingsSaveTimerRef.current = setTimeout(async () => {
+            const next = pendingOverlaySettingsRef.current;
+            pendingOverlaySettingsRef.current = null;
+            if (!next) return;
+            try {
+                const response = await fetch('http://127.0.0.1:5555/api/overlays/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(next)
+                });
+                const result = await response.json();
+                if (!response.ok || !result.success) {
+                    throw new Error(result.message || '保存 Mod UI 参数失败');
+                }
+                setOverlayMods(result);
+            } catch (error: unknown) {
+                showAdminToast(`❌ ${error instanceof Error ? error.message : '保存 Mod UI 参数失败'}`);
+                void loadOverlayMods();
+            }
+        }, 220);
+    }, [loadOverlayMods, showAdminToast]);
+
+    const resetOverlaySettings = useCallback(async (id: string) => {
+        if (overlaySettingsSaveTimerRef.current) {
+            clearTimeout(overlaySettingsSaveTimerRef.current);
+        }
+        pendingOverlaySettingsRef.current = null;
+        try {
+            const response = await fetch('http://127.0.0.1:5555/api/overlays/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, reset: true })
+            });
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.message || '恢复 Mod UI 默认参数失败');
+            }
+            setOverlayMods(result);
+            showAdminToast(`✅ 已恢复 ${result.overlays?.find((item: OverlayModRecord) => item.id === id)?.name || 'Mod UI'} 的默认参数`);
+        } catch (error: unknown) {
+            showAdminToast(`❌ ${error instanceof Error ? error.message : '恢复 Mod UI 默认参数失败'}`);
+        }
+    }, [showAdminToast]);
+
     const loadConnectorStatuses = useCallback(async (forceRefresh = false) => {
         setConnectorChecking(true);
         setConnectorStatusError('');
         try {
             const suffix = forceRefresh ? '?refresh=1' : '';
             const response = await fetch(
-                `http://localhost:5555/api/connectors/status${suffix}`
+                `http://127.0.0.1:5555/api/connectors/status${suffix}`
             );
             const result = await response.json();
             if (!result.success) {
@@ -1163,6 +1464,10 @@ const AdminWidget: React.FC = () => {
     useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
 
     useEffect(() => {
+        setSupportMenuOpen(['faq', 'feedback', 'logs', 'debug'].includes(activeTab));
+    }, [activeTab]);
+
+    useEffect(() => {
         if (activeTab !== 'settings') return;
         void loadConnectorStatuses(false);
         const timer = setInterval(
@@ -1173,7 +1478,7 @@ const AdminWidget: React.FC = () => {
     }, [activeTab, loadConnectorStatuses]);
 
     useEffect(() => {
-        if (activeTab !== 'status') return;
+        if (activeTab !== 'appearance') return;
         void loadOverlayMods();
         const timer = setInterval(() => void loadOverlayMods(), 5000);
         return () => clearInterval(timer);
@@ -1188,7 +1493,7 @@ const AdminWidget: React.FC = () => {
         setOverlayBusy(true);
         try {
             const response = await fetch(
-                'http://localhost:5555/api/overlays/install-url',
+                'http://127.0.0.1:5555/api/overlays/install-url',
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1210,6 +1515,18 @@ const AdminWidget: React.FC = () => {
         }
     }, [overlayUrl, showAdminToast]);
 
+    const openSkinMarketplace = useCallback(async () => {
+        try {
+            if (electronAPI?.openExternal) {
+                await electronAPI.openExternal(SKIN_MARKETPLACE_URL);
+            } else {
+                window.open(SKIN_MARKETPLACE_URL, '_blank', 'noopener,noreferrer');
+            }
+        } catch (error: unknown) {
+            showAdminToast(`❌ ${error instanceof Error ? error.message : '无法打开嗷呜皮肤站'}`);
+        }
+    }, [showAdminToast]);
+
     const installOverlayZip = useCallback(async (file: File) => {
         if (!/\.zip$/i.test(file.name)) {
             showAdminToast('❌ 请选择 .zip 格式的 Mod UI 包');
@@ -1222,7 +1539,7 @@ const AdminWidget: React.FC = () => {
         setOverlayBusy(true);
         try {
             const response = await fetch(
-                'http://localhost:5555/api/overlays/install-zip',
+                'http://127.0.0.1:5555/api/overlays/install-zip',
                 {
                     method: 'POST',
                     headers: {
@@ -1254,7 +1571,7 @@ const AdminWidget: React.FC = () => {
         setOverlayBusy(true);
         try {
             const response = await fetch(
-                'http://localhost:5555/api/overlays/activate',
+                'http://127.0.0.1:5555/api/overlays/activate',
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1280,7 +1597,7 @@ const AdminWidget: React.FC = () => {
         setOverlayBusy(true);
         try {
             const response = await fetch(
-                'http://localhost:5555/api/overlays/remove',
+                'http://127.0.0.1:5555/api/overlays/remove',
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1310,7 +1627,7 @@ const AdminWidget: React.FC = () => {
             ExternalWebSocketEnabled: true
         };
         try {
-            const response = await fetch('http://localhost:5555/api/config', {
+            const response = await fetch('http://127.0.0.1:5555/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ sysConfig: nextSysConfig })
@@ -1340,14 +1657,17 @@ const AdminWidget: React.FC = () => {
     useEffect(() => {
         const fetchConfig = async () => {
             try {
-                const res = await fetch('http://localhost:5555/api/config');
+                const res = await fetch('http://127.0.0.1:5555/api/config');
                 const json = await res.json();
 
                 setConfig((prev: any) => {
                     if (!prev) return json;
                     return {
                         ...json,
-                        config: activeTabRef.current === 'settings' ? prev.config : json.config
+                        config: activeTabRef.current === 'settings' ? prev.config : json.config,
+                        widgetStyle: activeTabRef.current === 'appearance'
+                            ? prev.widgetStyle
+                            : json.widgetStyle
                     };
                 });
 
@@ -1378,7 +1698,7 @@ const AdminWidget: React.FC = () => {
 
         const timer = setTimeout(() => {
             lastConfigString.current = currentStr;
-            fetch('http://localhost:5555/api/config', {
+            fetch('http://127.0.0.1:5555/api/config', {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ sysConfig: config.config })
@@ -1394,7 +1714,7 @@ const AdminWidget: React.FC = () => {
         if (activeTab !== 'login') return;
         const fetchQr = async () => {
             try {
-                const res = await fetch('http://localhost:5555/api/bili/qrstatus');
+                const res = await fetch('http://127.0.0.1:5555/api/bili/qrstatus');
                 const json = await res.json();
                 setQrState({ loading: false, base64: json.qrBase64, message: json.status });
                 if (json.isLogin) {
@@ -1416,7 +1736,7 @@ const AdminWidget: React.FC = () => {
     useEffect(() => {
         const fetchLogs = async () => {
             try {
-                const res = await fetch('http://localhost:5555/api/logs');
+                const res = await fetch('http://127.0.0.1:5555/api/logs');
                 const json = await res.json();
                 setSysLogs(json);
             } catch {}
@@ -1466,7 +1786,7 @@ const AdminWidget: React.FC = () => {
         const rid = parseInt(roomIdInput);
         if (!rid) return showAdminToast("❌ 请输入正确的房间号");
         try {
-            const res = await fetch('http://localhost:5555/api/room', {
+            const res = await fetch('http://127.0.0.1:5555/api/room', {
                 method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ roomId: rid })
             });
             const json = await res.json();
@@ -1483,7 +1803,7 @@ const AdminWidget: React.FC = () => {
             await new Promise(resolve => setTimeout(resolve, 350));
             try {
                 const response = await fetch(
-                    'http://localhost:5555/api/config'
+                    'http://127.0.0.1:5555/api/config'
                 );
                 const latest = await response.json();
                 if (latest.playerConnected === true) {
@@ -1512,7 +1832,7 @@ const AdminWidget: React.FC = () => {
             playerSnapshot: null
         }) : prev);
         try {
-            const res = await fetch('http://localhost:5555/api/sys/reconnect_player', { method: 'POST' });
+            const res = await fetch('http://127.0.0.1:5555/api/sys/reconnect_player', { method: 'POST' });
             const json = await res.json();
             const connected = json.success === true
                 || await waitForPlayerConnection();
@@ -1574,7 +1894,7 @@ const AdminWidget: React.FC = () => {
 
         try {
             const response = await fetch(
-                'http://localhost:5555/api/connectors/update',
+                'http://127.0.0.1:5555/api/connectors/update',
                 {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -1648,7 +1968,7 @@ const AdminWidget: React.FC = () => {
 
         try {
             const response = await fetch(
-                'http://localhost:5555/api/connectors/reinstall',
+                'http://127.0.0.1:5555/api/connectors/reinstall',
                 {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -1708,7 +2028,7 @@ const AdminWidget: React.FC = () => {
     const handleUpdateCheck = async () => {
         setUpdateInfo({ checking: true, info: null });
         try {
-            const res = await fetch('http://localhost:5555/api/update/check');
+            const res = await fetch('http://127.0.0.1:5555/api/update/check');
             const json = await res.json();
             setUpdateInfo({ checking: false, info: json });
 
@@ -1728,7 +2048,7 @@ const AdminWidget: React.FC = () => {
         setDownloadProgress(0);
 
         try {
-            await fetch('http://localhost:5555/api/update/apply', { method: 'POST' });
+            await fetch('http://127.0.0.1:5555/api/update/apply', { method: 'POST' });
             showAdminToast("正在后台下载更新，请稍候，程序将自动重启...");
 
             // 模拟进度条，真实后台正在走 Updater 更新流
@@ -1750,14 +2070,14 @@ const AdminWidget: React.FC = () => {
 
     const startQrLogin = async () => {
         setQrState(prev => ({ ...prev, loading: true, base64: '' }));
-        await fetch('http://localhost:5555/api/bili/qrstart', { method: 'POST' });
+        await fetch('http://127.0.0.1:5555/api/bili/qrstart', { method: 'POST' });
     };
 
     const loadFeedbackDiagnostics = useCallback(async (includeLogs = false) => {
         setFeedbackLoading(true);
         try {
             const response = await fetch(
-                'http://localhost:5555/api/feedback/diagnostics'
+                'http://127.0.0.1:5555/api/feedback/diagnostics'
                 + (includeLogs ? '?logs=1' : '')
             );
             const result = await response.json();
@@ -1799,7 +2119,7 @@ const AdminWidget: React.FC = () => {
         setFeedbackResult(null);
         try {
             const response = await fetch(
-                'http://localhost:5555/api/feedback/submit',
+                'http://127.0.0.1:5555/api/feedback/submit',
                 {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -1835,7 +2155,7 @@ const AdminWidget: React.FC = () => {
     const logoutBili = async () => {
         if (!window.confirm('确定退出当前 B站账号吗？本地保存的登录凭据将被清除。')) return;
         try {
-            const res = await fetch('http://localhost:5555/api/bili/logout', { method: 'POST' });
+            const res = await fetch('http://127.0.0.1:5555/api/bili/logout', { method: 'POST' });
             const result = await res.json();
             if (!res.ok || !result.success) throw new Error('logout failed');
             setConfig((prev: any) => ({ ...prev, biliLogin: false, uid: 0, currentUser: null }));
@@ -1848,14 +2168,14 @@ const AdminWidget: React.FC = () => {
 
     const toggleAccepting = async () => {
         try {
-            await fetch('http://localhost:5555/api/state/toggle', { method: 'POST' });
+            await fetch('http://127.0.0.1:5555/api/state/toggle', { method: 'POST' });
             setConfig((prev: any) => ({...prev, accepting: !prev.accepting}));
         } catch(err) { console.error(err); }
     };
 
     const togglePlaying = async () => {
         try {
-            await fetch('http://localhost:5555/api/state/toggle_play', { method: 'POST' });
+            await fetch('http://127.0.0.1:5555/api/state/toggle_play', { method: 'POST' });
             setConfig((prev: any) => ({...prev, playing: !prev.playing}));
         } catch(err) { console.error(err); }
     };
@@ -1863,7 +2183,7 @@ const AdminWidget: React.FC = () => {
     const handleDebugInsert = async () => {
         if(!debugInput.trim()) return showAdminToast("❌ 请输入需要搜索并插入的歌曲名！");
         try {
-            const res = await fetch('http://localhost:5555/api/debug/insert_next', {
+            const res = await fetch('http://127.0.0.1:5555/api/debug/insert_next', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ keyword: debugInput })
@@ -1880,7 +2200,7 @@ const AdminWidget: React.FC = () => {
     // ⭐ 增加了错误状态识别 and Toast 拦截提示
     const handleDebugPlayNext = async () => {
         try {
-            const res = await fetch('http://localhost:5555/api/debug/play_next', { method: 'POST' });
+            const res = await fetch('http://127.0.0.1:5555/api/debug/play_next', { method: 'POST' });
             const json = await res.json();
             if(json.success) showAdminToast(`✅ ${json.message || '切歌指令已成功发送！'}`);
             else showAdminToast(`❌ ${json.message || '切歌失败，播放器拒绝响应或未连接！'}`);
@@ -1942,7 +2262,7 @@ const AdminWidget: React.FC = () => {
         showAdminToast("正在切换并自动连接播放器...");
 
         try {
-            const res = await fetch('http://localhost:5555/api/config', {
+            const res = await fetch('http://127.0.0.1:5555/api/config', {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ sysConfig: nextSysConfig })
@@ -1998,6 +2318,57 @@ const AdminWidget: React.FC = () => {
     );
     const modObsUrl = `http://127.0.0.1:${externalApiPort}/overlay/`;
     const currentStatusSong = config?.current as SongInfo | null | undefined;
+    const currentControlTheme: Theme = {
+        ...defaultTheme,
+        ...(config?.widgetStyle?.theme || {})
+    };
+    const activeOverlaySettings = overlayMods?.active?.settings || [];
+    const activeOverlaySettingGroups = Array.from(
+        activeOverlaySettings.reduce((groups, setting) => {
+            const group = setting.group || '常规';
+            const items = groups.get(group) || [];
+            items.push(setting);
+            groups.set(group, items);
+            return groups;
+        }, new Map<string, OverlaySettingDefinition[]>())
+    );
+    const overlayPreviewStyle: React.CSSProperties = overlayPreviewBackground === 'dark'
+        ? { backgroundColor: '#111827' }
+        : overlayPreviewBackground === 'light'
+            ? { backgroundColor: '#eef3f8' }
+            : {
+                backgroundColor: '#20242d',
+                backgroundImage: 'linear-gradient(45deg, #2c3340 25%, transparent 25%), linear-gradient(-45deg, #2c3340 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #2c3340 75%), linear-gradient(-45deg, transparent 75%, #2c3340 75%)',
+                backgroundSize: '24px 24px',
+                backgroundPosition: '0 0, 0 12px, 12px -12px, -12px 0'
+            };
+    const onboardingSteps = [
+        {
+            icon: '📱',
+            kicker: '账号与权限',
+            title: '扫码登录 B站账号',
+            description: '游客模式也能普通点歌；扫码登录后，可以设置超级用户白名单和更细的观众权限。'
+        },
+        {
+            icon: '🏠',
+            kicker: '直播间连接',
+            title: '连接你的直播间',
+            description: '填写直播间网址末尾的数字房间号，让点歌机开始接收这间直播间的弹幕。'
+        },
+        {
+            icon: '📺',
+            kicker: '直播画面',
+            title: '添加 OBS 浏览器捕捉',
+            description: '复制固定的 Mod UI 地址到 OBS 或直播姬。以后切换 UI 模组时，不需要修改捕捉地址。'
+        },
+        {
+            icon: '🎵',
+            kicker: '播放器与观众',
+            title: '选择播放器并配置权限',
+            description: '选择你实际使用的音乐播放器，再按需要设置观众点歌、切歌、置顶和撤回等权限。'
+        }
+    ] as const;
+    const currentOnboardingStep = onboardingSteps[onboardingStep] || onboardingSteps[0];
 
     return (
         <div className="admin-widget-root animate-fade-in text-gray-200 flex flex-col font-sans select-none w-full h-screen overflow-hidden" style={{ backgroundColor: '#0d1117' }}>
@@ -2008,26 +2379,127 @@ const AdminWidget: React.FC = () => {
                 </div>
             )}
 
+            {onboardingOpen && (
+                <div className="fixed inset-0 z-[99990] grid place-items-center bg-black/70 p-5 backdrop-blur-sm">
+                    <div className="w-full max-w-xl overflow-hidden rounded-3xl border border-cyan-400/25 bg-[#151922] shadow-[0_24px_100px_rgba(0,0,0,0.65)]" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+                        <div className="border-b border-white/10 bg-gradient-to-r from-cyan-500/10 to-violet-500/10 px-6 py-5">
+                            <div className="flex items-start justify-between gap-4">
+                                <div>
+                                    <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-cyan-300">首次使用向导</div>
+                                    <h2 className="mt-1 text-xl font-bold text-white">用 4 步完成点歌机配置</h2>
+                                    <p className="mt-1 text-xs text-gray-400">点击“前往设置”会打开对应页面，并自动滚动到需要操作的位置。</p>
+                                </div>
+                                <button onClick={finishOnboarding} title="关闭并不再自动显示" className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-lg text-gray-500 hover:bg-white/10 hover:text-white">×</button>
+                            </div>
+
+                            <div className="mt-5 grid grid-cols-4 gap-2">
+                                {onboardingSteps.map((step, index) => (
+                                    <button key={step.title} onClick={() => setOnboardingStep(index)} className={`h-1.5 rounded-full transition-colors ${index === onboardingStep ? 'bg-cyan-400' : index < onboardingStep ? 'bg-cyan-700' : 'bg-white/10'}`} aria-label={`查看第 ${index + 1} 步`} />
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="px-6 py-6">
+                            <div className="flex items-start gap-4">
+                                <div className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl border border-white/10 bg-white/5 text-3xl">{currentOnboardingStep.icon}</div>
+                                <div className="min-w-0">
+                                    <div className="text-[11px] font-bold text-cyan-300">第 {onboardingStep + 1} 步 · {currentOnboardingStep.kicker}</div>
+                                    <h3 className="mt-1 text-xl font-bold text-white">{currentOnboardingStep.title}</h3>
+                                    <p className="mt-2 text-sm leading-relaxed text-gray-400">{currentOnboardingStep.description}</p>
+                                </div>
+                            </div>
+
+                            <div className="mt-6">
+                                {onboardingStep === 0 && (
+                                    <button onClick={() => openOnboardingDestination('login', null, true)} className="w-full rounded-xl bg-gradient-to-r from-pink-600 to-violet-600 px-5 py-3 text-sm font-bold text-white shadow-lg hover:brightness-110">前往扫码登录 →</button>
+                                )}
+                                {onboardingStep === 1 && (
+                                    <button onClick={() => openOnboardingDestination('status', 'room', true)} className="w-full rounded-xl bg-gradient-to-r from-blue-600 to-cyan-600 px-5 py-3 text-sm font-bold text-white shadow-lg hover:brightness-110">前往连接直播间 →</button>
+                                )}
+                                {onboardingStep === 2 && (
+                                    <button onClick={() => openOnboardingDestination('appearance', 'mod-ui', true)} className="w-full rounded-xl bg-gradient-to-r from-cyan-600 to-violet-600 px-5 py-3 text-sm font-bold text-white shadow-lg hover:brightness-110">前往设置 Mod UI 捕捉 →</button>
+                                )}
+                                {onboardingStep === 3 && (
+                                    <div className="grid gap-3 sm:grid-cols-2">
+                                        <button onClick={() => openOnboardingDestination('settings', 'player', false)} className="rounded-xl border border-purple-400/30 bg-purple-500/15 px-4 py-3 text-sm font-bold text-purple-100 hover:bg-purple-500/25">选择连接的播放器 →</button>
+                                        <button onClick={() => openOnboardingDestination('settings', 'permission', false)} className="rounded-xl border border-green-400/30 bg-green-500/15 px-4 py-3 text-sm font-bold text-green-100 hover:bg-green-500/25">配置观众权限 →</button>
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="mt-5 flex items-center justify-between border-t border-white/10 pt-4">
+                                <button disabled={onboardingStep === 0} onClick={() => setOnboardingStep(previous => Math.max(0, previous - 1))} className="text-xs font-bold text-gray-500 hover:text-gray-300 disabled:invisible">← 上一步</button>
+                                {onboardingStep === 3 ? (
+                                    <button onClick={finishOnboarding} className="rounded-lg bg-white/10 px-4 py-2 text-xs font-bold text-white hover:bg-white/15">完成引导</button>
+                                ) : (
+                                    <button onClick={finishOnboarding} className="text-xs text-gray-500 hover:text-gray-300">跳过，以后不再自动显示</button>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {onboardingActive && !onboardingOpen && (
+                <button onClick={() => setOnboardingOpen(true)} className="fixed bottom-5 right-5 z-[99980] rounded-full border border-cyan-400/30 bg-[#17222c]/95 px-4 py-2.5 text-xs font-bold text-cyan-200 shadow-xl backdrop-blur hover:bg-cyan-500/20">
+                    ✨ 继续新手引导 · {onboardingStep + 1}/4
+                </button>
+            )}
+
             <div className="px-4 py-2 border-b border-white/10 flex justify-between items-center bg-white/5" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
                 <div className="font-bold text-white text-sm flex items-center gap-2">⚙️ 控制面板</div>
             </div>
 
             <div className="flex-1 flex overflow-hidden relative">
-                <div className="w-36 border-r border-white/5 bg-white/[0.02] flex flex-col p-2 gap-1 overflow-y-auto custom-scrollbar shrink-0 z-10">
+                <div className="w-40 border-r border-white/5 bg-white/[0.02] flex flex-col p-2 gap-1 overflow-y-auto custom-scrollbar shrink-0 z-10">
+                    <button
+                        onClick={() => void openSkinMarketplace()}
+                        className="mb-2 rounded-xl border border-violet-400/35 bg-gradient-to-br from-violet-500/25 via-cyan-500/15 to-blue-500/20 p-3 text-left shadow-lg shadow-violet-950/20 transition hover:border-cyan-300/50 hover:brightness-110"
+                    >
+                        <span className="flex items-center gap-2 text-sm font-bold text-white">
+                            <span>🧩</span>
+                            <span>嗷呜皮肤站</span>
+                            <span className="ml-auto text-[10px] text-cyan-200">↗</span>
+                        </span>
+                        <span className="mt-1 block pl-6 text-[10px] leading-relaxed text-cyan-100/70">浏览并一键安装 UI</span>
+                    </button>
                     {[
                         { id: 'status', icon: '🏠', label: '运行状态' },
+                        { id: 'appearance', icon: '🎨', label: '外观设置' },
                         { id: 'settings', icon: '⚙️', label: '基础设置' },
-                        { id: 'logs', icon: '📝', label: '运行日志' },
-                        { id: 'faq', icon: '❓', label: '常见问题' },
-                        { id: 'feedback', icon: '💬', label: '问题反馈' },
                         { id: 'login', icon: '📱', label: '扫码登录' },
-                        { id: 'update', icon: '🚀', label: '版本升级' },
-                        { id: 'debug', icon: '🐞', label: '调试测试' }
+                        { id: 'update', icon: '🚀', label: '版本升级' }
                     ].map(t => (
-                        <button key={t.id} onClick={() => setActiveTab(t.id)} className={`flex items-center gap-2.5 p-2.5 rounded-lg text-sm transition-colors text-left ${activeTab === t.id ? 'bg-blue-600 text-white font-bold' : 'hover:bg-white/10 text-gray-400'}`}>
+                        <button key={t.id} onClick={() => { setActiveTab(t.id); setSupportMenuOpen(false); }} className={`flex items-center gap-2.5 p-2.5 rounded-lg text-sm transition-colors text-left ${activeTab === t.id ? 'bg-blue-600 text-white font-bold' : 'hover:bg-white/10 text-gray-400'}`}>
                             <span>{t.icon}</span> <span className="truncate">{t.label}</span>
                         </button>
                     ))}
+                    <details
+                        open={supportMenuOpen}
+                        onToggle={event => setSupportMenuOpen(event.currentTarget.open)}
+                        className="group mt-1 rounded-lg border border-white/[0.06] bg-black/10"
+                    >
+                        <summary className={`flex cursor-pointer list-none items-center gap-2 rounded-lg px-2.5 py-2 text-xs transition-colors [&::-webkit-details-marker]:hidden ${['faq', 'feedback', 'logs', 'debug'].includes(activeTab) ? 'text-cyan-200' : 'text-gray-500 hover:bg-white/5 hover:text-gray-300'}`}>
+                            <span>🛠️</span>
+                            <span className="font-bold">帮助与调试</span>
+                            <span className="ml-auto text-[10px] transition-transform group-open:rotate-90">›</span>
+                        </summary>
+                        <div className="space-y-0.5 px-1.5 pb-1.5">
+                            {[
+                                { id: 'faq', icon: '❓', label: '常见问题' },
+                                { id: 'feedback', icon: '💬', label: '问题反馈' },
+                                { id: 'logs', icon: '📝', label: '运行日志' },
+                                { id: 'debug', icon: '🐞', label: '调试测试' }
+                            ].map(t => (
+                                <button key={t.id} onClick={() => setActiveTab(t.id)} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors ${activeTab === t.id ? 'bg-blue-600/90 font-bold text-white' : 'text-gray-500 hover:bg-white/5 hover:text-gray-300'}`}>
+                                    <span>{t.icon}</span> <span className="truncate">{t.label}</span>
+                                </button>
+                            ))}
+                        </div>
+                    </details>
+                    <button onClick={restartOnboarding} className="mt-2 flex items-center gap-2.5 rounded-lg border border-cyan-400/15 bg-cyan-500/[0.06] p-2.5 text-left text-xs text-cyan-300 hover:bg-cyan-500/10">
+                        <span>✨</span> <span className="truncate">新手引导</span>
+                    </button>
                 </div>
 
                 <div className="flex-1 p-6 overflow-y-auto custom-scrollbar select-text relative">
@@ -2074,53 +2546,7 @@ const AdminWidget: React.FC = () => {
                                 <div className="space-y-5 animate-slide-in-right flex flex-col h-full pb-6">
                                     <div>
                                         <h2 className="text-2xl font-bold text-white mb-2">运行状态</h2>
-                                        <p className="text-sm text-gray-500 mb-5">查看播放器、点歌开关和 OBS 展示页面；Mod UI 只读取公开状态，不能控制点歌机。</p>
-
-                                        <div className="grid grid-cols-2 gap-4 mb-5">
-                                            <div className="bg-white/5 p-4 rounded-xl border border-white/10 shadow-inner">
-                                                <div className="flex items-center justify-between gap-3 mb-2">
-                                                    <span className="text-sm font-bold text-gray-200">经典页面</span>
-                                                    <span className="text-[10px] px-2 py-1 rounded-full bg-gray-500/15 text-gray-400">旧场景兼容</span>
-                                                </div>
-                                                <div className="text-xs text-gray-500 mb-3 leading-relaxed">原有整页界面，保留给已经配置好的 OBS 场景；它不是可换主题的 Mod 组件。</div>
-                                                <div className="flex items-center gap-2">
-                                                    <div className="flex-1 min-w-0 text-sm font-mono text-cyan-400 select-all truncate">{classicObsUrl}</div>
-                                                    <button onClick={() => { void navigator.clipboard.writeText(classicObsUrl); showAdminToast('✅ 已复制经典页面地址'); }} className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-xs font-bold border border-white/10">复制</button>
-                                                </div>
-                                            </div>
-
-                                            <div className="bg-cyan-500/5 p-4 rounded-xl border border-cyan-500/25 shadow-inner">
-                                                <div className="flex items-center justify-between gap-3 mb-2">
-                                                    <span className="text-sm font-bold text-cyan-300">Mod UI 组件</span>
-                                                    <span className="text-[10px] px-2 py-1 rounded-full bg-cyan-500/15 text-cyan-300">OBS 推荐</span>
-                                                </div>
-                                                <div className="text-xs text-gray-400 mb-3 leading-relaxed">透明组件页面。安装或切换 UI 后地址不变，OBS 会自动载入当前启用的主题。</div>
-                                                <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-cyan-400/15 bg-black/15 px-3 py-2">
-                                                    <div className="min-w-0">
-                                                        <div className="text-[10px] text-gray-500">当前使用</div>
-                                                        <div className="truncate text-xs font-bold text-white">
-                                                            {overlayMods?.active ? `${overlayMods.active.name} · v${overlayMods.active.version}` : '正在读取…'}
-                                                        </div>
-                                                    </div>
-                                                    <button
-                                                        onClick={() => overlaySettingsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
-                                                        className="shrink-0 rounded-lg border border-cyan-400/25 bg-cyan-500/10 px-3 py-2 text-[11px] font-bold text-cyan-300 hover:bg-cyan-500/20"
-                                                    >
-                                                        前往 Mod 设置
-                                                    </button>
-                                                </div>
-                                                <div className="flex items-center gap-2">
-                                                    <div className="flex-1 min-w-0 text-sm font-mono text-cyan-300 select-all truncate">{modObsUrl}</div>
-                                                    <button onClick={() => { void navigator.clipboard.writeText(modObsUrl); showAdminToast('✅ 已复制 Mod UI 地址'); }} className="px-3 py-2 bg-cyan-500/10 hover:bg-cyan-500/20 rounded-lg text-xs font-bold text-cyan-300 border border-cyan-500/25">复制</button>
-                                                </div>
-                                                {!config.externalApi?.httpEnabled && (
-                                                    <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2">
-                                                        <span className="text-[11px] text-amber-300">只读 HTTP 尚未开启，OBS 暂时打不开此地址。</span>
-                                                        <button onClick={enableOverlayApi} className="shrink-0 text-[11px] font-bold text-amber-200 underline">立即开启</button>
-                                                    </div>
-                                                )}
-                                            </div>
-                                        </div>
+                                        <p className="text-sm text-gray-500 mb-5">查看直播间、播放器、当前歌曲和点歌开关；界面与 OBS 捕捉请前往「外观设置」。</p>
 
                                         <div className={`p-4 rounded-xl border mb-5 flex items-center gap-4 ${currentStatusSong && !config.currentIsRequested ? 'bg-sky-500/10 border-sky-400/25' : 'bg-white/5 border-white/10'}`}>
                                             <div className={`w-12 h-12 shrink-0 rounded-xl overflow-hidden grid place-items-center ${currentStatusSong && !config.currentIsRequested ? 'bg-sky-400/15 text-sky-200' : 'bg-white/5 text-gray-400'}`}>
@@ -2140,7 +2566,7 @@ const AdminWidget: React.FC = () => {
                                             </span>
                                         </div>
 
-                                        <div className="bg-white/5 p-5 rounded-xl border border-white/10 shadow-inner mb-5">
+                                        <div ref={roomSetupRef} className="bg-white/5 p-5 rounded-xl border border-white/10 shadow-inner mb-5 scroll-mt-4">
                                             <div className="text-sm text-gray-400 mb-3 flex justify-between">
                                                 <span>当前监控直播间</span>
                                                 <span className="text-blue-400 text-xs">发弹幕 "test" 或 "测试" 验证连接</span>
@@ -2183,85 +2609,283 @@ const AdminWidget: React.FC = () => {
                                             </div>
                                         </div>
 
-                                        <section ref={overlaySettingsRef} className="bg-gradient-to-br from-violet-500/[0.08] to-cyan-500/[0.05] rounded-2xl border border-violet-400/25 overflow-hidden scroll-mt-4">
-                                            <div className="p-5 border-b border-white/10 flex items-start justify-between gap-4">
+                                    </div>
+                                </div>
+                            )}
+
+                            {activeTab === 'appearance' && (
+                                <div className="space-y-5 animate-slide-in-right pb-6">
+                                    <div className="flex flex-wrap items-center justify-between gap-3">
+                                        <div>
+                                            <h2 className="text-2xl font-bold text-white mb-2">外观设置</h2>
+                                            <p className="text-sm text-gray-500">分别设置面向观众的直播画面，以及主播自己操作的点歌机悬浮窗。</p>
+                                        </div>
+                                        <button onClick={() => void openSkinMarketplace()} className="shrink-0 rounded-xl border border-violet-400/40 bg-gradient-to-r from-violet-600 to-cyan-600 px-4 py-2.5 text-sm font-bold text-white shadow-lg shadow-violet-950/30 transition hover:brightness-110">
+                                            🧩 浏览嗷呜皮肤站 ↗
+                                        </button>
+                                    </div>
+
+                                    <section ref={modUiSetupRef} className="rounded-2xl border border-cyan-400/30 bg-gradient-to-br from-cyan-500/10 via-cyan-500/[0.04] to-violet-500/[0.08] overflow-hidden shadow-inner scroll-mt-4">
+                                        <div className="p-5 border-b border-cyan-400/15">
+                                            <div className="flex flex-wrap items-start justify-between gap-3">
                                                 <div>
-                                                    <div className="flex items-center gap-2">
-                                                        <h3 className="text-lg font-bold text-white">🎨 Mod UI</h3>
-                                                        {overlayMods?.active && <span className="text-[10px] px-2 py-1 rounded-full bg-violet-500/20 text-violet-200 border border-violet-400/20">当前：{overlayMods.active.name}</span>}
+                                                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                                                        <span className="text-xl">📺</span>
+                                                        <h3 className="text-lg font-bold text-cyan-100">面向观众 · Mod UI</h3>
+                                                        <span className="rounded-full border border-cyan-400/25 bg-cyan-500/15 px-2 py-1 text-[10px] font-bold text-cyan-300">OBS / 直播姬推荐</span>
                                                     </div>
-                                                    <p className="text-xs text-gray-400 mt-1 leading-relaxed">支持 GitHub 仓库发布清单，也支持选择或拖入本地 ZIP。包会经过路径、体积和文件类型校验。</p>
+                                                    <p className="max-w-2xl text-xs leading-relaxed text-gray-300">
+                                                        用浏览器捕捉把当前歌曲、待播队列和点歌状态展示给观众。页面只读取公开状态，没有控制按钮，也不会向点歌机发送操作请求。
+                                                    </p>
                                                 </div>
-                                                <a href="https://github.com/Enkianssus/AwooMusicBot-Overlay-Default" target="_blank" rel="noreferrer" className="text-xs text-cyan-300 hover:text-cyan-200 underline shrink-0">开发示例</a>
+                                                <a href="https://github.com/Enkianssus/AwooMusicBot-Overlay-Default" target="_blank" rel="noreferrer" className="shrink-0 rounded-lg border border-cyan-400/25 bg-cyan-500/10 px-3 py-2 text-[11px] font-bold text-cyan-300 hover:bg-cyan-500/20">查看 UI 模组开发示例 ↗</a>
                                             </div>
 
-                                            <div className="p-5 space-y-4">
-                                                <div className="flex gap-2">
-                                                    <input
-                                                        type="url"
-                                                        value={overlayUrl}
-                                                        onChange={event => setOverlayUrl(event.target.value)}
-                                                        placeholder="https://github.com/作者/仓库"
-                                                        className="flex-1 min-w-0 bg-black/30 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:border-violet-400 outline-none"
-                                                    />
-                                                    <button disabled={overlayBusy} onClick={installOverlayFromUrl} className="px-4 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-sm font-bold transition-colors">
-                                                        {overlayBusy ? '处理中…' : '识别并安装'}
-                                                    </button>
-                                                    <button disabled={overlayBusy} onClick={() => overlayFileInputRef.current?.click()} className="px-4 py-2.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50 text-gray-200 text-sm font-bold border border-white/10 transition-colors">＋ 选择 ZIP</button>
-                                                    <input
-                                                        ref={overlayFileInputRef}
-                                                        type="file"
-                                                        accept=".zip,application/zip"
-                                                        hidden
-                                                        onChange={event => {
-                                                            const file = event.target.files?.[0];
-                                                            if (file) void installOverlayZip(file);
-                                                        }}
-                                                    />
+                                            <div className="mt-4 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(200px,0.42fr)]">
+                                                <div className="rounded-xl border border-cyan-400/20 bg-black/20 p-3">
+                                                    <div className="mb-1 text-[10px] font-bold text-cyan-300/80">Mod UI 浏览器捕捉地址</div>
+                                                    <div className="flex items-center gap-2">
+                                                        <div className="min-w-0 flex-1 truncate font-mono text-sm text-cyan-200 select-all">{modObsUrl}</div>
+                                                        <button onClick={() => { void navigator.clipboard.writeText(modObsUrl); showAdminToast('✅ 已复制 Mod UI 浏览器捕捉地址'); }} className="shrink-0 rounded-lg border border-cyan-400/25 bg-cyan-500/15 px-3 py-2 text-xs font-bold text-cyan-200 hover:bg-cyan-500/25">复制地址</button>
+                                                    </div>
+                                                </div>
+                                                <div className="rounded-xl border border-white/10 bg-black/15 p-3">
+                                                    <div className="mb-1 text-[10px] text-gray-500">当前使用的 Mod UI</div>
+                                                    <div className="truncate text-sm font-bold text-white">
+                                                        {overlayMods?.active ? `${overlayMods.active.name} · v${overlayMods.active.version}` : '正在读取…'}
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            {!config.externalApi?.httpEnabled && (
+                                                <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2">
+                                                    <span className="text-[11px] text-amber-300">只读 HTTP 尚未开启，OBS 暂时打不开此地址。</span>
+                                                    <button onClick={enableOverlayApi} className="shrink-0 text-[11px] font-bold text-amber-200 underline">立即开启</button>
+                                                </div>
+                                            )}
+
+                                            <div className="mt-5 grid gap-4 md:grid-cols-[minmax(0,1fr)_280px]">
+                                                <div className="overflow-hidden rounded-2xl border border-white/10 bg-black/20">
+                                                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 px-3 py-2.5">
+                                                        <div>
+                                                            <div className="text-xs font-bold text-white">实时预览</div>
+                                                            <div className="text-[10px] text-gray-500">与 OBS 使用相同页面和参数</div>
+                                                        </div>
+                                                        <div className="flex items-center gap-1">
+                                                            {(['checker', 'dark', 'light'] as const).map(background => (
+                                                                <button key={background} onClick={() => setOverlayPreviewBackground(background)} className={`rounded-md px-2 py-1 text-[10px] ${overlayPreviewBackground === background ? 'bg-cyan-500/20 text-cyan-200' : 'text-gray-500 hover:bg-white/5 hover:text-gray-300'}`}>
+                                                                    {background === 'checker' ? '透明' : background === 'dark' ? '深色' : '浅色'}
+                                                                </button>
+                                                            ))}
+                                                            <button onClick={() => setOverlayPreviewNonce(value => value + 1)} className="rounded-md px-2 py-1 text-[10px] text-gray-400 hover:bg-white/5 hover:text-white">刷新</button>
+                                                        </div>
+                                                    </div>
+                                                    <div className="relative h-[420px] overflow-hidden transition-colors" style={overlayPreviewStyle}>
+                                                        {config.externalApi?.httpEnabled ? (
+                                                            <iframe
+                                                                key={`${overlayMods?.activeId || 'loading'}-${overlayPreviewNonce}`}
+                                                                title="Mod UI 实时预览"
+                                                                src={`${modObsUrl}?preview=${overlayPreviewNonce}`}
+                                                                className="h-full w-full border-0 pointer-events-none"
+                                                            />
+                                                        ) : (
+                                                            <div className="grid h-full place-items-center p-6 text-center text-xs text-amber-300">开启只读 HTTP 后即可在这里预览 Mod UI</div>
+                                                        )}
+                                                    </div>
                                                 </div>
 
-                                                <div
-                                                    onDragEnter={event => { event.preventDefault(); setOverlayDropActive(true); }}
-                                                    onDragOver={event => { event.preventDefault(); setOverlayDropActive(true); }}
-                                                    onDragLeave={event => { event.preventDefault(); setOverlayDropActive(false); }}
-                                                    onDrop={event => {
-                                                        event.preventDefault();
-                                                        setOverlayDropActive(false);
-                                                        const file = event.dataTransfer.files?.[0];
+                                                <div className="flex h-[474px] min-h-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-black/20">
+                                                    <div className="flex items-start justify-between gap-2 border-b border-white/10 px-3 py-2.5">
+                                                        <div className="min-w-0">
+                                                            <div className="truncate text-xs font-bold text-white">{overlayMods?.active?.name || '当前 Mod UI'} 参数</div>
+                                                            <div className="mt-0.5 text-[10px] leading-relaxed text-gray-500">每个 UI 独立缓存，切换或升级后继续保留。</div>
+                                                        </div>
+                                                        {activeOverlaySettings.length > 0 && overlayMods?.active && (
+                                                            <button onClick={() => void resetOverlaySettings(overlayMods.active.id)} className="shrink-0 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-gray-400 hover:text-white">恢复默认</button>
+                                                        )}
+                                                    </div>
+
+                                                    <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3 custom-scrollbar">
+                                                        {activeOverlaySettingGroups.map(([group, definitions]) => (
+                                                            <div key={group} className="space-y-2">
+                                                                <div className="px-1 text-[10px] font-bold uppercase tracking-wider text-cyan-300/80">{group}</div>
+                                                                {definitions.map(definition => (
+                                                                    <OverlaySettingControl
+                                                                        key={definition.key}
+                                                                        definition={definition}
+                                                                        value={overlayMods?.active?.values?.[definition.key]}
+                                                                        onChange={value => {
+                                                                            if (overlayMods?.active) updateOverlaySetting(overlayMods.active.id, definition.key, value);
+                                                                        }}
+                                                                        onReset={() => {
+                                                                            if (overlayMods?.active) updateOverlaySetting(overlayMods.active.id, definition.key, definition.default);
+                                                                        }}
+                                                                    />
+                                                                ))}
+                                                            </div>
+                                                        ))}
+                                                        {overlayMods && activeOverlaySettings.length === 0 && (
+                                                            <div className="rounded-xl border border-dashed border-white/10 p-4 text-center text-xs leading-relaxed text-gray-500">
+                                                                这个 Mod UI 尚未声明可调参数，仍可正常预览和使用。
+                                                            </div>
+                                                        )}
+                                                        {!overlayMods && <div className="text-xs text-gray-500">正在读取 Mod UI 参数…</div>}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div className="p-5 space-y-4">
+                                            <div className="flex flex-wrap items-start justify-between gap-3">
+                                                <div>
+                                                    <div className="text-sm font-bold text-white">安装与切换 Mod UI</div>
+                                                    <p className="mt-1 text-xs leading-relaxed text-gray-500">皮肤站支持一键安装；也可以继续使用 GitHub 地址或本地 ZIP。切换 UI 后，OBS 捕捉地址保持不变。</p>
+                                                </div>
+                                            </div>
+
+                                            <div className="flex flex-wrap gap-2">
+                                                <input
+                                                    type="url"
+                                                    value={overlayUrl}
+                                                    onChange={event => setOverlayUrl(event.target.value)}
+                                                    placeholder="粘贴 GitHub 仓库或 Mod UI 地址"
+                                                    className="flex-[1_1_320px] min-w-0 bg-black/30 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:border-violet-400 outline-none"
+                                                />
+                                                <button disabled={overlayBusy} onClick={installOverlayFromUrl} className="px-4 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-sm font-bold transition-colors">
+                                                    {overlayBusy ? '处理中…' : '识别并安装'}
+                                                </button>
+                                                <button disabled={overlayBusy} onClick={() => overlayFileInputRef.current?.click()} className="px-4 py-2.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50 text-gray-200 text-sm font-bold border border-white/10 transition-colors">＋ 选择 ZIP</button>
+                                                <input
+                                                    ref={overlayFileInputRef}
+                                                    type="file"
+                                                    accept=".zip,application/zip"
+                                                    hidden
+                                                    onChange={event => {
+                                                        const file = event.target.files?.[0];
                                                         if (file) void installOverlayZip(file);
                                                     }}
-                                                    className={`rounded-xl border border-dashed px-4 py-3 text-center text-xs transition-colors ${overlayDropActive ? 'border-cyan-300 bg-cyan-400/10 text-cyan-200' : 'border-white/15 bg-black/15 text-gray-500'}`}
-                                                >
-                                                    {overlayDropActive ? '松开即可安装 Mod UI ZIP' : '将 Mod UI ZIP 拖到这里安装'}
+                                                />
+                                            </div>
+
+                                            <div
+                                                onDragEnter={event => { event.preventDefault(); setOverlayDropActive(true); }}
+                                                onDragOver={event => { event.preventDefault(); setOverlayDropActive(true); }}
+                                                onDragLeave={event => { event.preventDefault(); setOverlayDropActive(false); }}
+                                                onDrop={event => {
+                                                    event.preventDefault();
+                                                    setOverlayDropActive(false);
+                                                    const file = event.dataTransfer.files?.[0];
+                                                    if (file) void installOverlayZip(file);
+                                                }}
+                                                className={`rounded-xl border border-dashed px-4 py-3 text-center text-xs transition-colors ${overlayDropActive ? 'border-cyan-300 bg-cyan-400/10 text-cyan-200' : 'border-white/15 bg-black/15 text-gray-500'}`}
+                                            >
+                                                {overlayDropActive ? '松开即可安装 Mod UI ZIP' : '拖入 Mod UI ZIP 到这里安装'}
+                                            </div>
+
+                                            <div className="space-y-2">
+                                                {(overlayMods?.overlays || []).map(overlay => (
+                                                    <div key={overlay.id} className={`rounded-xl border p-3 flex items-center gap-3 ${overlay.active ? 'border-violet-400/35 bg-violet-500/10' : 'border-white/10 bg-black/15'}`}>
+                                                        <div className={`w-9 h-9 rounded-lg grid place-items-center shrink-0 ${overlay.active ? 'bg-violet-500/25 text-violet-200' : 'bg-white/5 text-gray-500'}`}>◫</div>
+                                                        <div className="min-w-0 flex-1">
+                                                            <div className="flex items-center gap-2">
+                                                                <span className="text-sm font-bold text-white truncate">{overlay.name}</span>
+                                                                <span className="text-[10px] text-gray-500">v{overlay.version}</span>
+                                                                {overlay.builtin && <span className="text-[10px] text-gray-500">内置</span>}
+                                                                {(overlay.settings?.length || 0) > 0 && <span className="rounded bg-cyan-500/10 px-1.5 py-0.5 text-[9px] text-cyan-300">{overlay.settings.length} 项可调</span>}
+                                                            </div>
+                                                            <div className="text-[11px] text-gray-500 truncate mt-0.5">{overlay.description || `${overlay.author} · ${overlay.id}`}</div>
+                                                        </div>
+                                                        {overlay.active ? (
+                                                            <span className="text-xs font-bold text-violet-300 px-3 py-1.5">使用中</span>
+                                                        ) : (
+                                                            <button disabled={overlayBusy} onClick={() => void activateOverlay(overlay.id)} className="text-xs font-bold text-cyan-300 px-3 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 disabled:opacity-50">切换</button>
+                                                        )}
+                                                        {!overlay.builtin && (
+                                                            <button disabled={overlayBusy} onClick={() => void removeOverlay(overlay.id)} title="删除这个 Mod UI" className="text-xs text-red-300/70 hover:text-red-300 px-2 py-1.5 disabled:opacity-50">删除</button>
+                                                        )}
+                                                    </div>
+                                                ))}
+                                                {!overlayMods && <div className="text-xs text-gray-500 py-2">正在读取已安装 Mod UI…</div>}
+                                            </div>
+                                        </div>
+                                    </section>
+
+                                    <section className="rounded-2xl border border-blue-400/20 bg-gradient-to-br from-blue-500/[0.07] to-white/[0.025] overflow-hidden">
+                                        <div className="p-5 border-b border-white/10">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <span className="text-xl">🧑‍💻</span>
+                                                <h3 className="text-lg font-bold text-white">主播控制 UI</h3>
+                                                <span className="rounded-full border border-blue-400/20 bg-blue-500/10 px-2 py-1 text-[10px] text-blue-300">主播自己使用</span>
+                                            </div>
+                                            <p className="mt-2 text-xs leading-relaxed text-gray-400">设置点歌机悬浮窗的标题栏、文字与背景。修改后会自动保存并同步到主播操作窗口。</p>
+                                        </div>
+
+                                        <div className="p-5 space-y-5">
+                                            <div className="grid gap-4 lg:grid-cols-2">
+                                                <div className="space-y-3 rounded-xl border border-white/10 bg-black/15 p-4">
+                                                    <div className="text-xs font-bold text-blue-200">布局与标题栏</div>
+                                                    <div className="flex items-center justify-between gap-4">
+                                                        <div>
+                                                            <div className="text-sm text-gray-200">极简待播队列</div>
+                                                            <div className="text-[10px] text-gray-500">Mini 模式，缩小每首歌曲占用的高度</div>
+                                                        </div>
+                                                        <button aria-label="极简待播队列" onClick={() => updateControlTheme({ ...currentControlTheme, compactQueue: !currentControlTheme.compactQueue })} className={`w-10 h-6 rounded-full p-1 transition-colors shrink-0 ${currentControlTheme.compactQueue ? 'bg-blue-500' : 'bg-white/15'}`}><span className={`block w-4 h-4 rounded-full bg-white transition-transform ${currentControlTheme.compactQueue ? 'translate-x-4' : 'translate-x-0'}`}></span></button>
+                                                    </div>
+                                                    <div className="flex items-center justify-between gap-4">
+                                                        <div className="text-sm text-gray-200">显示标题栏</div>
+                                                        <button aria-label="显示标题栏" onClick={() => updateControlTheme({ ...currentControlTheme, showTitleBar: !currentControlTheme.showTitleBar })} className={`w-10 h-6 rounded-full p-1 transition-colors shrink-0 ${currentControlTheme.showTitleBar ? 'bg-blue-500' : 'bg-white/15'}`}><span className={`block w-4 h-4 rounded-full bg-white transition-transform ${currentControlTheme.showTitleBar ? 'translate-x-4' : 'translate-x-0'}`}></span></button>
+                                                    </div>
+                                                    {currentControlTheme.showTitleBar && (
+                                                        <>
+                                                            <div className="flex items-center justify-between gap-4">
+                                                                <div className="text-sm text-gray-200">标题栏融入背景</div>
+                                                                <button aria-label="标题栏融入背景" onClick={() => updateControlTheme({ ...currentControlTheme, syncTitleBarWithBg: !currentControlTheme.syncTitleBarWithBg })} className={`w-10 h-6 rounded-full p-1 transition-colors shrink-0 ${currentControlTheme.syncTitleBarWithBg ? 'bg-blue-500' : 'bg-white/15'}`}><span className={`block w-4 h-4 rounded-full bg-white transition-transform ${currentControlTheme.syncTitleBarWithBg ? 'translate-x-4' : 'translate-x-0'}`}></span></button>
+                                                            </div>
+                                                            {!currentControlTheme.syncTitleBarWithBg && (
+                                                                <label className="flex items-center justify-between gap-4 text-sm text-gray-200">
+                                                                    <span>标题栏背景色</span>
+                                                                    <span className="flex items-center gap-2 text-[11px] font-mono text-gray-500"><span>{currentControlTheme.titleBarBgColor}</span><input aria-label="标题栏背景色" type="color" value={currentControlTheme.titleBarBgColor} onChange={event => updateControlTheme({ ...currentControlTheme, titleBarBgColor: event.target.value })} className="w-8 h-8 rounded cursor-pointer bg-transparent" /></span>
+                                                                </label>
+                                                            )}
+                                                        </>
+                                                    )}
                                                 </div>
 
-                                                <div className="space-y-2">
-                                                    {(overlayMods?.overlays || []).map(overlay => (
-                                                        <div key={overlay.id} className={`rounded-xl border p-3 flex items-center gap-3 ${overlay.active ? 'border-violet-400/35 bg-violet-500/10' : 'border-white/10 bg-black/15'}`}>
-                                                            <div className={`w-9 h-9 rounded-lg grid place-items-center shrink-0 ${overlay.active ? 'bg-violet-500/25 text-violet-200' : 'bg-white/5 text-gray-500'}`}>◫</div>
-                                                            <div className="min-w-0 flex-1">
-                                                                <div className="flex items-center gap-2">
-                                                                    <span className="text-sm font-bold text-white truncate">{overlay.name}</span>
-                                                                    <span className="text-[10px] text-gray-500">v{overlay.version}</span>
-                                                                    {overlay.builtin && <span className="text-[10px] text-gray-500">内置</span>}
-                                                                </div>
-                                                                <div className="text-[11px] text-gray-500 truncate mt-0.5">{overlay.description || `${overlay.author} · ${overlay.id}`}</div>
-                                                            </div>
-                                                            {overlay.active ? (
-                                                                <span className="text-xs font-bold text-violet-300 px-3 py-1.5">使用中</span>
-                                                            ) : (
-                                                                <button disabled={overlayBusy} onClick={() => void activateOverlay(overlay.id)} className="text-xs font-bold text-cyan-300 px-3 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 disabled:opacity-50">切换</button>
-                                                            )}
-                                                            {!overlay.builtin && (
-                                                                <button disabled={overlayBusy} onClick={() => void removeOverlay(overlay.id)} title="删除这个 Mod UI" className="text-xs text-red-300/70 hover:text-red-300 px-2 py-1.5 disabled:opacity-50">删除</button>
-                                                            )}
-                                                        </div>
-                                                    ))}
-                                                    {!overlayMods && <div className="text-xs text-gray-500 py-2">正在读取已安装 Mod UI…</div>}
+                                                <div className="space-y-3 rounded-xl border border-white/10 bg-black/15 p-4">
+                                                    <div className="text-xs font-bold text-blue-200">颜色与透明度</div>
+                                                    <label className="flex items-center justify-between gap-4 text-sm text-gray-200"><span>标题 / 高亮字</span><span className="flex items-center gap-2 text-[11px] font-mono text-gray-500"><span>{currentControlTheme.titleColor}</span><input aria-label="标题和高亮字颜色" type="color" value={currentControlTheme.titleColor} onChange={event => updateControlTheme({ ...currentControlTheme, titleColor: event.target.value })} className="w-8 h-8 rounded cursor-pointer bg-transparent" /></span></label>
+                                                    <label className="flex items-center justify-between gap-4 text-sm text-gray-200"><span>主体文字</span><span className="flex items-center gap-2 text-[11px] font-mono text-gray-500"><span>{currentControlTheme.textColor}</span><input aria-label="主体文字颜色" type="color" value={currentControlTheme.textColor} onChange={event => updateControlTheme({ ...currentControlTheme, textColor: event.target.value })} className="w-8 h-8 rounded cursor-pointer bg-transparent" /></span></label>
+                                                    <label className="flex items-center justify-between gap-4 text-sm text-gray-200"><span>次要文字</span><span className="flex items-center gap-2 text-[11px] font-mono text-gray-500"><span>{currentControlTheme.subTextColor}</span><input aria-label="次要文字颜色" type="color" value={currentControlTheme.subTextColor} onChange={event => updateControlTheme({ ...currentControlTheme, subTextColor: event.target.value })} className="w-8 h-8 rounded cursor-pointer bg-transparent" /></span></label>
+                                                    <label className="flex items-center justify-between gap-4 text-sm text-gray-200"><span>全局背景色</span><span className="flex items-center gap-2 text-[11px] font-mono text-gray-500"><span>{currentControlTheme.bgColor}</span><input aria-label="全局背景色" type="color" value={currentControlTheme.bgColor} onChange={event => updateControlTheme({ ...currentControlTheme, bgColor: event.target.value })} className="w-8 h-8 rounded cursor-pointer bg-transparent" /></span></label>
+                                                    <label className="block pt-1">
+                                                        <span className="mb-2 flex items-center justify-between text-sm text-gray-200"><span>背景不透明度</span><span className="text-xs font-bold text-blue-300">{Math.round(currentControlTheme.bgOpacity * 100)}%</span></span>
+                                                        <input aria-label="背景不透明度" type="range" min="0" max="1" step="0.05" value={currentControlTheme.bgOpacity} onChange={event => updateControlTheme({ ...currentControlTheme, bgOpacity: Number(event.target.value) })} className="w-full accent-blue-500" />
+                                                    </label>
                                                 </div>
                                             </div>
-                                        </section>
-                                    </div>
+
+                                            <div className="flex justify-end">
+                                                <button onClick={() => { updateControlTheme(defaultTheme); showAdminToast('✅ 已恢复主播控制 UI 默认外观'); }} className="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-xs font-bold text-gray-300 hover:bg-white/10">恢复默认外观</button>
+                                            </div>
+
+                                            <details className="group rounded-xl border border-white/10 bg-white/[0.025]">
+                                                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-gray-400 hover:text-gray-200">
+                                                    <span className="flex min-w-0 items-center gap-2">
+                                                        <span className="text-sm font-bold">经典页面捕捉</span>
+                                                        <span className="rounded-full border border-gray-500/20 bg-gray-500/10 px-2 py-1 text-[10px] text-gray-500">向前兼容</span>
+                                                    </span>
+                                                    <span className="shrink-0 text-[11px] text-gray-500">展开查看旧地址 ▾</span>
+                                                </summary>
+                                                <div className="border-t border-white/5 px-4 pb-4 pt-3">
+                                                    <p className="mb-3 text-xs leading-relaxed text-gray-500">仅保留给已经配置好旧版 OBS 场景的用户。新建直播画面时，请优先使用上方的 Mod UI 浏览器捕捉。</p>
+                                                    <div className="flex items-center gap-2 rounded-lg border border-white/5 bg-black/15 p-2">
+                                                        <div className="min-w-0 flex-1 truncate font-mono text-sm text-gray-400 select-all">{classicObsUrl}</div>
+                                                        <button onClick={() => { void navigator.clipboard.writeText(classicObsUrl); showAdminToast('✅ 已复制经典页面地址'); }} className="shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-bold text-gray-300 hover:bg-white/10">复制旧地址</button>
+                                                    </div>
+                                                </div>
+                                            </details>
+                                        </div>
+                                    </section>
                                 </div>
                             )}
 
@@ -2495,7 +3119,7 @@ const AdminWidget: React.FC = () => {
                                     )}
 
                                     {/* 播放器原生控制区域 */}
-                                    <div className="bg-white/5 p-6 rounded-xl border border-purple-500/40 space-y-5 mb-6 shadow-[0_0_15px_rgba(168,85,247,0.15)] relative overflow-hidden">
+                                    <div ref={playerSetupRef} className="bg-white/5 p-6 rounded-xl border border-purple-500/40 space-y-5 mb-6 shadow-[0_0_15px_rgba(168,85,247,0.15)] relative overflow-hidden scroll-mt-4">
                                         <div className="absolute top-0 right-0 bg-purple-600 text-white text-xs px-3 py-1 rounded-bl-lg font-bold">v1.1 独立连接器</div>
 
                                         <div className="flex items-center justify-between gap-3 border-b border-white/10 pb-3">
@@ -2887,7 +3511,7 @@ const AdminWidget: React.FC = () => {
                                         </div>
                                     </div>
 
-                                    <div className={`bg-white/5 p-6 rounded-xl border border-white/10 ${!config.biliLogin ? 'opacity-50' : ''}`}>
+                                    <div ref={permissionSetupRef} className={`bg-white/5 p-6 rounded-xl border border-white/10 scroll-mt-4 ${!config.biliLogin ? 'opacity-50' : ''}`}>
                                         <h3 className="text-sm font-bold text-green-400 uppercase tracking-widest border-b border-white/10 pb-3 mb-5">🛡️ 弹幕指令权限控制</h3>
                                         {!config.biliLogin && <div className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3 mb-5">游客模式固定使用基础权限，以下自定义设置暂不可用。</div>}
 
@@ -3138,9 +3762,14 @@ const App: React.FC = () => {
     return (
         <>
             <GlobalStyles />
-            <OverlayWidget onToggleAdmin={() => {
-                if (isElectron) electronAPI?.openAdmin();
-            }}/>
+            <OverlayWidget
+                onToggleAdmin={() => {
+                    if (isElectron) electronAPI?.openAdmin();
+                }}
+                onOpenAppearance={() => {
+                    if (isElectron) electronAPI?.openAdmin('appearance');
+                }}
+            />
         </>
     );
 };

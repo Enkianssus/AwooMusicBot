@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, session } from 'electron';
+import { app, BrowserWindow, ipcMain, session, shell } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import http from 'http';
@@ -42,6 +42,11 @@ import {
   OverlayModManager
 } from './overlay-mod-manager';
 import {
+  isAllowedSkinMarketplaceOrigin,
+  validateSkinMarketplaceDownloadUrl
+} from './skin-marketplace-policy';
+import { shouldShowWelcomeHint } from './welcome-hint-policy';
+import {
   isSuccessfulPlayerResult,
   PLAYER_LABELS,
   playerKeyFromConfig,
@@ -76,6 +81,7 @@ const INTERNAL_HTTP_PORT = Number(process.env['BILINCM_INTERNAL_PORT']) || 5555;
 const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
 const INTERNAL_API_BROWSER_TOKEN = randomBytes(32).toString('base64url');
 let overlayModManager: OverlayModManager | null = null;
+let skinMarketplaceInstallInProgress = false;
 
 function getOverlayModManager(): OverlayModManager {
   if (!overlayModManager) {
@@ -154,6 +160,23 @@ process.on('unhandledRejection', (reason) => {
 let overlayWindow: BrowserWindow | null = null;
 let adminWindow: BrowserWindow | null = null;
 
+function presentAdminWindow() {
+  if (!adminWindow || adminWindow.isDestroyed()) return;
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.setAlwaysOnTop(false);
+  }
+  if (adminWindow.isMinimized()) adminWindow.restore();
+  adminWindow.show();
+  adminWindow.moveTop();
+  adminWindow.focus();
+}
+
+function restoreOverlayAlwaysOnTop() {
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.setAlwaysOnTop(true);
+  }
+}
+
 function getDevUrl(): string | undefined {
   return process.env['VITE_DEV_SERVER_URL'] || process.env['ELECTRON_RENDERER_URL'];
 }
@@ -215,10 +238,12 @@ function createOverlayWindow() {
   overlayWindow.on('closed', () => { overlayWindow = null; app.quit(); });
 }
 
-function createAdminWindow() {
+function createAdminWindow(initialTab?: unknown) {
+  const tab = initialTab === 'appearance' ? 'appearance' : '';
   if (adminWindow && !adminWindow.isDestroyed()) {
-    if (adminWindow.isMinimized()) adminWindow.restore();
-    adminWindow.focus(); return;
+    presentAdminWindow();
+    if (tab) adminWindow.webContents.send('admin-navigate', tab);
+    return;
   }
   adminWindow = new BrowserWindow({
     width: 900, height: 640, minWidth: 600, minHeight: 420,
@@ -232,11 +257,31 @@ function createAdminWindow() {
       sandbox: true
     }
   });
-  loadWindow(adminWindow, 'admin=true');
-  adminWindow.on('closed', () => { adminWindow = null; });
+  adminWindow.once('ready-to-show', () => {
+    presentAdminWindow();
+  });
+  loadWindow(adminWindow, `admin=true${tab ? `&tab=${tab}` : ''}`);
+  adminWindow.on('minimize', restoreOverlayAlwaysOnTop);
+  adminWindow.on('restore', presentAdminWindow);
+  adminWindow.on('closed', () => {
+    adminWindow = null;
+    restoreOverlayAlwaysOnTop();
+  });
 }
 
-ipcMain.on('open-admin', () => createAdminWindow());
+ipcMain.on('open-admin', (_event, tab) => createAdminWindow(tab));
+ipcMain.handle('open-external', async (_event, value) => {
+  let target: URL;
+  try {
+    target = new URL(String(value || ''));
+  } catch {
+    throw new Error('外部链接无效');
+  }
+  if (!isAllowedSkinMarketplaceOrigin(target.origin)) {
+    throw new Error('只允许打开官方嗷呜皮肤站');
+  }
+  await shell.openExternal(target.toString());
+});
 ipcMain.on('close-window', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (win) { if (win === overlayWindow) app.quit(); else win.close(); }
@@ -265,6 +310,11 @@ ipcMain.on('overlay-resize', (event, w, h) => {
 });
 
 const CONFIG_PATH = path.join(app.getPath('userData'), 'bili_bot_config.json');
+const CONFIG_EXISTED_AT_STARTUP = fs.existsSync(CONFIG_PATH);
+const WELCOME_HINT_SENTINEL_PATH = path.join(
+  app.getPath('userData'),
+  'welcome-hint-shown-v1'
+);
 
 let appConfig: any = {
   roomId: 0,
@@ -345,6 +395,26 @@ let biliUid = 0;
 function createEmptyBiliUserInfo() {
   return { uid: 0, uname: '', face: '', level: 0, myRoomId: 0, followerCount: 0, guardCount: 0, fanClubCount: 0 };
 }
+
+ipcMain.handle('claim-welcome-hint', (_event, legacyHintWasShown) => {
+  const alreadyShown = fs.existsSync(WELCOME_HINT_SENTINEL_PATH);
+  const shouldShow = shouldShowWelcomeHint({
+    alreadyShown,
+    configExistedAtStartup: CONFIG_EXISTED_AT_STARTUP,
+    legacyHintWasShown: legacyHintWasShown === true
+  });
+
+  if (!alreadyShown) {
+    try {
+      fs.writeFileSync(WELCOME_HINT_SENTINEL_PATH, 'shown\n', { flag: 'wx' });
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') {
+        writeLog('[界面] 无法保存首次欢迎提示状态', 'Yellow');
+      }
+    }
+  }
+  return shouldShow;
+});
 
 let currentUserInfo: any = createEmptyBiliUserInfo();
 
@@ -2325,6 +2395,17 @@ const OBS_OVERLAY_HOST_JS = `
   var frame=document.getElementById('awoo-overlay-frame');
   var status=document.getElementById('awoo-overlay-status');
   var revision='';
+  var settingsRevision='';
+  var activeState=null;
+  function deliverSettings(){
+    if(!activeState||!frame.contentWindow)return;
+    frame.contentWindow.postMessage({
+      type:'awoo-overlay-settings',
+      overlayId:activeState.id||'builtin',
+      definitions:Array.isArray(activeState.settings)?activeState.settings:[],
+      values:activeState.values&&typeof activeState.values==='object'?activeState.values:{}
+    },'*');
+  }
   function refresh(){
     fetch('/api/v1/overlay',{cache:'no-store'}).then(function(response){
       if(!response.ok)throw new Error('HTTP '+response.status);
@@ -2332,20 +2413,101 @@ const OBS_OVERLAY_HOST_JS = `
     }).then(function(state){
       var active=state&&state.active?state.active:{};
       var next=[active.id||'builtin',active.version||'',active.installedAt||''].join('@');
-      if(next===revision)return;
-      revision=next;
-      frame.dataset.ready='false';
-      status.textContent='正在载入 '+(active.name||'Mod UI')+'…';
-      frame.src='/overlay/content/?revision='+encodeURIComponent(next);
+      var nextSettings=JSON.stringify(active.values||{});
+      activeState=active;
+      if(next!==revision){
+        revision=next;
+        settingsRevision=nextSettings;
+        frame.dataset.ready='false';
+        status.textContent='正在载入 '+(active.name||'Mod UI')+'…';
+        frame.src='/overlay/content/?revision='+encodeURIComponent(next);
+        return;
+      }
+      if(nextSettings!==settingsRevision){
+        settingsRevision=nextSettings;
+      }
+      // iframe 在刚完成导航或被 Electron 后台节流时可能错过单次消息。
+      // 每轮补发当前参数，让预览与 OBS 最迟在下一次轮询恢复一致。
+      deliverSettings();
     }).catch(function(error){
       status.textContent='Mod UI 无法载入：'+error.message;
     });
   }
-  frame.addEventListener('load',function(){frame.dataset.ready='true'});
+  frame.addEventListener('load',function(){
+    frame.dataset.ready='true';
+    deliverSettings();
+  });
+  window.addEventListener('message',function(event){
+    if(event.source===frame.contentWindow&&event.data&&event.data.type==='awoo-overlay-ready'){
+      deliverSettings();
+    }
+  });
   refresh();
-  window.setInterval(refresh,2000);
+  window.setInterval(refresh,500);
 }());
 `;
+
+const OBS_OVERLAY_RUNTIME_JS = `
+(function(){
+  'use strict';
+  var current={overlayId:'',definitions:[],values:{}};
+  var applied=[];
+  var subscribers=[];
+  function attributeName(key){
+    return 'data-awoo-setting-'+String(key||'').replace(/([a-z0-9])([A-Z])/g,'$1-$2').replace(/[^A-Za-z0-9_-]/g,'-').toLowerCase();
+  }
+  function cssValue(definition,value){
+    if(typeof value==='boolean')return value?'1':'0';
+    return String(value)+(definition.cssUnit||'');
+  }
+  function apply(payload){
+    var root=document.documentElement;
+    applied.forEach(function(definition){
+      if(definition.cssVariable)root.style.removeProperty(definition.cssVariable);
+      root.removeAttribute(attributeName(definition.key));
+    });
+    var definitions=Array.isArray(payload.definitions)?payload.definitions:[];
+    var values=payload.values&&typeof payload.values==='object'?payload.values:{};
+    definitions.forEach(function(definition){
+      if(!definition||typeof definition.key!=='string')return;
+      var value=Object.prototype.hasOwnProperty.call(values,definition.key)?values[definition.key]:definition.default;
+      if(typeof definition.cssVariable==='string'&&/^--[a-z][a-z0-9-]*$/.test(definition.cssVariable)){
+        root.style.setProperty(definition.cssVariable,cssValue(definition,value));
+      }
+      root.setAttribute(attributeName(definition.key),String(value));
+    });
+    applied=definitions;
+    current={overlayId:String(payload.overlayId||''),definitions:definitions,values:Object.assign({},values)};
+    var detail={overlayId:current.overlayId,definitions:current.definitions,values:Object.assign({},current.values)};
+    window.dispatchEvent(new CustomEvent('awoo-overlay-settings',{detail:detail}));
+    subscribers.slice().forEach(function(callback){try{callback(detail);}catch(_error){}});
+  }
+  window.AwooOverlay={
+    getSettings:function(){return Object.assign({},current.values);},
+    subscribe:function(callback){
+      if(typeof callback!=='function')return function(){};
+      subscribers.push(callback);
+      if(current.overlayId)callback({overlayId:current.overlayId,definitions:current.definitions,values:Object.assign({},current.values)});
+      return function(){subscribers=subscribers.filter(function(item){return item!==callback;});};
+    }
+  };
+  window.addEventListener('message',function(event){
+    if(event.source!==window.parent||!event.data||event.data.type!=='awoo-overlay-settings')return;
+    apply(event.data);
+  });
+  window.parent.postMessage({type:'awoo-overlay-ready'},'*');
+}());
+`;
+
+function injectObsOverlayRuntime(content: Buffer): Buffer {
+  const html = content.toString('utf8');
+  if (html.includes('data-awoo-overlay-runtime')) return content;
+  const runtimeTag = '<script src="/overlay/runtime.js" defer data-awoo-overlay-runtime></script>';
+  const injected = /<head(?:\s[^>]*)?>/i.test(html)
+    ? html.replace(/<head(?:\s[^>]*)?>/i, match => `${match}\n  ${runtimeTag}`)
+    : `${runtimeTag}\n${html}`;
+  return Buffer.from(injected, 'utf8');
+}
 
 async function serveObsOverlay(
   pathname: string,
@@ -2371,6 +2533,11 @@ async function serveObsOverlay(
       res.end(OBS_OVERLAY_HOST_JS);
       return true;
     }
+    if (pathname === '/overlay/runtime.js') {
+      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      res.end(OBS_OVERLAY_RUNTIME_JS);
+      return true;
+    }
     if (!pathname.startsWith('/overlay/content/')) return false;
     const relativePath = decodeURIComponent(
       pathname.slice('/overlay/content/'.length)
@@ -2381,12 +2548,15 @@ async function serveObsOverlay(
       res.end('Mod UI asset not found');
       return true;
     }
-    const content = await fs.promises.readFile(asset.filePath);
+    const rawContent = await fs.promises.readFile(asset.filePath);
+    const content = asset.contentType.startsWith('text/html')
+      ? injectObsOverlayRuntime(rawContent)
+      : rawContent;
     res.setHeader('Content-Type', asset.contentType);
     res.setHeader('X-Awoo-Overlay-Revision', asset.revision);
     res.setHeader(
       'Content-Security-Policy',
-      "default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; img-src http: https: data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
+      "default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; img-src http: https: data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' file: http://127.0.0.1:* http://localhost:*"
     );
     res.end(content);
   } catch (error: unknown) {
@@ -2650,8 +2820,17 @@ async function restartExternalApiServer(): Promise<void> {
 function startBackendServer() {
   const server = http.createServer(async (req, res) => {
     try {
+      const url = new URL(req.url || '/', `http://${req.headers.host}`);
       const origin = req.headers.origin;
-      if (!isAllowedInternalOrigin(origin)) {
+      const isSkinMarketplaceRoute =
+        url.pathname === '/api/skin-marketplace/status'
+        || url.pathname === '/api/skin-marketplace/install';
+      const isTrustedSkinMarketplaceRequest = Boolean(
+        isSkinMarketplaceRoute
+        && isLoopbackRemoteAddress(req.socket.remoteAddress)
+        && isAllowedSkinMarketplaceOrigin(origin)
+      );
+      if (!isAllowedInternalOrigin(origin) && !isTrustedSkinMarketplaceRequest) {
         res.writeHead(403);
         res.end('Forbidden origin');
         return;
@@ -2665,11 +2844,18 @@ function startBackendServer() {
         'Access-Control-Allow-Headers',
         'Content-Type, X-Awoo-File-Name, X-Awoo-Internal-Token'
       );
+      if (
+        isTrustedSkinMarketplaceRequest
+        && req.headers['access-control-request-private-network'] === 'true'
+      ) {
+        res.setHeader('Access-Control-Allow-Private-Network', 'true');
+      }
       if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
       if (
         req.method !== 'GET'
         && req.method !== 'HEAD'
+        && !isTrustedSkinMarketplaceRequest
         && !isTrustedInternalMutationRequest(req)
       ) {
         res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -2680,7 +2866,80 @@ function startBackendServer() {
         return;
       }
 
-    const url = new URL(req.url || '/', `http://${req.headers.host}`);
+    if (url.pathname === '/api/skin-marketplace/status' && req.method === 'GET') {
+      if (origin && !isTrustedSkinMarketplaceRequest) {
+        res.writeHead(403);
+        res.end(JSON.stringify({ success: false, message: '皮肤站来源不受信任' }));
+        return;
+      }
+      const state = await getOverlayModManager().getPublicState();
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({
+        success: true,
+        appVersion: app.getVersion(),
+        active: {
+          id: state.active.id,
+          name: state.active.name,
+          version: state.active.version
+        }
+      }));
+      return;
+    }
+
+    if (url.pathname === '/api/skin-marketplace/install' && req.method === 'POST') {
+      if (!isTrustedSkinMarketplaceRequest) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ success: false, message: '只接受官方皮肤站的一键安装请求' }));
+        return;
+      }
+      if (skinMarketplaceInstallInProgress) {
+        res.writeHead(409, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ success: false, message: '另一个皮肤正在安装，请稍候' }));
+        return;
+      }
+      skinMarketplaceInstallInProgress = true;
+      try {
+        const contentType = String(req.headers['content-type'] || '')
+          .split(';', 1)[0]
+          .trim()
+          .toLowerCase();
+        let state;
+        if (
+          contentType === 'application/zip'
+          || contentType === 'application/octet-stream'
+        ) {
+          const archive = await readBinaryRequest(
+            req,
+            MAX_OVERLAY_ARCHIVE_BYTES
+          );
+          await getOverlayModManager().installArchive(
+            archive,
+            `skin-marketplace:${origin}`
+          );
+          state = await getOverlayModManager().getPublicState();
+        } else {
+          const body = await readJsonRequest(req);
+          const downloadUrl = validateSkinMarketplaceDownloadUrl(
+            body.downloadUrl,
+            origin
+          );
+          state = await getOverlayModManager().installArchiveFromUrl(downloadUrl);
+        }
+        writeLog(`✅ [皮肤站] 已一键安装并启用 ${state.active.name} ${state.active.version}`, 'Green');
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({
+          success: true,
+          active: {
+            id: state.active.id,
+            name: state.active.name,
+            version: state.active.version
+          }
+        }));
+      } finally {
+        skinMarketplaceInstallInProgress = false;
+      }
+      return;
+    }
 
     if (url.pathname === '/data') {
       const showPlayerCurrentTrack = appConfig.sysConfig?.ShowPlayerCurrentTrack !== false;
@@ -2733,6 +2992,19 @@ function startBackendServer() {
       const body = await readJsonRequest(req);
       const state = await getOverlayModManager().activate(String(body.id || ''));
       writeLog(`🎨 [Mod UI] 已切换到 ${state.active.name} ${state.active.version}`, 'Cyan');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ success: true, ...state }));
+      return;
+    }
+
+    if (url.pathname === '/api/overlays/settings' && req.method === 'POST') {
+      const body = await readJsonRequest(req);
+      const state = await getOverlayModManager().updateSettings(
+        String(body.id || ''),
+        body.values,
+        body.reset === true
+      );
+      writeLog(`🎛️ [Mod UI] 已保存 ${state.activeId === String(body.id || '') ? state.active.name : String(body.id || '')} 的独立参数`, 'Cyan');
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({ success: true, ...state }));
       return;
@@ -3324,10 +3596,11 @@ app.whenReady().then(() => {
     () => void maintainPlayerConnectors(true),
     CONNECTOR_MAINTENANCE_INTERVAL_MS
   );
+  // 先开始监听本地接口，再加载悬浮窗，避免首次轮询撞上尚未启动的后端。
+  startBackendServer();
   createOverlayWindow();
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createOverlayWindow(); });
-  startBackendServer();
   void restartExternalApiServer();
   if (biliCookie) updateCurrentUserInfo();
   if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);

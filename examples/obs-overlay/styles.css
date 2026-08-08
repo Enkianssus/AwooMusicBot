@@ -9,6 +9,9 @@
   --success: #58e5aa;
   --warning: #ffd27c;
   --danger: #ff91a2;
+  --panel-opacity: 0.94;
+  --widget-scale: 1;
+  --cover-spin-duration: 18s;
 }
 
 * {
@@ -40,6 +43,8 @@ body {
   width: min(720px, calc(100vw - 32px));
   min-width: 0;
   margin: 16px;
+  transform: scale(var(--widget-scale));
+  transform-origin: top left;
 }
 
 .widget-card {
@@ -49,7 +54,7 @@ body {
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 20px;
-  background: linear-gradient(135deg, var(--panel), var(--panel-soft));
+  background: linear-gradient(135deg, rgb(18 18 28 / var(--panel-opacity)), rgb(25 23 38 / var(--panel-opacity)));
   box-shadow: 0 16px 44px rgba(5, 3, 15, 0.28);
   backdrop-filter: blur(14px);
 }
@@ -79,6 +84,7 @@ body {
   border-radius: 16px;
   background: linear-gradient(135deg, rgba(185, 135, 255, 0.36), rgba(42, 45, 78, 0.76));
   box-shadow: 0 10px 28px rgba(100, 57, 167, 0.2);
+  transition: border-radius 220ms ease;
 }
 
 .cover-frame img,
@@ -90,6 +96,20 @@ body {
 .cover-frame img {
   display: block;
   object-fit: cover;
+  animation: awoo-cover-spin var(--cover-spin-duration) linear infinite;
+  animation-play-state: paused;
+}
+
+html[data-awoo-setting-cover-rotation="true"] .cover-frame {
+  border-radius: 50%;
+}
+
+html[data-awoo-setting-cover-rotation="true"] .cover-frame img:not([hidden]) {
+  animation-play-state: running;
+}
+
+@keyframes awoo-cover-spin {
+  to { transform: rotate(360deg); }
 }
 
 .cover-fallback {

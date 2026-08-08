@@ -7,5 +7,83 @@
   "author": "Enkianssus",
   "description": "透明的当前播放与待播队列组件，暂停区域变红，正常状态保持安静。",
   "homepage": "https://github.com/Enkianssus/AwooMusicBot-Overlay-Default",
-  "minAppVersion": "1.1.5"
+  "minAppVersion": "1.1.6",
+  "settings": [
+    {
+      "key": "accentColor",
+      "label": "强调色",
+      "description": "标题、标签和高亮元素使用的颜色。",
+      "group": "颜色",
+      "type": "color",
+      "default": "#c6a3ff",
+      "cssVariable": "--accent"
+    },
+    {
+      "key": "textColor",
+      "label": "主要文字颜色",
+      "description": "歌曲名称等主要文字使用的颜色。",
+      "group": "颜色",
+      "type": "color",
+      "default": "#f8f8ff",
+      "cssVariable": "--text"
+    },
+    {
+      "key": "panelOpacity",
+      "label": "面板不透明度",
+      "description": "调整卡片背景的透明程度。",
+      "group": "外观",
+      "type": "range",
+      "default": 0.94,
+      "min": 0.2,
+      "max": 1,
+      "step": 0.02,
+      "cssVariable": "--panel-opacity"
+    },
+    {
+      "key": "scale",
+      "label": "整体缩放",
+      "description": "缩放整个组件，不改变 OBS 浏览器源尺寸。",
+      "group": "布局",
+      "type": "range",
+      "default": 1,
+      "min": 0.65,
+      "max": 1.5,
+      "step": 0.05,
+      "cssVariable": "--widget-scale"
+    },
+    {
+      "key": "maxQueue",
+      "label": "最多显示歌曲",
+      "description": "控制待播队列中最多显示多少首歌曲。",
+      "group": "布局",
+      "type": "range",
+      "default": 3,
+      "min": 1,
+      "max": 10,
+      "step": 1,
+      "cssVariable": "--awoo-max-queue"
+    },
+    {
+      "key": "coverRotation",
+      "label": "专辑封面旋转",
+      "description": "播放歌曲时让专辑封面像唱片一样缓慢旋转。",
+      "group": "专辑封面",
+      "type": "toggle",
+      "default": false,
+      "cssVariable": "--awoo-cover-rotation"
+    },
+    {
+      "key": "coverRotationSpeed",
+      "label": "封面旋转一圈",
+      "description": "数值越大，专辑封面旋转得越慢。",
+      "group": "专辑封面",
+      "type": "range",
+      "default": 18,
+      "min": 4,
+      "max": 60,
+      "step": 1,
+      "cssVariable": "--cover-spin-duration",
+      "cssUnit": "s"
+    }
+  ]
 }

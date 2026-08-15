@@ -55,10 +55,21 @@ app.js
     },
     {
       "key": "coverRotation",
-      "label": "专辑封面旋转",
-      "group": "封面",
+      "label": "当前图片旋转",
+      "group": "图片动画",
       "type": "toggle",
       "default": false
+    },
+    {
+      "key": "artworkSource",
+      "label": "Mod UI 当前歌曲图片",
+      "group": "Mod UI 歌曲图片",
+      "type": "select",
+      "default": "album_cover",
+      "options": [
+        { "label": "专辑封面（默认）", "value": "album_cover" },
+        { "label": "点歌人头像", "value": "requester_avatar" }
+      ]
     }
   ]
 }

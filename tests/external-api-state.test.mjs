@@ -23,7 +23,9 @@ test('publishes explicit request intake and queue playback states', () => {
     currentSong: {
       Id: 1403356922,
       SongName: 'Test Song',
-      ArtistName: 'Test Artist'
+      ArtistName: 'Test Artist',
+      CoverUrl: 'https://example.com/album.jpg',
+      OrderedByAvatar: 'https://example.com/avatar.jpg'
     },
     currentIsRequested: true,
     queue: [{ Id: 'next', SongName: 'Next Song', OrderedBy: 'viewer' }],
@@ -36,6 +38,11 @@ test('publishes explicit request intake and queue playback states', () => {
   assert.equal(state.schemaVersion, 1);
   assert.equal(state.timestamp, '2026-08-03T00:00:00.000Z');
   assert.equal(state.current?.id, '1403356922');
+  assert.equal(state.current?.coverUrl, 'https://example.com/album.jpg');
+  assert.equal(
+    state.current?.requestedByAvatar,
+    'https://example.com/avatar.jpg'
+  );
   assert.equal(state.queueLength, 1);
   assert.deepEqual(state.service, {
     requestIntake: { enabled: false, state: 'paused' },

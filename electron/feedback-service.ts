@@ -28,6 +28,16 @@ export interface FeedbackSubmitResult {
   trackingUrl: string;
 }
 
+export interface PublicFeedbackStatus {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  category: string;
+  status: string;
+  title: string;
+  reply: string;
+}
+
 export async function submitFeedback(
   submission: FeedbackSubmission,
   timeoutMs = 12_000
@@ -55,6 +65,45 @@ export async function submitFeedback(
       );
     }
     return result as FeedbackSubmitResult;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function getFeedbackStatus(
+  publicId: string,
+  timeoutMs = 8_000
+): Promise<PublicFeedbackStatus> {
+  const id = String(publicId || '').trim().toUpperCase();
+  if (!/^[A-Z0-9][A-Z0-9-]{7,39}$/.test(id)) {
+    throw new Error('问题编号格式无效');
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${FEEDBACK_API_URL}/${encodeURIComponent(id)}`, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'AwooMusicBot-Feedback/1.1'
+      },
+      signal: controller.signal
+    });
+    const result = await response.json() as Record<string, any>;
+    if (!response.ok) {
+      throw new Error(
+        String(result.error || `反馈查询 HTTP ${response.status}`)
+      );
+    }
+    return {
+      id: String(result.id || id),
+      createdAt: String(result.createdAt || ''),
+      updatedAt: String(result.updatedAt || ''),
+      category: String(result.category || ''),
+      status: String(result.status || 'open'),
+      title: String(result.title || ''),
+      reply: String(result.reply || '')
+    };
   } finally {
     clearTimeout(timer);
   }

@@ -10,6 +10,7 @@
     Number.isInteger(pagePort) ? pagePort : 5556
   );
   var maxQueue = readMaxQueue(params.get('maxQueue'));
+  var artworkSource = readArtworkSource(params.get('artworkSource'));
   var endpointHost = '127.0.0.1:' + port;
   var stateUrl = 'http://' + endpointHost + '/api/v1/state';
   var websocketUrl = 'ws://' + endpointHost + '/ws';
@@ -25,6 +26,7 @@
     currentArtist: document.getElementById('current-artist'),
     currentRequester: document.getElementById('current-requester'),
     currentRequesterName: document.getElementById('current-requester-name'),
+    currentCoverFrame: document.getElementById('current-cover-frame'),
     currentCover: document.getElementById('current-cover'),
     currentCoverFallback: document.getElementById('current-cover-fallback'),
     playbackAlert: document.getElementById('playback-alert'),
@@ -52,6 +54,11 @@
       maxQueue = readMaxQueue(String(values.maxQueue));
       if (lastState) renderQueue(lastState);
     }
+    var nextArtworkSource = readArtworkSource(values.artworkSource);
+    if (nextArtworkSource !== artworkSource) {
+      artworkSource = nextArtworkSource;
+      if (lastState) renderCurrent(lastState);
+    }
   });
 
   function readPort(value, fallbackPort) {
@@ -65,6 +72,12 @@
     var parsed = Number.parseInt(value || '', 10);
     if (!Number.isInteger(parsed)) return 3;
     return Math.min(30, Math.max(1, parsed));
+  }
+
+  function readArtworkSource(value) {
+    return value === 'requester_avatar'
+      ? 'requester_avatar'
+      : 'album_cover';
   }
 
   function text(value, fallback) {
@@ -171,6 +184,47 @@
     }
   }
 
+  function currentArtworkCandidates(song, state) {
+    var candidates = artworkSource === 'requester_avatar'
+      && state.currentIsRequested
+      ? [
+          { kind: 'requester_avatar', value: song.requestedByAvatar },
+          { kind: 'album_cover', value: song.coverUrl }
+        ]
+      : [{ kind: 'album_cover', value: song.coverUrl }];
+    return candidates
+      .map(function (candidate) {
+        return { kind: candidate.kind, url: safeCoverUrl(candidate.value) };
+      })
+      .filter(function (candidate, index, values) {
+        return Boolean(candidate.url) && values.map(function (item) {
+          return item.url;
+        }).indexOf(candidate.url) === index;
+      });
+  }
+
+  function renderCurrentArtwork(candidates) {
+    var index = 0;
+    function showNext() {
+      if (index >= candidates.length) {
+        elements.currentCoverFrame.dataset.artworkKind = 'fallback';
+        elements.currentCover.hidden = true;
+        elements.currentCover.removeAttribute('src');
+        elements.currentCoverFallback.hidden = false;
+        return;
+      }
+      var candidate = candidates[index];
+      index += 1;
+      elements.currentCoverFrame.dataset.artworkKind = candidate.kind;
+      elements.currentCover.hidden = false;
+      elements.currentCoverFallback.hidden = true;
+      elements.currentCover.src = candidate.url;
+    }
+    elements.currentCover.alt = '';
+    elements.currentCover.onerror = showNext;
+    showNext();
+  }
+
   function renderCurrent(state) {
     var song = state.current;
     if (!song) {
@@ -178,7 +232,9 @@
       elements.currentArtist.textContent = '暂无歌曲';
       elements.currentRequester.hidden = true;
       elements.currentRequesterName.textContent = '';
+      elements.currentCoverFrame.dataset.artworkKind = 'fallback';
       elements.currentCover.hidden = true;
+      elements.currentCover.onerror = null;
       elements.currentCover.removeAttribute('src');
       elements.currentCoverFallback.hidden = false;
       return;
@@ -189,21 +245,7 @@
     var requester = song.requestedBy;
     elements.currentRequester.hidden = !state.currentIsRequested || !requester;
     elements.currentRequesterName.textContent = requester;
-    var coverUrl = safeCoverUrl(song.coverUrl);
-    elements.currentCover.hidden = !coverUrl;
-    elements.currentCoverFallback.hidden = Boolean(coverUrl);
-    if (coverUrl) {
-      // The cover is decorative in the overlay; keep alt text static so external
-      // song titles are only rendered through textContent below.
-      elements.currentCover.alt = '';
-      elements.currentCover.src = coverUrl;
-      elements.currentCover.onerror = function () {
-        elements.currentCover.hidden = true;
-        elements.currentCoverFallback.hidden = false;
-      };
-    } else {
-      elements.currentCover.removeAttribute('src');
-    }
+    renderCurrentArtwork(currentArtworkCandidates(song, state));
   }
 
   function renderQueue(state) {

@@ -33,10 +33,25 @@ import {
 import { PlayerManager } from './players/player-manager';
 import type { NativeConnectorId } from './connector-updater';
 import {
+  getFeedbackStatus,
   sanitizeFeedbackLog,
   submitFeedback
 } from './feedback-service';
 import { buildExternalApiState } from './external-api-state';
+import {
+  addGiftRequestCredits,
+  canRequestWithGiftCredits,
+  consumeGiftRequestCredit,
+  createEmptyGiftRequestRequirements,
+  describeGiftRequestRequirement,
+  giftRequestTierFromGuardLevel,
+  giftRequestTierLabel,
+  matchesGiftRequestRequirement,
+  normalizeGiftRequestRequirements,
+  parseBilibiliGiftCreditEvent,
+  type BilibiliGiftCreditEvent,
+  type GiftRequestRequirement
+} from './gift-request-credit-policy';
 import {
   MAX_OVERLAY_ARCHIVE_BYTES,
   OverlayModManager
@@ -46,6 +61,13 @@ import {
   validateSkinMarketplaceDownloadUrl
 } from './skin-marketplace-policy';
 import { shouldShowWelcomeHint } from './welcome-hint-policy';
+import {
+  buildPlayerProcessAccessHint,
+  buildPlayerUpgradeHint,
+  isUpgradeSensitivePlayerCommand,
+  type PlayerProcessAccessHint,
+  type PlayerUpgradeHint
+} from './player-upgrade-hint-policy';
 import {
   isSuccessfulPlayerResult,
   PLAYER_LABELS,
@@ -130,6 +152,41 @@ let connectorMaintenanceStatus = '';
 let statusClearTimer: NodeJS.Timeout | null = null;
 let isPlayerConnected: boolean = false;
 
+type AppUpdateDownloadState =
+  | 'idle'
+  | 'checking'
+  | 'downloading'
+  | 'applying'
+  | 'no-update'
+  | 'error';
+
+interface AppUpdateDownloadStatus {
+  state: AppUpdateDownloadState;
+  progress: number | null;
+  version: string | null;
+  message: string;
+  updatedAt: string;
+}
+
+let appUpdateDownloadStatus: AppUpdateDownloadStatus = {
+  state: 'idle',
+  progress: null,
+  version: null,
+  message: '',
+  updatedAt: new Date().toISOString()
+};
+let appUpdateOperation: Promise<void> | null = null;
+
+function setAppUpdateDownloadStatus(
+  patch: Partial<Omit<AppUpdateDownloadStatus, 'updatedAt'>>
+): void {
+  appUpdateDownloadStatus = {
+    ...appUpdateDownloadStatus,
+    ...patch,
+    updatedAt: new Date().toISOString()
+  };
+}
+
 function setGlobalStatus(msg: string) {
   currentStatusMessage = msg;
   if (statusClearTimer) clearTimeout(statusClearTimer);
@@ -146,6 +203,87 @@ function writeLog(message: string, color: string = 'Gray') {
     Message: message
   });
   if (sysLogs.length > 100) sysLogs.shift();
+}
+
+function startAppUpdateOperation(): void {
+  if (appUpdateOperation) return;
+  appUpdateOperation = (async () => {
+    try {
+      setAppUpdateDownloadStatus({
+        state: 'checking',
+        progress: 0,
+        version: null,
+        message: '正在确认更新版本'
+      });
+      const updateManager = new UpdateManager(
+        'https://app.enkianss.us/update/awoo'
+      );
+      const updateInfo = await updateManager.checkForUpdatesAsync();
+      if (!updateInfo) {
+        setAppUpdateDownloadStatus({
+          state: 'no-update',
+          progress: null,
+          version: null,
+          message: '当前已经是最新版本'
+        });
+        return;
+      }
+
+      const version = String(
+        updateInfo.TargetFullRelease?.Version || ''
+      ) || null;
+      let lastLoggedBucket = -1;
+      setAppUpdateDownloadStatus({
+        state: 'downloading',
+        progress: 0,
+        version,
+        message: '正在下载更新'
+      });
+      setGlobalStatus('🚀 下载更新中...');
+      await updateManager.downloadUpdateAsync(
+        updateInfo,
+        (rawProgress: number) => {
+          const progress = Math.max(
+            0,
+            Math.min(100, Math.floor(Number(rawProgress) || 0))
+          );
+          setAppUpdateDownloadStatus({
+            state: 'downloading',
+            progress,
+            version,
+            message: '正在下载更新'
+          });
+          const bucket = Math.floor(progress / 10);
+          if (bucket > lastLoggedBucket) {
+            lastLoggedBucket = bucket;
+            writeLog(`[更新] 真实下载进度: ${progress}%`, 'DarkGray');
+          }
+        }
+      );
+      setAppUpdateDownloadStatus({
+        state: 'applying',
+        progress: 100,
+        version,
+        message: '下载完成，正在重启安装'
+      });
+      updateManager.waitExitThenApplyUpdate(updateInfo, false, true);
+      app.quit();
+    } catch (error: unknown) {
+      const message = error instanceof Error
+        ? error.message
+        : String(error);
+      setAppUpdateDownloadStatus({
+        state: 'error',
+        progress: null,
+        version: null,
+        message: `更新失败：${message}`
+      });
+      setGlobalStatus('❌ 更新失败');
+      writeLog(`[更新] ${message}`, 'Red');
+    }
+  })().finally(() => {
+    appUpdateOperation = null;
+  });
 }
 
 process.on('uncaughtException', (err) => {
@@ -326,6 +464,7 @@ let appConfig: any = {
     PlayerType: 'NCM',
     FoliaToken: '',
     Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 },
+    GiftRequestRequirements: createEmptyGiftRequestRequirements(),
     IdleWaitNext: true,
     ShowPlayerCurrentTrack: true,
     PauseAfterRequests: false,
@@ -345,7 +484,7 @@ function loadConfig() {
       appConfig = { ...appConfig, ...saved };
 
       if (!appConfig.sysConfig) {
-        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, IdleWaitNext: true, ShowPlayerCurrentTrack: true, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], ExternalHttpEnabled: false, ExternalWebSocketEnabled: false, ExternalApiPort: 5556 };
+        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, GiftRequestRequirements: createEmptyGiftRequestRequirements(), IdleWaitNext: true, ShowPlayerCurrentTrack: true, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], ExternalHttpEnabled: false, ExternalWebSocketEnabled: false, ExternalApiPort: 5556 };
       }
       if (!['NCM', 'Kugou', 'QQMusic', 'Folia'].includes(appConfig.sysConfig.PlayerType)) appConfig.sysConfig.PlayerType = 'NCM';
       if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
@@ -370,6 +509,10 @@ function loadConfig() {
         appConfig.sysConfig.Cooldowns = { Normal: oldSecs, Captain: oldSecs, Admiral: oldSecs, Governor: oldSecs };
         delete appConfig.sysConfig.CooldownMinutes;
       }
+      appConfig.sysConfig.GiftRequestRequirements =
+        normalizeGiftRequestRequirements(
+          appConfig.sysConfig.GiftRequestRequirements
+        );
 
       biliCookie = appConfig.biliCookie || '';
       biliUid = appConfig.biliUid || 0;
@@ -436,6 +579,9 @@ let isPausingAfterRequests = false;
 let lastQueueActionTime = 0; // 全局队列操作防抖冷却时间
 let activePlayerSnapshot: PlayerSnapshot | null = null;
 let playerConnecting = false;
+type PlayerControlHint = PlayerUpgradeHint | PlayerProcessAccessHint;
+type PlayerControlNotice = PlayerControlHint & { detectedAt: string };
+let playerControlNotice: PlayerControlNotice | null = null;
 let registeredNextGuardKey = '';
 let registeredNextGuardSongIdentity = '';
 let queueHeadNeedsGuardOnlyAfterCurrentChange = false;
@@ -476,6 +622,24 @@ const playerManager = new PlayerManager({
     isPlayerConnected = state.connected;
     playerConnecting = state.connecting;
     activePlayerSnapshot = state.snapshot;
+    if (
+      playerControlNotice
+      && (
+        !state.connected
+        || getSelectedPlayerKey() !== playerControlNotice.playerKey
+        || (
+          state.snapshot?.version
+          && state.snapshot.version !== playerControlNotice.currentVersion
+        )
+        || (
+          state.snapshot?.processId
+          && playerControlNotice.processId
+          && state.snapshot.processId !== playerControlNotice.processId
+        )
+      )
+    ) {
+      playerControlNotice = null;
+    }
     if (!state.connected) {
       registeredNextGuardKey = '';
       registeredNextGuardSongIdentity = '';
@@ -528,7 +692,47 @@ const playerManager = new PlayerManager({
 });
 
 const userCooldowns = new Map<string, number>();
+const giftRequestCredits = new Map<string, number>();
+const recentGiftEvents = new Map<string, number>();
 let recentRejects: { id: number, user: any, reason: string }[] = [];
+
+function isConfiguredSuperUser(user: any): boolean {
+  if (!isBiliLoginReady()) return false;
+  const configured = Array.isArray(appConfig.sysConfig?.SuperUsers)
+    ? appConfig.sysConfig.SuperUsers.map((value: unknown) => String(value))
+    : [];
+  return configured.includes(String(user?.uname || ''))
+    || configured.includes(String(user?.uid || ''));
+}
+
+function getGiftRequirementForGuardLevel(guardLevel: unknown): {
+  tier: ReturnType<typeof giftRequestTierFromGuardLevel>;
+  requirement: GiftRequestRequirement;
+} {
+  const tier = giftRequestTierFromGuardLevel(guardLevel);
+  const requirements = normalizeGiftRequestRequirements(
+    appConfig.sysConfig?.GiftRequestRequirements
+  );
+  return { tier, requirement: requirements[tier] };
+}
+
+function claimGiftEvent(event: BilibiliGiftCreditEvent): boolean {
+  if (!event.eventId) return true;
+  const key = `${event.uid}|${event.eventId}`;
+  const now = Date.now();
+  const previous = recentGiftEvents.get(key) || 0;
+  if (now - previous < 15 * 60_000) return false;
+  recentGiftEvents.set(key, now);
+  for (const [storedKey, timestamp] of recentGiftEvents) {
+    if (now - timestamp > 15 * 60_000) recentGiftEvents.delete(storedKey);
+  }
+  while (recentGiftEvents.size > 1_000) {
+    const oldest = recentGiftEvents.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    recentGiftEvents.delete(oldest);
+  }
+  return true;
+}
 
 async function addReject(user: any, reason: string) {
   const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
@@ -818,7 +1022,7 @@ function checkPermission(user: any, permKey: string): { allowed: boolean, reason
       reason: '游客模式仅开放普通点歌和撤回自己的歌曲，请先扫码登录使用控制指令'
     };
   }
-  if (appConfig.sysConfig?.SuperUsers?.includes(user.uname) || appConfig.sysConfig?.SuperUsers?.includes(user.uid)) return { allowed: true };
+  if (isConfiguredSuperUser(user)) return { allowed: true };
   const defaultGuardType = permKey === 'ForceControlPermission' ? -1 : 0;
   const perm = appConfig.sysConfig?.[permKey] || { AllowManager: true, MinGuardType: defaultGuardType, MinMedalLevel: 0 };
   if (perm.MinGuardType === -1) {
@@ -906,8 +1110,39 @@ async function processDanmakuCommandQueue(): Promise<void> {
   }
 }
 
+function handleGiftEvent(doc: any): void {
+  if (appConfig.sysConfig?.ShowAllDanmaku) {
+    writeLog(`[RAW礼物数据] ${JSON.stringify(doc)}`, 'DarkGray');
+  }
+  const event = parseBilibiliGiftCreditEvent(doc);
+  if (!event) return;
+  if (!claimGiftEvent(event)) {
+    writeLog('[礼物点歌] 已忽略重复礼物事件', 'DarkGray');
+    return;
+  }
+
+  const { tier, requirement } = getGiftRequirementForGuardLevel(
+    event.guardLevel
+  );
+  if (!matchesGiftRequestRequirement(requirement, event)) return;
+
+  const previous = giftRequestCredits.get(event.uid) || 0;
+  const next = addGiftRequestCredits(previous, event.quantity);
+  giftRequestCredits.set(event.uid, next);
+  const displayGift = event.giftName || `ID ${event.giftId}`;
+  writeLog(
+    `[礼物点歌][${giftRequestTierLabel(tier)}] ${event.userName} 赠送 ${displayGift} ×${event.quantity}，新增 ${next - previous} 次点歌，当前剩余 ${next} 次`,
+    'Magenta'
+  );
+  setGlobalStatus(`🎁 ${event.userName} 获得 ${next - previous} 次点歌`);
+}
+
 function handleRawDanmaku(doc: any) {
   const cmd = doc.cmd || "";
+  if (cmd === 'SEND_GIFT') {
+    handleGiftEvent(doc);
+    return;
+  }
   if (cmd.startsWith("DANMU_MSG")) {
     if (appConfig.sysConfig?.ShowAllDanmaku) writeLog(`[RAW原始数据] ${JSON.stringify(doc)}`, 'DarkGray');
     const info = doc.info;
@@ -1347,10 +1582,67 @@ async function executePlayerCommand(
   command: string,
   song?: any
 ): Promise<PlayerOperationResult | null> {
-  return await playerManager.execute(
+  const playerKey = getSelectedPlayerKey();
+  const result = await playerManager.execute(
     command as Parameters<PlayerManager['execute']>[0],
     song
   );
+  const snapshot = result?.snapshot || activePlayerSnapshot;
+  const hintInput = {
+    playerKey,
+    connected: Boolean(snapshot?.connected ?? isPlayerConnected),
+    playerVersion: snapshot?.version || '',
+    command,
+    outcome: result?.outcome || 'error',
+    processId: snapshot?.processId ?? null,
+    failureCode: result?.failureCode,
+    message: result?.message
+  };
+  const hint = buildPlayerProcessAccessHint(hintInput)
+    || buildPlayerUpgradeHint(hintInput);
+  if (hint) {
+    const duplicate = Boolean(
+      playerControlNotice
+      && playerControlNotice.code === hint.code
+      && playerControlNotice.playerKey === hint.playerKey
+      && playerControlNotice.currentVersion === hint.currentVersion
+      && playerControlNotice.blockedCommand === hint.blockedCommand
+      && playerControlNotice.processId === hint.processId
+    );
+    playerControlNotice = {
+      ...hint,
+      detectedAt: new Date().toISOString()
+    };
+    if (!duplicate && hint.kind === 'upgrade') {
+      writeLog(
+        `[播放器兼容] ${hint.playerName} ${hint.currentVersion} 低于`
+        + `当前已验证版本 ${hint.testedPlayerVersion}，且 `
+        + `${hint.blockedCommand} 未生效。请升级播放器，完全退出并`
+        + '重新打开后再连接。',
+        'Yellow'
+      );
+    }
+    if (!duplicate && hint.kind === 'process-access') {
+      writeLog(
+        `[播放器权限] Windows 拒绝了 ${hint.playerName} 的`
+        + `${hint.operation}。请确认点歌机与播放器使用相同运行权限，`
+        + '并检查 360、Windows 安全中心或其他安全软件的拦截记录。'
+        + '确认是安全软件拦截后，请恢复防护并仅信任点歌机程序目录与'
+        + '%APPDATA%\\嗷呜点歌机\\player-connectors。',
+        'Yellow'
+      );
+    }
+    setGlobalStatus(hint.kind === 'upgrade'
+      ? `⚠️ ${hint.playerName}版本较旧，点歌控制未生效，请打开设置升级播放器`
+      : `⚠️ ${hint.playerName}控制被 Windows 拒绝，请打开设置检查权限`);
+  } else if (
+    playerControlNotice?.playerKey === playerKey
+    && isUpgradeSensitivePlayerCommand(command)
+    && isSuccessfulPlayerResult(result)
+  ) {
+    playerControlNotice = null;
+  }
+  return result;
 }
 
 async function pauseActivePlayerAfterRequests(): Promise<void> {
@@ -1960,9 +2252,7 @@ async function handleDanmaku(user: any, msg: string): Promise<void> {
     else if (isTopOrder) { keyword = msg.replace(/^(置顶点歌|优先点歌)/, '').trim(); mode = 'top'; }
     else { keyword = msg.substring(2).trim(); }
 
-    const isSuperUser = isBiliLoginReady()
-      && (appConfig.sysConfig?.SuperUsers?.includes(user.uname)
-        || appConfig.sysConfig?.SuperUsers?.includes(user.uid));
+    const isSuperUser = isConfiguredSuperUser(user);
     if (!isSuperUser) {
       const cds = appConfig.sysConfig?.Cooldowns || { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 };
       let cdSeconds = cds.Normal;
@@ -1981,8 +2271,41 @@ async function handleDanmaku(user: any, msg: string): Promise<void> {
     else { const perm = checkPermission(user, 'OrderPermission'); if (!perm.allowed) { await addReject(user, perm.reason!); return; } }
 
     if (keyword) {
-      userCooldowns.set(user.uid, Date.now());
-      await tryRequestSong(user, keyword, mode);
+      const uid = String(user.uid || '');
+      const { tier, requirement } = getGiftRequirementForGuardLevel(
+        user.guardLevel
+      );
+      const currentCredits = giftRequestCredits.get(uid) || 0;
+      if (!canRequestWithGiftCredits(
+        requirement,
+        currentCredits,
+        isSuperUser
+      )) {
+        await addReject(
+          user,
+          `${giftRequestTierLabel(tier)}点歌需要先赠送 ${describeGiftRequestRequirement(requirement)}；每赠送 1 个增加 1 次点歌`
+        );
+        return;
+      }
+
+      const result = await tryRequestSong(user, keyword, mode);
+      if (result.success) {
+        userCooldowns.set(uid, Date.now());
+        const remainingCredits = consumeGiftRequestCredit(
+          requirement,
+          currentCredits,
+          isSuperUser,
+          true
+        );
+        if (remainingCredits !== currentCredits) {
+          if (remainingCredits > 0) giftRequestCredits.set(uid, remainingCredits);
+          else giftRequestCredits.delete(uid);
+          writeLog(
+            `[礼物点歌] ${user.uname || uid} 使用 1 次点歌，当前剩余 ${remainingCredits} 次`,
+            'DarkGray'
+          );
+        }
+      }
     }
   }
 }
@@ -2603,7 +2926,11 @@ async function buildFeedbackContext(
       processId: activePlayerSnapshot?.processId ?? null,
       version: activePlayerSnapshot?.version || '',
       status: activePlayerSnapshot?.status || '',
-      capabilities: activePlayerSnapshot?.capabilities || null
+      capabilities: activePlayerSnapshot?.capabilities || null,
+      controlNotice: playerControlNotice,
+      compatibilityNotice: playerControlNotice?.kind === 'upgrade'
+        ? playerControlNotice
+        : null
     },
     connectors: connectorStatuses.map(status => ({
       id: status.id,
@@ -3129,6 +3456,10 @@ function startBackendServer() {
         }
         if (!['NCM', 'Kugou', 'QQMusic', 'Folia'].includes(appConfig.sysConfig?.PlayerType)) appConfig.sysConfig.PlayerType = 'NCM';
         if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
+        appConfig.sysConfig.GiftRequestRequirements =
+          normalizeGiftRequestRequirements(
+            appConfig.sysConfig.GiftRequestRequirements
+          );
         appConfig.sysConfig.ExternalApiPort = getExternalApiPort();
         delete appConfig.sysConfig.EnableCDP;
         delete appConfig.sysConfig.CdpPort;
@@ -3142,6 +3473,7 @@ function startBackendServer() {
           isPlayerConnected = false;
           playerConnecting = true;
           activePlayerSnapshot = null;
+          playerControlNotice = null;
           playerManager.resetObservedTrack();
           updatePlayerCurrentTrack('', '');
           writeLog(`>>> [系统] 已切换到 ${getSelectedPlayerLabel()}，旧播放器的待播队列已清空`, 'Cyan');
@@ -3180,6 +3512,7 @@ function startBackendServer() {
         playerConnected: isPlayerConnected,
         playerConnecting,
         playerSnapshot: activePlayerSnapshot,
+        playerControlNotice,
         connectorMaintenanceStatus,
         commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand },
         current: currentPlayingSong || playerCurrentTrack,
@@ -3344,6 +3677,35 @@ function startBackendServer() {
     }
 
     if (
+      url.pathname === '/api/feedback/status'
+      && req.method === 'GET'
+    ) {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      const publicId = String(url.searchParams.get('id') || '')
+        .trim()
+        .toUpperCase();
+      if (!/^[A-Z0-9][A-Z0-9-]{7,39}$/.test(publicId)) {
+        res.writeHead(400);
+        res.end(JSON.stringify({
+          success: false,
+          message: '问题编号格式无效'
+        }));
+        return;
+      }
+      try {
+        const feedback = await getFeedbackStatus(publicId);
+        res.end(JSON.stringify({ success: true, feedback }));
+      } catch (error: unknown) {
+        const message = error instanceof Error
+          ? error.message
+          : String(error);
+        res.writeHead(502);
+        res.end(JSON.stringify({ success: false, message }));
+      }
+      return;
+    }
+
+    if (
       url.pathname === '/api/feedback/submit'
       && req.method === 'POST'
     ) {
@@ -3488,17 +3850,24 @@ function startBackendServer() {
       return;
     }
 
+    if (url.pathname === '/api/update/status' && req.method === 'GET') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({
+        success: true,
+        status: appUpdateDownloadStatus
+      }));
+      return;
+    }
+
     if (url.pathname === '/api/update/apply' && req.method === 'POST') {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true }));
-      try {
-        const um = new UpdateManager('https://app.enkianss.us/update/awoo');
-        const updateInfo = await um.checkForUpdatesAsync();
-        if (updateInfo) {
-          setGlobalStatus(`🚀 下载更新中...`);
-          await um.downloadUpdateAsync(updateInfo, (progress: number) => { if (progress % 20 === 0) writeLog(`[更新] 下载进度: ${progress}%`, 'DarkGray'); });
-          um.waitExitThenApplyUpdate(updateInfo, false, true); app.quit();
-        }
-      } catch { setGlobalStatus(`❌ 更新失败`); }
+      const alreadyRunning = Boolean(appUpdateOperation);
+      startAppUpdateOperation();
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({
+        success: true,
+        alreadyRunning,
+        status: appUpdateDownloadStatus
+      }));
       return;
     }
 

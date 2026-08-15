@@ -46,6 +46,7 @@ export interface PlayerOperationResult {
   outcome: string;
   message: string;
   snapshot?: PlayerSnapshot | null;
+  failureCode?: string | null;
 }
 
 interface PendingRequest {

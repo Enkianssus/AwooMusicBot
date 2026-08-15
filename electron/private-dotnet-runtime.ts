@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import extract from 'extract-zip';
 import { downloadBufferWithRanges } from './connector-download.ts';
+import { extractZipSafely } from './safe-zip.ts';
 
 export type DotnetRuntimeRid = 'win-x86' | 'win-x64';
 
@@ -262,7 +262,7 @@ export class PrivateDotnetRuntimeManager {
     const versionDirectory = path.join(ridRoot, artifact.version);
     try {
       await fs.promises.writeFile(archivePath, archive, { flag: 'wx' });
-      await extract(archivePath, { dir: stagingDirectory });
+      await extractZipSafely(archivePath, stagingDirectory);
       await verifyRuntimeDirectory(stagingDirectory, artifact.version);
       const marker: RuntimeMarker = {
         schemaVersion: 1,

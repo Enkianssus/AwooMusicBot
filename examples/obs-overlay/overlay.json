@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "us.enkianss.awoo.default",
   "name": "嗷呜默认组件",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "entry": "index.html",
   "author": "Enkianssus",
   "description": "透明的当前播放与待播队列组件，暂停区域变红，正常状态保持安静。",
@@ -64,19 +64,38 @@
       "cssVariable": "--awoo-max-queue"
     },
     {
+      "key": "artworkSource",
+      "label": "Mod UI 当前歌曲图片",
+      "description": "只影响 OBS / 直播姬的 Mod UI；主播控制窗口需在下方单独设置。主播歌单或头像不可用时自动使用专辑封面。",
+      "group": "Mod UI 歌曲图片",
+      "type": "select",
+      "default": "album_cover",
+      "options": [
+        {
+          "label": "专辑封面（默认）",
+          "value": "album_cover"
+        },
+        {
+          "label": "点歌人头像",
+          "value": "requester_avatar"
+        }
+      ],
+      "cssVariable": "--awoo-artwork-source"
+    },
+    {
       "key": "coverRotation",
-      "label": "专辑封面旋转",
-      "description": "播放歌曲时让专辑封面像唱片一样缓慢旋转。",
-      "group": "专辑封面",
+      "label": "当前图片旋转",
+      "description": "开启后，当前显示的专辑封面或点歌人头像会缓慢旋转。",
+      "group": "图片动画",
       "type": "toggle",
       "default": false,
       "cssVariable": "--awoo-cover-rotation"
     },
     {
       "key": "coverRotationSpeed",
-      "label": "封面旋转一圈",
-      "description": "数值越大，专辑封面旋转得越慢。",
-      "group": "专辑封面",
+      "label": "图片旋转一圈",
+      "description": "数值越大，当前图片旋转得越慢。",
+      "group": "图片动画",
       "type": "range",
       "default": 18,
       "min": 4,

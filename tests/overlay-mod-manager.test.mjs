@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  BUILTIN_OVERLAY_SETTINGS,
   OFFICIAL_OVERLAY_DESCRIPTOR_PROXY,
   OverlayModManager,
   normalizeOverlaySettingValues,
@@ -161,6 +162,25 @@ test('validates flexible overlay controls and normalizes their defaults', () => 
     () => normalizeOverlaySettingValues(definitions, { unknown: true }, true),
     /不支持参数/
   );
+});
+
+test('defaults builtin Mod UI artwork to album cover with requester avatar opt-in', () => {
+  const definition = BUILTIN_OVERLAY_SETTINGS.find(
+    item => item.key === 'artworkSource'
+  );
+  assert.equal(definition?.type, 'select');
+  assert.equal(definition?.label, 'Mod UI 当前歌曲图片');
+  assert.equal(definition?.group, 'Mod UI 歌曲图片');
+  assert.equal(definition?.default, 'album_cover');
+  assert.deepEqual(definition?.options, [
+    { label: '专辑封面（默认）', value: 'album_cover' },
+    { label: '点歌人头像', value: 'requester_avatar' }
+  ]);
+  const rotation = BUILTIN_OVERLAY_SETTINGS.find(
+    item => item.key === 'coverRotation'
+  );
+  assert.equal(rotation?.label, '当前图片旋转');
+  assert.equal(rotation?.group, '图片动画');
 });
 
 test('rejects unsafe or contradictory overlay control definitions', () => {

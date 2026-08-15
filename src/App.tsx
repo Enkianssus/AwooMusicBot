@@ -1,4 +1,19 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import {
+    FEEDBACK_HISTORY_STORAGE_KEY,
+    countUnreadFeedbackReplies,
+    markFeedbackReplyRead,
+    mergeFeedbackStatus,
+    parseFeedbackHistory,
+    recordFeedbackSubmission,
+    serializeFeedbackHistory,
+    type LocalFeedbackHistoryItem,
+    type PublicFeedbackStatus
+} from './feedback-history-policy';
+import {
+    buildNeteaseConnectorSuccessMessage,
+    shouldWaitForConnectorPlayer
+} from './connector-update-feedback-policy';
 
 // ==========================================
 // 0. 环境检测
@@ -7,6 +22,22 @@ const isElectron = new URLSearchParams(window.location.search).get('mode') === '
 
 const electronAPI = window.electronAPI;
 const SKIN_MARKETPLACE_URL = 'https://awoo-skins.enkianss.us/';
+const FEEDBACK_STATUS_LABELS: Record<string, string> = {
+    open: '已收到',
+    triaging: '正在确认',
+    working: '处理中',
+    resolved: '已解决',
+    closed: '已关闭',
+    duplicate: '重复问题'
+};
+
+function formatFeedbackTime(value: string): string {
+    if (!value) return '时间未知';
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp)
+        ? new Date(timestamp).toLocaleString('zh-CN')
+        : '时间未知';
+}
 
 // ==========================================
 // 1. 类型定义
@@ -129,6 +160,22 @@ interface UpdateInfo {
     info: any;
 }
 
+type AppUpdateDownloadState =
+    | 'idle'
+    | 'checking'
+    | 'downloading'
+    | 'applying'
+    | 'no-update'
+    | 'error';
+
+interface AppUpdateDownloadStatus {
+    state: AppUpdateDownloadState;
+    progress: number | null;
+    version: string | null;
+    message: string;
+    updatedAt: string;
+}
+
 interface QrState {
     loading: boolean;
     base64: string;
@@ -136,6 +183,40 @@ interface QrState {
 }
 
 type NativeConnectorId = 'netease' | 'kugou' | 'qqmusic' | 'folia';
+
+type GiftRequestTier = 'Normal' | 'Captain' | 'Admiral' | 'Governor';
+
+const GIFT_REQUEST_TIER_OPTIONS: ReadonlyArray<{
+    key: GiftRequestTier;
+    label: string;
+    accent: string;
+    inputClass: string;
+}> = [
+    {
+        key: 'Normal',
+        label: '普通观众',
+        accent: 'text-gray-300',
+        inputClass: 'bg-black/30 border-white/10 text-white focus:border-blue-500'
+    },
+    {
+        key: 'Captain',
+        label: '舰长',
+        accent: 'text-blue-400',
+        inputClass: 'bg-blue-900/20 border-blue-500/30 text-blue-100 focus:border-blue-500'
+    },
+    {
+        key: 'Admiral',
+        label: '提督',
+        accent: 'text-purple-400',
+        inputClass: 'bg-purple-900/20 border-purple-500/30 text-purple-100 focus:border-purple-500'
+    },
+    {
+        key: 'Governor',
+        label: '总督',
+        accent: 'text-red-400',
+        inputClass: 'bg-red-900/20 border-red-500/30 text-red-100 focus:border-red-500'
+    }
+];
 
 interface ConnectorStatus {
     id: NativeConnectorId;
@@ -154,6 +235,34 @@ interface ConnectorStatus {
     checkedAt: string;
     error: string | null;
 }
+
+interface PlayerUpgradeNotice {
+    kind: 'upgrade';
+    code: 'netease-player-update-suggested' | 'kugou-player-update-suggested' | 'qqmusic-player-update-suggested';
+    reason: 'older-than-tested-after-control-failure' | 'player-version-unsupported';
+    playerKey: NativeConnectorId;
+    playerName: string;
+    currentVersion: string;
+    testedPlayerVersion: string;
+    blockedCommand: string;
+    processId: number | null;
+    detectedAt: string;
+}
+
+interface PlayerProcessAccessNotice {
+    kind: 'process-access';
+    code: 'qqmusic-control-access-denied';
+    reason: 'process-access-denied';
+    playerKey: NativeConnectorId;
+    playerName: string;
+    currentVersion: string;
+    blockedCommand: string;
+    processId: number | null;
+    operation: string;
+    detectedAt: string;
+}
+
+type PlayerControlNotice = PlayerUpgradeNotice | PlayerProcessAccessNotice;
 
 type OverlaySettingValue = string | number | boolean;
 
@@ -1167,6 +1276,8 @@ const AdminWidget: React.FC = () => {
 
     const [updateInfo, setUpdateInfo] = useState<UpdateInfo>({ checking: false, info: null });
     const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
+    const [updateDownloadStatus, setUpdateDownloadStatus] = useState<AppUpdateDownloadStatus | null>(null);
+    const updateStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const [qrState, setQrState] = useState<QrState>({ loading: false, base64: '', message: '' });
     const [roomIdInput, setRoomIdInput] = useState<string>('');
@@ -1204,6 +1315,19 @@ const AdminWidget: React.FC = () => {
     const [feedbackLoading, setFeedbackLoading] = useState(false);
     const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
     const [feedbackResult, setFeedbackResult] = useState<any>(null);
+    const [feedbackHistory, setFeedbackHistory] = useState<LocalFeedbackHistoryItem[]>(() => {
+        try {
+            return parseFeedbackHistory(
+                localStorage.getItem(FEEDBACK_HISTORY_STORAGE_KEY)
+            );
+        } catch {
+            return [];
+        }
+    });
+    const [feedbackHistoryRefreshing, setFeedbackHistoryRefreshing] = useState(false);
+    const feedbackHistoryRef = useRef(feedbackHistory);
+    const feedbackRefreshInFlightRef = useRef(false);
+    const activeTabRef = useRef<string>(activeTab);
     const [overlayMods, setOverlayMods] = useState<OverlayModState | null>(null);
     const [overlayUrl, setOverlayUrl] = useState(
         'https://app.enkianss.us/mods/v1/retro-cmd/manifest.json'
@@ -1245,6 +1369,75 @@ const AdminWidget: React.FC = () => {
         setAdminToast(msg);
         setTimeout(() => setAdminToast(''), 3000);
     }, []);
+
+    const persistFeedbackHistory = useCallback((items: LocalFeedbackHistoryItem[]) => {
+        feedbackHistoryRef.current = items;
+        setFeedbackHistory(items);
+        try {
+            localStorage.setItem(
+                FEEDBACK_HISTORY_STORAGE_KEY,
+                serializeFeedbackHistory(items)
+            );
+        } catch {
+            // 本地存储不可用时，当前窗口内仍保留历史记录。
+        }
+    }, []);
+
+    const refreshFeedbackHistory = useCallback(async (announce = false) => {
+        if (feedbackRefreshInFlightRef.current) return;
+        const ids = feedbackHistoryRef.current.map(item => item.id);
+        if (ids.length === 0) {
+            if (announce) showAdminToast('还没有本机提交过的反馈');
+            return;
+        }
+
+        feedbackRefreshInFlightRef.current = true;
+        setFeedbackHistoryRefreshing(true);
+        try {
+            const results = await Promise.all(ids.map(async id => {
+                try {
+                    const response = await fetch(
+                        `http://127.0.0.1:5555/api/feedback/status?id=${encodeURIComponent(id)}`,
+                        { cache: 'no-store' }
+                    );
+                    const result = await response.json();
+                    if (!response.ok || !result.success || !result.feedback) {
+                        throw new Error(result.message || '查询失败');
+                    }
+                    return result.feedback as PublicFeedbackStatus;
+                } catch {
+                    return null;
+                }
+            }));
+
+            let next = feedbackHistoryRef.current;
+            let successCount = 0;
+            const checkedAt = new Date().toISOString();
+            for (const result of results) {
+                if (!result) continue;
+                successCount += 1;
+                next = mergeFeedbackStatus(next, result.id, result, checkedAt);
+            }
+            if (successCount > 0) persistFeedbackHistory(next);
+            if (announce) {
+                showAdminToast(
+                    successCount === ids.length
+                        ? '✅ 反馈处理进度已刷新'
+                        : successCount > 0
+                            ? `⚠️ 已刷新 ${successCount}/${ids.length} 条反馈`
+                            : '❌ 暂时无法查询反馈进度'
+                );
+            }
+        } finally {
+            feedbackRefreshInFlightRef.current = false;
+            setFeedbackHistoryRefreshing(false);
+        }
+    }, [persistFeedbackHistory, showAdminToast]);
+
+    const markFeedbackHistoryItemRead = useCallback((id: string) => {
+        const next = markFeedbackReplyRead(feedbackHistoryRef.current, id);
+        persistFeedbackHistory(next);
+    }, [persistFeedbackHistory]);
 
     const finishOnboarding = useCallback(() => {
         try {
@@ -1323,6 +1516,9 @@ const AdminWidget: React.FC = () => {
         }
         if (overlaySettingsSaveTimerRef.current) {
             clearTimeout(overlaySettingsSaveTimerRef.current);
+        }
+        if (updateStatusTimerRef.current) {
+            clearTimeout(updateStatusTimerRef.current);
         }
     }, []);
 
@@ -1460,8 +1656,27 @@ const AdminWidget: React.FC = () => {
         }
     }, [showAdminToast]);
 
-    const activeTabRef = useRef<string>(activeTab);
     useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+
+    useEffect(() => {
+        void refreshFeedbackHistory(false);
+        const timer = setInterval(
+            () => void refreshFeedbackHistory(false),
+            120_000
+        );
+        const refreshWhenVisible = () => {
+            if (document.visibilityState === 'visible') {
+                void refreshFeedbackHistory(false);
+            }
+        };
+        window.addEventListener('focus', refreshWhenVisible);
+        document.addEventListener('visibilitychange', refreshWhenVisible);
+        return () => {
+            clearInterval(timer);
+            window.removeEventListener('focus', refreshWhenVisible);
+            document.removeEventListener('visibilitychange', refreshWhenVisible);
+        };
+    }, [refreshFeedbackHistory]);
 
     useEffect(() => {
         setSupportMenuOpen(['faq', 'feedback', 'logs', 'debug'].includes(activeTab));
@@ -1664,7 +1879,9 @@ const AdminWidget: React.FC = () => {
                     if (!prev) return json;
                     return {
                         ...json,
-                        config: activeTabRef.current === 'settings' ? prev.config : json.config,
+                        config: activeTabRef.current === 'settings' || activeTabRef.current === 'appearance'
+                            ? prev.config
+                            : json.config,
                         widgetStyle: activeTabRef.current === 'appearance'
                             ? prev.widgetStyle
                             : json.widgetStyle
@@ -1703,7 +1920,7 @@ const AdminWidget: React.FC = () => {
                 headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ sysConfig: config.config })
             }).then(res => {
-                if (res.ok) showAdminToast("✅ 基础设置已自动保存！");
+                if (res.ok) showAdminToast("✅ 设置已自动保存！");
             }).catch(() => {});
         }, 800);
 
@@ -1914,7 +2131,10 @@ const AdminWidget: React.FC = () => {
 
             let selectedConnected = result.reconnected === true;
             if (updatesSelectedPlayer) {
-                if (!selectedConnected) {
+                if (
+                    !selectedConnected
+                    && shouldWaitForConnectorPlayer(connectorId, result)
+                ) {
                     selectedConnected = await waitForPlayerConnection();
                 }
                 setConfig((previous: any) => previous ? ({
@@ -1927,7 +2147,9 @@ const AdminWidget: React.FC = () => {
             await loadConnectorStatuses(false);
             showAdminToast(
                 updatesSelectedPlayer && !selectedConnected
-                    ? '⚠️ 连接器已更新，后台正在等待播放器连接。'
+                    ? connectorId === 'netease'
+                        ? buildNeteaseConnectorSuccessMessage('update', result)
+                        : '⚠️ 连接器已更新，后台正在等待播放器连接。'
                     : `✅ ${result.message || '连接器更新完成'}`
             );
         } catch (error: unknown) {
@@ -1988,7 +2210,10 @@ const AdminWidget: React.FC = () => {
             }
             let selectedConnected = result.reconnected === true;
             if (reinstallsSelectedPlayer) {
-                if (!selectedConnected) {
+                if (
+                    !selectedConnected
+                    && shouldWaitForConnectorPlayer(connectorId, result)
+                ) {
                     selectedConnected = await waitForPlayerConnection();
                 }
                 setConfig((previous: any) => previous ? ({
@@ -2000,13 +2225,30 @@ const AdminWidget: React.FC = () => {
             }
             await loadConnectorStatuses(false);
             if (!reinstallsSelectedPlayer) {
-                showAdminToast('✅ 连接器重新安装完成，正在切换并连接播放器...');
-                await handleSetPlayerType(playerTypeByConnector[connectorId]);
+                showAdminToast('✅ 连接器重新安装完成，正在切换播放器...');
+                await handleSetPlayerType(
+                    playerTypeByConnector[connectorId],
+                    connectorId === 'netease'
+                        && !shouldWaitForConnectorPlayer(connectorId, result)
+                        ? {
+                            waitForConnection: false,
+                            disconnectedMessage: buildNeteaseConnectorSuccessMessage(
+                                'reinstall',
+                                result
+                            )
+                        }
+                        : undefined
+                );
             } else {
                 showAdminToast(
                     selectedConnected
                         ? `✅ ${result.status?.name || '播放器'}连接器已重新安装并自动连接！`
-                        : '⚠️ 连接器已重新安装，后台正在等待播放器连接。'
+                        : connectorId === 'netease'
+                            ? buildNeteaseConnectorSuccessMessage(
+                                'reinstall',
+                                result
+                            )
+                            : '⚠️ 连接器已重新安装，后台正在等待播放器连接。'
                 );
             }
         } catch (error: unknown) {
@@ -2045,26 +2287,104 @@ const AdminWidget: React.FC = () => {
 
     const handleApplyUpdate = async () => {
         if(!confirm("确定要开始更新吗？程序将会自动下载并重启。")) return;
+        if (updateStatusTimerRef.current) {
+            clearTimeout(updateStatusTimerRef.current);
+            updateStatusTimerRef.current = null;
+        }
         setDownloadProgress(0);
+        setUpdateDownloadStatus({
+            state: 'checking',
+            progress: 0,
+            version: updateInfo.info?.version || null,
+            message: '正在确认更新版本',
+            updatedAt: new Date().toISOString()
+        });
 
         try {
-            await fetch('http://127.0.0.1:5555/api/update/apply', { method: 'POST' });
+            const response = await fetch(
+                'http://127.0.0.1:5555/api/update/apply',
+                { method: 'POST' }
+            );
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.message || '更新任务启动失败');
+            }
             showAdminToast("正在后台下载更新，请稍候，程序将自动重启...");
 
-            // 模拟进度条，真实后台正在走 Updater 更新流
-            const timer = setInterval(() => {
-                setDownloadProgress(prev => {
-                    if (prev === null) {
-                        clearInterval(timer);
-                        return null;
+            let consecutiveFailures = 0;
+            const pollUpdateStatus = async (): Promise<void> => {
+                try {
+                    const statusResponse = await fetch(
+                        'http://127.0.0.1:5555/api/update/status',
+                        { cache: 'no-store' }
+                    );
+                    const statusResult = await statusResponse.json();
+                    if (!statusResponse.ok || !statusResult.success) {
+                        throw new Error(
+                            statusResult.message || '无法读取更新进度'
+                        );
                     }
-                    const next = prev + (Math.random() * 8 + 2);
-                    return next > 95 ? 95 : next; // 卡在 95% 直到后端完成并自动重启
-                });
-            }, 1000);
-        } catch {
+                    consecutiveFailures = 0;
+                    const status = statusResult.status as AppUpdateDownloadStatus;
+                    setUpdateDownloadStatus(status);
+
+                    if (status.state === 'error') {
+                        setDownloadProgress(null);
+                        setUpdateInfo({
+                            checking: false,
+                            info: { error: status.message || '更新失败' }
+                        });
+                        showAdminToast(`❌ ${status.message || '更新失败'}`);
+                        return;
+                    }
+                    if (status.state === 'no-update') {
+                        setDownloadProgress(null);
+                        setUpdateInfo({
+                            checking: false,
+                            info: { hasUpdate: false }
+                        });
+                        showAdminToast('✅ 当前已经是最新版本');
+                        return;
+                    }
+
+                    const numericProgress = Number(status.progress);
+                    setDownloadProgress(
+                        Number.isFinite(numericProgress)
+                            ? Math.max(0, Math.min(100, numericProgress))
+                            : 0
+                    );
+                    updateStatusTimerRef.current = setTimeout(
+                        () => void pollUpdateStatus(),
+                        450
+                    );
+                } catch (error: unknown) {
+                    consecutiveFailures += 1;
+                    if (consecutiveFailures < 5) {
+                        updateStatusTimerRef.current = setTimeout(
+                            () => void pollUpdateStatus(),
+                            700
+                        );
+                        return;
+                    }
+                    const message = error instanceof Error
+                        ? error.message
+                        : '读取更新进度失败';
+                    setDownloadProgress(null);
+                    setUpdateInfo({
+                        checking: false,
+                        info: { error: message }
+                    });
+                    showAdminToast(`❌ ${message}`);
+                }
+            };
+            void pollUpdateStatus();
+        } catch (error: unknown) {
             setDownloadProgress(null);
-            showAdminToast("❌ 更新请求失败，请检查网络连接");
+            const message = error instanceof Error
+                ? error.message
+                : '更新请求失败，请检查网络连接';
+            setUpdateInfo({ checking: false, info: { error: message } });
+            showAdminToast(`❌ ${message}`);
         }
     };
 
@@ -2098,10 +2418,12 @@ const AdminWidget: React.FC = () => {
     useEffect(() => {
         if (activeTab !== 'feedback') return;
         void loadFeedbackDiagnostics(feedbackIncludeLogs);
+        void refreshFeedbackHistory(false);
     }, [
         activeTab,
         feedbackIncludeLogs,
-        loadFeedbackDiagnostics
+        loadFeedbackDiagnostics,
+        refreshFeedbackHistory
     ]);
 
     const handleFeedbackSubmit = async () => {
@@ -2115,6 +2437,11 @@ const AdminWidget: React.FC = () => {
             return;
         }
 
+        const submissionSummary = {
+            title: feedbackForm.title,
+            category: feedbackForm.category,
+            priority: feedbackForm.priority
+        };
         setFeedbackSubmitting(true);
         setFeedbackResult(null);
         try {
@@ -2136,6 +2463,12 @@ const AdminWidget: React.FC = () => {
                 throw new Error(result.message || '提交失败');
             }
             setFeedbackResult(result);
+            persistFeedbackHistory(recordFeedbackSubmission(
+                feedbackHistoryRef.current,
+                submissionSummary,
+                result,
+                new Date().toISOString()
+            ));
             setFeedbackForm(previous => ({
                 ...previous,
                 title: '',
@@ -2234,6 +2567,29 @@ const AdminWidget: React.FC = () => {
         }));
     };
 
+    const updateGiftRequestRequirement = (
+        tier: GiftRequestTier,
+        field: 'giftName' | 'giftId',
+        value: string
+    ) => {
+        setConfig((prev: any) => ({
+            ...prev,
+            config: {
+                ...prev.config,
+                GiftRequestRequirements: {
+                    ...(prev.config.GiftRequestRequirements || {}),
+                    [tier]: {
+                        ...(prev.config.GiftRequestRequirements?.[tier] || {
+                            giftName: '',
+                            giftId: ''
+                        }),
+                        [field]: value
+                    }
+                }
+            }
+        }));
+    };
+
     const addSuperUser = () => {
         if(!superUserInput.trim()) return;
         const currentSu = config.config.SuperUsers || [];
@@ -2247,7 +2603,13 @@ const AdminWidget: React.FC = () => {
         setConfig((prev: any) => ({...prev, config: {...prev.config, SuperUsers: currentSu.filter(n => n !== name)}}));
     };
 
-    const handleSetPlayerType = async (type: string) => {
+    const handleSetPlayerType = async (
+        type: string,
+        options?: {
+            waitForConnection?: boolean;
+            disconnectedMessage?: string;
+        }
+    ) => {
         if (!config?.config || config.config.PlayerType === type) return;
         const nextSysConfig = { ...config.config, PlayerType: type };
         lastConfigString.current = JSON.stringify(nextSysConfig);
@@ -2269,7 +2631,9 @@ const AdminWidget: React.FC = () => {
             });
             const json = await res.json();
             const connected = json.playerConnected === true
-                || await waitForPlayerConnection();
+                || (options?.waitForConnection === false
+                    ? false
+                    : await waitForPlayerConnection());
             setConfig((prev: any) => prev ? ({
                 ...prev,
                 playerConnected: connected,
@@ -2279,7 +2643,10 @@ const AdminWidget: React.FC = () => {
                     : json.playerConnecting === true
             }) : prev);
             if (connected) showAdminToast("✅ 已切换并自动连接播放器！");
-            else showAdminToast("⚠️ 已切换播放器，后台正在等待连接。");
+            else showAdminToast(
+                options?.disconnectedMessage
+                    || "⚠️ 已切换播放器，后台正在等待连接。"
+            );
         } catch {
             setConfig((prev: any) => prev ? ({
                 ...prev,
@@ -2369,6 +2736,13 @@ const AdminWidget: React.FC = () => {
         }
     ] as const;
     const currentOnboardingStep = onboardingSteps[onboardingStep] || onboardingSteps[0];
+    const feedbackUnreadCount = countUnreadFeedbackReplies(feedbackHistory);
+    const playerControlNotice = (config?.playerControlNotice || null) as PlayerControlNotice | null;
+    const playerUpgradeTargetVersion = playerControlNotice?.kind === 'upgrade'
+        ? connectorStatuses[playerControlNotice.playerKey]?.supportedPlayerVersion
+            || playerControlNotice.testedPlayerVersion
+        : '';
+    const playerAccessBlocked = playerControlNotice?.kind === 'process-access';
 
     return (
         <div className="admin-widget-root animate-fade-in text-gray-200 flex flex-col font-sans select-none w-full h-screen overflow-hidden" style={{ backgroundColor: '#0d1117' }}>
@@ -2482,7 +2856,10 @@ const AdminWidget: React.FC = () => {
                         <summary className={`flex cursor-pointer list-none items-center gap-2 rounded-lg px-2.5 py-2 text-xs transition-colors [&::-webkit-details-marker]:hidden ${['faq', 'feedback', 'logs', 'debug'].includes(activeTab) ? 'text-cyan-200' : 'text-gray-500 hover:bg-white/5 hover:text-gray-300'}`}>
                             <span>🛠️</span>
                             <span className="font-bold">帮助与调试</span>
-                            <span className="ml-auto text-[10px] transition-transform group-open:rotate-90">›</span>
+                            {feedbackUnreadCount > 0 && (
+                                <span className="ml-auto h-2 w-2 shrink-0 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]" title={`${feedbackUnreadCount} 条反馈有新回复`}></span>
+                            )}
+                            <span className={`${feedbackUnreadCount > 0 ? '' : 'ml-auto'} text-[10px] transition-transform group-open:rotate-90`}>›</span>
                         </summary>
                         <div className="space-y-0.5 px-1.5 pb-1.5">
                             {[
@@ -2493,6 +2870,9 @@ const AdminWidget: React.FC = () => {
                             ].map(t => (
                                 <button key={t.id} onClick={() => setActiveTab(t.id)} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors ${activeTab === t.id ? 'bg-blue-600/90 font-bold text-white' : 'text-gray-500 hover:bg-white/5 hover:text-gray-300'}`}>
                                     <span>{t.icon}</span> <span className="truncate">{t.label}</span>
+                                    {t.id === 'feedback' && feedbackUnreadCount > 0 && (
+                                        <span className="ml-auto h-2 w-2 shrink-0 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]" title={`${feedbackUnreadCount} 条新回复`}></span>
+                                    )}
                                 </button>
                             ))}
                         </div>
@@ -2542,27 +2922,74 @@ const AdminWidget: React.FC = () => {
                                 </div>
                             )}
 
+                            {playerControlNotice && (
+                                <div className={`mb-6 animate-fadeIn rounded-xl border p-4 shadow-lg ${playerAccessBlocked ? 'border-red-400/35 bg-red-500/10 text-red-100' : 'border-orange-400/35 bg-orange-500/10 text-orange-100'}`}>
+                                    <div className="flex items-start gap-3">
+                                        <span className="mt-0.5 shrink-0 text-xl">{playerAccessBlocked ? '🛡️' : '⚠️'}</span>
+                                        <div className="min-w-0 flex-1">
+                                            <div className={`text-sm font-bold ${playerAccessBlocked ? 'text-red-300' : 'text-orange-300'}`}>
+                                                {playerAccessBlocked
+                                                    ? `${playerControlNotice.playerName}已连接，但 Windows 阻止了播放控制`
+                                                    : `${playerControlNotice.playerName}已连接，但当前版本无法完成点歌播放`}
+                                            </div>
+                                            <p className="mt-1 text-xs leading-relaxed text-gray-300">
+                                                {playerControlNotice.kind === 'process-access'
+                                                    ? 'Windows 或 360 等安全软件拒绝了点歌机对播放器进程的控制。请先完全退出点歌机和播放器，确认两者使用相同权限重新打开，并查看安全软件的行为防护或隔离记录。'
+                                                    : playerControlNotice.reason === 'older-than-tested-after-control-failure'
+                                                        ? `播放器 v${playerControlNotice.currentVersion} 的点歌控制刚刚失败；该版本低于当前连接器已验证的 v${playerUpgradeTargetVersion}。建议升级播放器，而不是反复重新安装连接器。`
+                                                        : `连接器已确认当前播放器版本不受支持。建议改用已验证的 v${playerUpgradeTargetVersion}，而不是反复重新安装连接器。`}
+                                            </p>
+                                            <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                                                {playerControlNotice.kind === 'process-access'
+                                                    ? '如需确认，可临时暂停 360 行为防护并只测试一次；如果恢复正常，请立即重新开启防护，再按下方说明加入信任区。不建议长期关闭杀毒软件。'
+                                                    : `升级后请完全退出并重新打开${playerControlNotice.playerName}，再到播放器设置点击“重新连接”。`}
+                                            </p>
+                                            {playerControlNotice.kind === 'process-access' && (
+                                                <div className="mt-3 rounded-lg border border-red-400/20 bg-black/20 p-3 text-[11px] leading-relaxed text-gray-300">
+                                                    <div className="font-bold text-red-200">确认是 360 拦截后，将这两个位置加入信任区：</div>
+                                                    <div className="mt-1.5 space-y-1 font-mono text-gray-400 select-text">
+                                                        <div>1. 包含“嗷呜点歌机.exe”的程序文件夹</div>
+                                                        <div>2. %APPDATA%\嗷呜点歌机\player-connectors</div>
+                                                    </div>
+                                                    <div className="mt-1.5 text-gray-500">不要把整个“下载”、AppData 或用户目录加入白名单。添加后重新开启 360，并完全重启点歌机和播放器。</div>
+                                                </div>
+                                            )}
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setActiveTab('settings');
+                                                setPendingOnboardingTarget('player');
+                                            }}
+                                            className={`shrink-0 rounded-lg border px-3 py-2 text-xs font-bold transition ${playerAccessBlocked ? 'border-red-400/30 bg-red-500/15 text-red-200 hover:bg-red-500/25' : 'border-orange-400/30 bg-orange-500/15 text-orange-200 hover:bg-orange-500/25'}`}
+                                        >
+                                            打开播放器设置
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
                             {activeTab === 'status' && (
                                 <div className="space-y-5 animate-slide-in-right flex flex-col h-full pb-6">
                                     <div>
                                         <h2 className="text-2xl font-bold text-white mb-2">运行状态</h2>
                                         <p className="text-sm text-gray-500 mb-5">查看直播间、播放器、当前歌曲和点歌开关；界面与 OBS 捕捉请前往「外观设置」。</p>
 
-                                        <div className={`p-4 rounded-xl border mb-5 flex items-center gap-4 ${currentStatusSong && !config.currentIsRequested ? 'bg-sky-500/10 border-sky-400/25' : 'bg-white/5 border-white/10'}`}>
+                                        <div className={`p-4 rounded-xl border mb-5 flex items-center gap-4 ${playerAccessBlocked ? 'bg-red-500/10 border-red-400/30' : playerControlNotice ? 'bg-orange-500/10 border-orange-400/30' : currentStatusSong && !config.currentIsRequested ? 'bg-sky-500/10 border-sky-400/25' : 'bg-white/5 border-white/10'}`}>
                                             <div className={`w-12 h-12 shrink-0 rounded-xl overflow-hidden grid place-items-center ${currentStatusSong && !config.currentIsRequested ? 'bg-sky-400/15 text-sky-200' : 'bg-white/5 text-gray-400'}`}>
                                                 {currentStatusSong?.CoverUrl ? (
                                                     <img src={currentStatusSong.CoverUrl} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
                                                 ) : '♫'}
                                             </div>
                                             <div className="min-w-0 flex-1">
-                                                <div className={`text-[11px] font-bold mb-1 ${currentStatusSong && !config.currentIsRequested ? 'text-sky-300' : 'text-green-400'}`}>
+                                                <div className={`text-[11px] font-bold mb-1 ${playerAccessBlocked ? 'text-red-300' : playerControlNotice ? 'text-orange-300' : currentStatusSong && !config.currentIsRequested ? 'text-sky-300' : 'text-green-400'}`}>
                                                     {currentStatusSong ? (config.currentIsRequested ? '点歌播放中' : '播放器当前歌曲 · 主播歌单') : '播放器当前歌曲'}
                                                 </div>
                                                 <div className="font-bold text-white truncate">{currentStatusSong?.SongName || '暂未读取到歌曲'}</div>
                                                 <div className="text-xs text-gray-400 truncate mt-0.5">{currentStatusSong?.ArtistName || '连接播放器后会在这里实时显示'}</div>
                                             </div>
-                                            <span className={`text-xs px-2.5 py-1 rounded-full border ${config.playerConnected ? 'text-green-300 border-green-500/25 bg-green-500/10' : 'text-red-300 border-red-500/25 bg-red-500/10'}`}>
-                                                {config.playerConnected ? '播放器已连接' : '播放器未连接'}
+                                            <span className={`text-xs px-2.5 py-1 rounded-full border ${playerAccessBlocked ? 'text-red-300 border-red-400/30 bg-red-500/10' : playerControlNotice ? 'text-orange-300 border-orange-400/30 bg-orange-500/10' : config.playerConnected ? 'text-green-300 border-green-500/25 bg-green-500/10' : 'text-red-300 border-red-500/25 bg-red-500/10'}`}>
+                                                {playerAccessBlocked ? '已连接 · 权限被阻止' : playerControlNotice ? '已连接 · 版本不兼容' : config.playerConnected ? '播放器已连接' : '播放器未连接'}
                                             </span>
                                         </div>
 
@@ -2817,7 +3244,7 @@ const AdminWidget: React.FC = () => {
                                                 <h3 className="text-lg font-bold text-white">主播控制 UI</h3>
                                                 <span className="rounded-full border border-blue-400/20 bg-blue-500/10 px-2 py-1 text-[10px] text-blue-300">主播自己使用</span>
                                             </div>
-                                            <p className="mt-2 text-xs leading-relaxed text-gray-400">设置点歌机悬浮窗的标题栏、文字与背景。修改后会自动保存并同步到主播操作窗口。</p>
+                                            <p className="mt-2 text-xs leading-relaxed text-gray-400">设置点歌机悬浮窗的点歌图片、标题栏、文字与背景。这里只影响主播操作窗口，不会改变 OBS 的 Mod UI。</p>
                                         </div>
 
                                         <div className="p-5 space-y-5">
@@ -2862,10 +3289,36 @@ const AdminWidget: React.FC = () => {
                                                         <input aria-label="背景不透明度" type="range" min="0" max="1" step="0.05" value={currentControlTheme.bgOpacity} onChange={event => updateControlTheme({ ...currentControlTheme, bgOpacity: Number(event.target.value) })} className="w-full accent-blue-500" />
                                                     </label>
                                                 </div>
+
+                                                <div className="space-y-3 rounded-xl border border-blue-400/15 bg-blue-500/[0.04] p-4 lg:col-span-2">
+                                                    <div className="text-xs font-bold text-blue-200">主播控制 UI · 歌曲图片</div>
+                                                    <div className="grid items-center gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(220px,0.52fr)]">
+                                                        <div>
+                                                            <div className="text-sm text-gray-200">点歌歌曲显示图片</div>
+                                                            <div className="mt-1 text-[10px] leading-relaxed text-gray-500">仅影响主播悬浮窗；主播歌单始终显示歌曲封面，OBS Mod UI 请在上方单独设置。</div>
+                                                        </div>
+                                                        <select
+                                                            aria-label="主播控制 UI 点歌歌曲图片"
+                                                            value={config.config.RequestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar'}
+                                                            onChange={event => setConfig({ ...config, config: { ...config.config, RequestedSongArtwork: event.target.value } })}
+                                                            className="w-full cursor-pointer rounded-lg border border-blue-400/20 bg-black/30 p-2.5 text-sm text-white outline-none focus:border-blue-400"
+                                                        >
+                                                            <option value="bili_avatar">点歌人的 B 站头像（默认）</option>
+                                                            <option value="song_cover">歌曲专辑封面</option>
+                                                        </select>
+                                                    </div>
+                                                </div>
                                             </div>
 
                                             <div className="flex justify-end">
-                                                <button onClick={() => { updateControlTheme(defaultTheme); showAdminToast('✅ 已恢复主播控制 UI 默认外观'); }} className="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-xs font-bold text-gray-300 hover:bg-white/10">恢复默认外观</button>
+                                                <button onClick={() => {
+                                                    updateControlTheme(defaultTheme);
+                                                    setConfig((previous: any) => previous ? ({
+                                                        ...previous,
+                                                        config: { ...previous.config, RequestedSongArtwork: 'bili_avatar' }
+                                                    }) : previous);
+                                                    showAdminToast('✅ 已恢复主播控制 UI 默认外观');
+                                                }} className="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-xs font-bold text-gray-300 hover:bg-white/10">恢复默认外观</button>
                                             </div>
 
                                             <details className="group rounded-xl border border-white/10 bg-white/[0.025]">
@@ -3137,6 +3590,21 @@ const AdminWidget: React.FC = () => {
                                             </div>
                                         )}
 
+                                        {playerControlNotice && (
+                                            <div className={`rounded-lg border px-4 py-3 text-xs ${playerAccessBlocked ? 'border-red-400/35 bg-red-500/10 text-red-100' : 'border-orange-400/35 bg-orange-500/10 text-orange-100'}`}>
+                                                <div className={`font-bold ${playerAccessBlocked ? 'text-red-300' : 'text-orange-300'}`}>
+                                                    {playerAccessBlocked
+                                                        ? `${playerControlNotice.playerName}控制权限被 Windows 拒绝`
+                                                        : `请升级${playerControlNotice.playerName}客户端`}
+                                                </div>
+                                                <div className="mt-1 leading-relaxed text-gray-300">
+                                                    {playerControlNotice.kind === 'process-access'
+                                                        ? '请先确认点歌机与播放器使用相同权限。若 360 的行为防护记录与失败时间吻合，可以临时暂停防护测试一次；确认恢复后立即重新开启，并将“嗷呜点歌机.exe 所在文件夹”和“%APPDATA%\\嗷呜点歌机\\player-connectors”加入信任区，然后完全重启点歌机与播放器。不建议长期关闭杀毒软件，也不要把整个下载目录或 AppData 加入白名单。'
+                                                        : `当前 v${playerControlNotice.currentVersion} 已连接，但播放控制未生效；建议升级到已验证版本 v${playerUpgradeTargetVersion}，或连接器明确支持的更新版本。升级后完全退出并重新打开播放器，再点击下方“重新连接”。无需重复安装连接器。`}
+                                                </div>
+                                            </div>
+                                        )}
+
                                         <div className="hidden md:grid grid-cols-12 gap-4 text-[11px] text-gray-500 font-bold uppercase tracking-wider pb-2 border-b border-white/5 mt-3">
                                             <div className="col-span-2">目标播放器</div>
                                             <div className="col-span-2">当前状态</div>
@@ -3156,6 +3624,11 @@ const AdminWidget: React.FC = () => {
                                                     player.connectorId === connectorUpdating;
                                                 const automaticallyUpdating =
                                                     connectorStatus?.updating === true;
+                                                const controlBlocked = Boolean(
+                                                    selected
+                                                    && playerControlNotice?.playerKey === player.connectorId
+                                                );
+                                                const rowAccessBlocked = controlBlocked && playerAccessBlocked;
                                                 return (
                                                     <div key={player.type} className={`grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border ${selected ? 'border-purple-500/50 shadow-inner' : 'border-white/10'} rounded-lg p-3 transition-colors hover:bg-white/5`}>
                                                         <div className="md:col-span-2 flex items-center gap-3">
@@ -3167,8 +3640,8 @@ const AdminWidget: React.FC = () => {
                                                         <div className="md:col-span-2">
                                                             {selected ? (
                                                                 <div className="space-y-1.5">
-                                                                    <span className={`inline-flex text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${connecting ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/30' : connected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
-                                                                        {connecting ? '⏳ 连接中' : connected ? '✅ 已连接' : '❌ 未连接'}
+                                                                    <span className={`inline-flex text-[10px] px-2.5 py-1 rounded-full font-bold shadow-md ${rowAccessBlocked ? 'bg-red-500/20 text-red-300 border border-red-400/30' : controlBlocked ? 'bg-orange-500/20 text-orange-300 border border-orange-400/30' : connecting ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/30' : connected ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>
+                                                                        {rowAccessBlocked ? '🛡️ 已连接但权限受阻' : controlBlocked ? '⚠️ 已连接但版本不兼容' : connecting ? '⏳ 连接中' : connected ? '✅ 已连接' : '❌ 未连接'}
                                                                     </span>
                                                                     <div className="text-[10px] text-gray-400">
                                                                         播放器版本：
@@ -3360,6 +3833,62 @@ const AdminWidget: React.FC = () => {
                                         </div>
                                     </div>
 
+                                    <div className="bg-white/5 p-6 rounded-xl border border-pink-500/20 space-y-5 mb-6">
+                                        <div className="border-b border-white/10 pb-3">
+                                            <h3 className="text-sm font-bold text-pink-400 uppercase tracking-widest">🎁 礼物点歌次数</h3>
+                                            <p className="text-xs text-gray-500 mt-2 leading-relaxed">
+                                                可为每档观众指定礼物。每送出 1 个匹配礼物增加 1 次点歌，连续赠送 10 个就增加 10 次；只有歌曲成功加入队列或进入播放后才扣除 1 次。名称和 ID 任一匹配即可，两项都留空表示该档无需礼物。
+                                            </p>
+                                            <p className="text-xs text-pink-300/70 mt-1.5">
+                                                点歌次数仅在本次点歌机运行期间保留；超级用户不受此限制。
+                                            </p>
+                                        </div>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            {GIFT_REQUEST_TIER_OPTIONS.map(tier => {
+                                                const requirement = config.config.GiftRequestRequirements?.[tier.key] || {
+                                                    giftName: '',
+                                                    giftId: ''
+                                                };
+                                                return (
+                                                    <div key={tier.key} className="bg-black/25 border border-white/5 rounded-xl p-4 space-y-3">
+                                                        <div className={`text-sm font-bold ${tier.accent}`}>{tier.label}</div>
+                                                        <div>
+                                                            <label className="block text-[11px] text-gray-500 mb-1.5">礼物名称</label>
+                                                            <input
+                                                                type="text"
+                                                                maxLength={80}
+                                                                value={requirement.giftName || ''}
+                                                                onChange={event => updateGiftRequestRequirement(
+                                                                    tier.key,
+                                                                    'giftName',
+                                                                    event.target.value
+                                                                )}
+                                                                placeholder="留空表示不按名称限制"
+                                                                className={`w-full border rounded-lg p-2.5 text-sm outline-none ${tier.inputClass}`}
+                                                            />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-[11px] text-gray-500 mb-1.5">礼物 ID（可选）</label>
+                                                            <input
+                                                                type="text"
+                                                                inputMode="numeric"
+                                                                maxLength={80}
+                                                                value={requirement.giftId || ''}
+                                                                onChange={event => updateGiftRequestRequirement(
+                                                                    tier.key,
+                                                                    'giftId',
+                                                                    event.target.value
+                                                                )}
+                                                                placeholder="可填更稳定的数字 ID"
+                                                                className={`w-full border rounded-lg p-2.5 text-sm outline-none ${tier.inputClass}`}
+                                                            />
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
                                         <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3">⚙️ 常规参数</h3>
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -3395,19 +3924,6 @@ const AdminWidget: React.FC = () => {
                                                         当前播放器连接器无法保证明确暂停，将继续播放主播歌单。
                                                     </span>
                                                 )}
-                                            </div>
-
-                                            <div>
-                                                <label className="block text-xs text-gray-400 mb-2">点歌图片显示</label>
-                                                <select
-                                                    value={config.config.RequestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar'}
-                                                    onChange={e => setConfig({...config, config: {...config.config, RequestedSongArtwork: e.target.value}})}
-                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none cursor-pointer"
-                                                >
-                                                    <option value="bili_avatar">B站点歌人头像（默认）</option>
-                                                    <option value="song_cover">播放器歌曲封面</option>
-                                                </select>
-                                                <span className="text-xs text-gray-500 block mt-1.5">主播歌单始终显示歌曲封面</span>
                                             </div>
 
                                             <div className="flex flex-col justify-center pt-3">
@@ -3574,6 +4090,96 @@ const AdminWidget: React.FC = () => {
                                         </p>
                                     </div>
 
+                                    <div className="rounded-xl border border-violet-400/20 bg-violet-500/[0.06] p-5 space-y-4">
+                                        <div className="flex flex-wrap items-start justify-between gap-3">
+                                            <div>
+                                                <div className="flex items-center gap-2 font-bold text-violet-200">
+                                                    <span>📮</span>
+                                                    <span>我提交过的反馈</span>
+                                                    {feedbackUnreadCount > 0 && (
+                                                        <span className="rounded-full bg-red-500/20 px-2 py-0.5 text-[10px] text-red-300 ring-1 ring-red-400/30">
+                                                            {feedbackUnreadCount} 条新回复
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                <div className="mt-1 text-xs leading-relaxed text-gray-500">
+                                                    编号、标题和公开回复暂存在本机，不保存问题描述、联系方式或诊断信息。
+                                                </div>
+                                            </div>
+                                            <div className="flex gap-2">
+                                                <button
+                                                    type="button"
+                                                    disabled={feedbackHistoryRefreshing || feedbackHistory.length === 0}
+                                                    onClick={() => void refreshFeedbackHistory(true)}
+                                                    className="rounded-lg border border-violet-400/25 bg-violet-500/10 px-3 py-2 text-xs font-bold text-violet-200 transition hover:bg-violet-500/20 disabled:opacity-40"
+                                                >
+                                                    {feedbackHistoryRefreshing ? '刷新中…' : '刷新回复'}
+                                                </button>
+                                                {feedbackHistory.length > 0 && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => {
+                                                            if (window.confirm('只清除这台电脑保存的反馈历史吗？服务器上的反馈不会删除。')) {
+                                                                persistFeedbackHistory([]);
+                                                            }
+                                                        }}
+                                                        className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-gray-400 transition hover:bg-white/10 hover:text-white"
+                                                    >
+                                                        清除本地记录
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        {feedbackHistory.length === 0 ? (
+                                            <div className="rounded-lg border border-dashed border-white/10 bg-black/15 px-4 py-5 text-center text-xs text-gray-500">
+                                                在点歌机里成功提交反馈后，会自动保存问题编号并在这里检查回复。
+                                            </div>
+                                        ) : (
+                                            <div className="max-h-96 space-y-2 overflow-y-auto pr-1 custom-scrollbar">
+                                                {feedbackHistory.map(item => (
+                                                    <details
+                                                        key={item.id}
+                                                        onToggle={event => {
+                                                            if (event.currentTarget.open && item.unreadReply) {
+                                                                markFeedbackHistoryItemRead(item.id);
+                                                            }
+                                                        }}
+                                                        className={`group rounded-lg border bg-black/20 ${item.unreadReply ? 'border-red-400/35' : 'border-white/10'}`}
+                                                    >
+                                                        <summary className="flex cursor-pointer list-none items-center gap-3 px-4 py-3 [&::-webkit-details-marker]:hidden">
+                                                            <span className={`h-2 w-2 shrink-0 rounded-full ${item.unreadReply ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]' : item.reply ? 'bg-green-400' : 'bg-gray-600'}`}></span>
+                                                            <span className="min-w-0 flex-1">
+                                                                <span className="block truncate text-sm font-bold text-gray-100">{item.title}</span>
+                                                                <span className="mt-0.5 block truncate text-[10px] text-gray-500">
+                                                                    {item.id} · {formatFeedbackTime(item.submittedAt)}
+                                                                </span>
+                                                            </span>
+                                                            <span className="shrink-0 rounded-full border border-cyan-400/20 bg-cyan-500/10 px-2 py-1 text-[10px] text-cyan-300">
+                                                                {FEEDBACK_STATUS_LABELS[item.status] || item.status}
+                                                            </span>
+                                                            <span className="shrink-0 text-xs text-gray-500 transition-transform group-open:rotate-90">›</span>
+                                                        </summary>
+                                                        <div className="space-y-3 border-t border-white/[0.06] px-4 py-3">
+                                                            {item.reply ? (
+                                                                <div className="whitespace-pre-wrap rounded-lg border border-green-400/20 bg-green-500/[0.08] p-3 text-xs leading-relaxed text-green-100">
+                                                                    <div className="mb-1 font-bold text-green-400">处理回复</div>
+                                                                    {item.reply}
+                                                                </div>
+                                                            ) : (
+                                                                <div className="text-xs text-gray-500">暂时还没有公开回复，可以稍后刷新查看。</div>
+                                                            )}
+                                                            <div className="flex flex-wrap items-center justify-between gap-3 text-[10px] text-gray-600">
+                                                                <span>{item.lastCheckedAt ? `上次查询：${formatFeedbackTime(item.lastCheckedAt)}` : '尚未查询处理进度'}</span>
+                                                                <a href={item.trackingUrl} target="_blank" rel="noreferrer" className="font-bold text-cyan-400 hover:text-cyan-300">在网页查看 ↗</a>
+                                                            </div>
+                                                        </div>
+                                                    </details>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5">
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                             <div>
@@ -3711,7 +4317,7 @@ const AdminWidget: React.FC = () => {
                                         {downloadProgress !== null ? (
                                             <div className="bg-green-900/30 border border-green-500/30 p-5 rounded-xl w-full text-left">
                                                 <div className="text-green-400 font-bold text-md mb-2 flex justify-between">
-                                                    <span>🚀 正在下载更新...</span>
+                                                    <span>🚀 {updateDownloadStatus?.message || '正在下载更新'}</span>
                                                     <span>{Math.floor(downloadProgress)}%</span>
                                                 </div>
                                                 <div className="w-full bg-black/50 h-3 rounded-full overflow-hidden">
@@ -3720,7 +4326,7 @@ const AdminWidget: React.FC = () => {
                                                         style={{ width: `${downloadProgress}%` }}
                                                     ></div>
                                                 </div>
-                                                <div className="text-xs text-green-400/70 mt-3 text-center">下载完成后程序将自动重启，请勿关闭本窗口</div>
+                                                <div className="text-xs text-green-400/70 mt-3 text-center">这里显示安装器返回的真实下载进度；完成后程序将自动重启</div>
                                             </div>
                                         ) : updateInfo.info?.hasUpdate ? (
                                             <div className="bg-green-900/30 border border-green-500/30 p-5 rounded-xl w-full">

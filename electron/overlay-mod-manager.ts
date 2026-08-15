@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import extract from 'extract-zip';
+import { extractZipSafely } from './safe-zip.ts';
 
 export const OVERLAY_PACKAGE_SCHEMA_VERSION = 1;
 export const OFFICIAL_OVERLAY_REPOSITORY =
@@ -102,10 +102,24 @@ export const BUILTIN_OVERLAY_SETTINGS: OverlaySettingDefinition[] = [
     step: 1
   },
   {
+    key: 'artworkSource',
+    label: 'Mod UI 当前歌曲图片',
+    description: '只影响 OBS / 直播姬的 Mod UI；主播控制窗口需在下方单独设置。主播歌单或头像不可用时自动使用专辑封面。',
+    group: 'Mod UI 歌曲图片',
+    type: 'select',
+    default: 'album_cover',
+    cssVariable: '--awoo-artwork-source',
+    cssUnit: '',
+    options: [
+      { label: '专辑封面（默认）', value: 'album_cover' },
+      { label: '点歌人头像', value: 'requester_avatar' }
+    ]
+  },
+  {
     key: 'coverRotation',
-    label: '专辑封面旋转',
-    description: '播放歌曲时让专辑封面像唱片一样缓慢旋转。',
-    group: '专辑封面',
+    label: '当前图片旋转',
+    description: '开启后，当前显示的专辑封面或点歌人头像会缓慢旋转。',
+    group: '图片动画',
     type: 'toggle',
     default: false,
     cssVariable: '--awoo-cover-rotation',
@@ -113,9 +127,9 @@ export const BUILTIN_OVERLAY_SETTINGS: OverlaySettingDefinition[] = [
   },
   {
     key: 'coverRotationSpeed',
-    label: '封面旋转一圈',
-    description: '数值越大，专辑封面旋转得越慢。',
-    group: '专辑封面',
+    label: '图片旋转一圈',
+    description: '数值越大，当前图片旋转得越慢。',
+    group: '图片动画',
     type: 'range',
     default: 18,
     cssVariable: '--cover-spin-duration',
@@ -776,8 +790,9 @@ export class OverlayModManager {
     try {
       await fs.promises.mkdir(extractedDirectory, { recursive: true });
       await fs.promises.writeFile(archivePath, archive);
-      await extract(archivePath, {
-        dir: extractedDirectory,
+      await extractZipSafely(archivePath, extractedDirectory, {
+        maxEntries: MAX_OVERLAY_FILES * 2,
+        maxUncompressedBytes: MAX_OVERLAY_EXTRACTED_BYTES,
         onEntry: entry => {
           const entryName = entry.fileName.replace(/\\/g, '/');
           const isDirectory = entryName.endsWith('/');
@@ -786,10 +801,6 @@ export class OverlayModManager {
             : entryName;
           if (safeName && !isSafeRelativePath(safeName)) {
             throw new Error(`ZIP 包含不安全路径：${entry.fileName}`);
-          }
-          const unixType = (entry.externalFileAttributes >>> 16) & 0o170000;
-          if (unixType === 0o120000 || (entry.generalPurposeBitFlag & 1) !== 0) {
-            throw new Error('Mod UI ZIP 不允许符号链接或加密文件');
           }
           if (!isDirectory) {
             archiveFiles += 1;

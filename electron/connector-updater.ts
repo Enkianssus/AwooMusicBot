@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import extract from 'extract-zip';
+import { extractZipSafely } from './safe-zip.ts';
 import {
   downloadBufferWithRanges,
   downloadWholeBufferWithRetries
@@ -19,6 +19,19 @@ import {
   requiresManualConnectorUpdate,
   type ConnectorUpdateKind
 } from './connector-version-policy';
+import {
+  AWOO_CONNECTOR_EXECUTABLE_NAMES,
+  connectorAssetNames,
+  connectorExecutableNames,
+  isRecognizedConnectorAssetName,
+  isRecognizedQQMusicProfileAssetName
+} from './connector-branding-policy';
+import {
+  isTransientNeteaseFileLock,
+  NeteaseProcessControlError,
+  NeteaseUpdateProcessController,
+  type NeteaseUpdateProcessSession
+} from './netease-update-process';
 
 export type NativeConnectorId =
   | 'netease'
@@ -49,6 +62,9 @@ export interface ConnectorUpdateResult {
   updated: boolean;
   message: string;
   status: ConnectorUpdateStatus;
+  neteasePlayerWasRunning?: boolean;
+  neteasePlayerRestarted?: boolean;
+  neteasePlayerRestartError?: string | null;
 }
 
 interface ConnectorPackageEntry {
@@ -73,6 +89,8 @@ interface ConnectorCatalogEntry extends ConnectorPackageEntry {
   playerVersionPolicy?: string;
   runtime?: DotnetRuntimeRid;
   frameworkDependent?: FrameworkDependentConnectorPackage;
+  awooPackage?: ConnectorPackageEntry;
+  awooFrameworkDependent?: FrameworkDependentConnectorPackage;
 }
 
 interface ConnectorCatalog {
@@ -96,6 +114,8 @@ type ConnectorPackageActivation = Pick<
   'deployment' | 'runtimeRid' | 'runtimeRoot'
 >;
 
+type BeforeConnectorReplace = () => Promise<void>;
+
 interface QQMusicProfileCatalogEntry {
   id: 'qqmusic';
   version: string;
@@ -106,6 +126,7 @@ interface QQMusicProfileCatalogEntry {
   sha256: string;
   signature: string;
   downloadUrl: string;
+  awooPackage?: ConnectorPackageEntry;
 }
 
 interface QQMusicProfileCatalog {
@@ -147,13 +168,6 @@ MCowBQYDK2VwAyEApFy/TMxhGKlxzOS2b1gjvQxnvFhjefK0sbxsCXFS2uc=
 -----END PUBLIC KEY-----
 `;
 
-const EXECUTABLE_NAMES: Record<NativeConnectorId, string> = {
-  netease: 'BiliNCM.Connector.Netease.exe',
-  kugou: 'BiliNCM.Connector.Kugou.exe',
-  qqmusic: 'BiliNCM.Connector.QQMusic.exe',
-  folia: 'BiliNCM.Connector.Folia.exe'
-};
-
 export class ConnectorUpdater {
   private catalog: ConnectorCatalog | null = null;
   private catalogFetchedAt = 0;
@@ -164,10 +178,15 @@ export class ConnectorUpdater {
   private readonly validatedExecutables = new Set<string>();
   private qqMusicProfileUpdate: Promise<string | null> | null = null;
   private privateDotnetRuntime: PrivateDotnetRuntimeManager | null = null;
+  private readonly neteaseProcessController: NeteaseUpdateProcessController;
 
   constructor(
-    private readonly onLog: (message: string) => void
-  ) {}
+    private readonly onLog: (message: string) => void,
+    neteaseProcessController?: NeteaseUpdateProcessController
+  ) {
+    this.neteaseProcessController = neteaseProcessController
+      || new NeteaseUpdateProcessController({ onLog });
+  }
 
   async resolve(connectorId: NativeConnectorId): Promise<string | null> {
     return (await this.readActive(connectorId))?.executable || null;
@@ -432,8 +451,36 @@ export class ConnectorUpdater {
       };
     }
 
+    const neteaseMaintenance: {
+      prepared: boolean;
+      session: NeteaseUpdateProcessSession | null;
+    } = {
+      prepared: false,
+      session: null
+    };
+    const beforeReplace: BeforeConnectorReplace | undefined =
+      connectorId === 'netease'
+        ? async () => {
+            if (neteaseMaintenance.prepared) return;
+            neteaseMaintenance.prepared = true;
+            try {
+              neteaseMaintenance.session = await this.neteaseProcessController
+                .stopForConnectorUpdate();
+            } catch (error: unknown) {
+              neteaseMaintenance.prepared = false;
+              throw error;
+            }
+          }
+        : undefined;
+
+    let result: ConnectorUpdateResult;
     try {
-      await this.install(connectorId, entry, forceReinstall);
+      await this.install(
+        connectorId,
+        entry,
+        forceReinstall,
+        beforeReplace
+      );
       const refreshedStatus = this.makeStatus(
         connectorId,
         await this.readActive(connectorId),
@@ -445,7 +492,7 @@ export class ConnectorUpdater {
         `[连接器更新] 已${forceReinstall ? '重新安装' : '安装'} `
         + `${connectorId} ${entry.version}`
       );
-      return {
+      result = {
         success: true,
         updated: true,
         message: forceReinstall
@@ -458,7 +505,7 @@ export class ConnectorUpdater {
       this.onLog(
         `[连接器更新] ${connectorId} 安装失败：${message}`
       );
-      return {
+      result = {
         success: false,
         updated: false,
         message: `安装失败：${message}`,
@@ -468,6 +515,36 @@ export class ConnectorUpdater {
         }
       };
     }
+
+    if (neteaseMaintenance.prepared && neteaseMaintenance.session) {
+      result = {
+        ...result,
+        neteasePlayerWasRunning: neteaseMaintenance.session.wasRunning
+      };
+    }
+
+    if (neteaseMaintenance.session?.wasRunning) {
+      try {
+        await this.neteaseProcessController
+          .restartAfterConnectorUpdate(neteaseMaintenance.session);
+        result = {
+          ...result,
+          message: `${result.message}；已自动重新启动网易云音乐`,
+          neteasePlayerRestarted: true,
+          neteasePlayerRestartError: null
+        };
+      } catch (error: unknown) {
+        const message = getErrorMessage(error);
+        this.onLog(`[网易云连接器更新] 自动重启失败：${message}`);
+        result = {
+          ...result,
+          message: `${result.message}；网易云自动重启失败，请手动打开：${message}`,
+          neteasePlayerRestarted: false,
+          neteasePlayerRestartError: message
+        };
+      }
+    }
+    return result;
   }
 
   private makeStatus(
@@ -593,7 +670,12 @@ export class ConnectorUpdater {
       || !['win-x86', 'win-x64'].includes(
         entry.runtime || 'win-x86'
       )
-      || entry.asset !== `bilincm-connector-${connectorId}-${entry.version}-${entry.runtime || 'win-x86'}.zip`
+      || !isRecognizedConnectorAssetName(
+        entry.asset,
+        connectorId,
+        entry.version,
+        entry.runtime || 'win-x86'
+      )
       || path.basename(new URL(entry.downloadUrl).pathname) !== entry.asset
     ) {
       throw new Error(`${connectorId} 连接器清单字段无效`);
@@ -612,11 +694,64 @@ export class ConnectorUpdater {
         'https://app.enkianss.us/connectors/v1/download/'
       )
       || path.basename(framework.asset) !== framework.asset
-      || framework.asset !== `bilincm-connector-${connectorId}-${entry.version}-${runtimeRid}-framework-dependent.zip`
+      || !isRecognizedConnectorAssetName(
+        framework.asset,
+        connectorId,
+        entry.version,
+        runtimeRid,
+        true
+      )
       || path.basename(new URL(framework.downloadUrl).pathname) !== framework.asset
     )) {
       throw new Error(
         `${connectorId} framework-dependent 连接器清单字段无效`
+      );
+    }
+
+    const awooPackage = entry.awooPackage;
+    if (awooPackage && (
+      !Number.isSafeInteger(awooPackage.size)
+      || awooPackage.size <= 0
+      || !/^[a-f0-9]{64}$/i.test(awooPackage.sha256)
+      || !awooPackage.signature
+      || !awooPackage.downloadUrl.startsWith(
+        'https://app.enkianss.us/connectors/v1/download/'
+      )
+      || path.basename(awooPackage.asset) !== awooPackage.asset
+      || awooPackage.asset !== connectorAssetNames(
+        connectorId,
+        entry.version,
+        runtimeRid
+      )[0]
+      || path.basename(new URL(awooPackage.downloadUrl).pathname)
+        !== awooPackage.asset
+    )) {
+      throw new Error(`${connectorId} Awoo 完整连接器清单字段无效`);
+    }
+
+    const awooFramework = entry.awooFrameworkDependent;
+    if (awooFramework && (
+      awooFramework.runtime !== runtimeRid
+      || awooFramework.runtimeChannel !== '8.0'
+      || !Number.isSafeInteger(awooFramework.size)
+      || awooFramework.size <= 0
+      || !/^[a-f0-9]{64}$/i.test(awooFramework.sha256)
+      || !awooFramework.signature
+      || !awooFramework.downloadUrl.startsWith(
+        'https://app.enkianss.us/connectors/v1/download/'
+      )
+      || path.basename(awooFramework.asset) !== awooFramework.asset
+      || awooFramework.asset !== connectorAssetNames(
+        connectorId,
+        entry.version,
+        runtimeRid,
+        true
+      )[0]
+      || path.basename(new URL(awooFramework.downloadUrl).pathname)
+        !== awooFramework.asset
+    )) {
+      throw new Error(
+        `${connectorId} Awoo framework-dependent 连接器清单字段无效`
       );
     }
   }
@@ -624,9 +759,11 @@ export class ConnectorUpdater {
   private async install(
     connectorId: NativeConnectorId,
     entry: ConnectorCatalogEntry,
-    forceReinstall = false
+    forceReinstall = false,
+    beforeReplace?: BeforeConnectorReplace
   ): Promise<string> {
-    const framework = entry.frameworkDependent;
+    const framework = entry.awooFrameworkDependent
+      || entry.frameworkDependent;
     if (framework) {
       try {
         const runtimeRoot = await this.getPrivateDotnetRuntime().ensure(
@@ -644,9 +781,13 @@ export class ConnectorUpdater {
             entry,
             framework,
             activation,
-            forceReinstall
+            forceReinstall,
+            beforeReplace
           );
         } catch (proxyError: unknown) {
+          if (proxyError instanceof NeteaseProcessControlError) {
+            throw proxyError;
+          }
           const directPackage: ConnectorPackageEntry = {
             ...framework,
             downloadUrl: buildConnectorGitHubReleaseUrl(
@@ -665,10 +806,14 @@ export class ConnectorUpdater {
             directPackage,
             activation,
             forceReinstall,
+            beforeReplace,
             true
           );
         }
       } catch (error: unknown) {
+        if (error instanceof NeteaseProcessControlError) {
+          throw error;
+        }
         this.onLog(
           `[连接器更新] ${connectorId} 小体积包或私有 .NET Runtime 安装失败，`
           + `自动回退完整包：${getErrorMessage(error)}`
@@ -679,9 +824,10 @@ export class ConnectorUpdater {
     return this.installPackage(
       connectorId,
       entry,
-      entry,
+      entry.awooPackage || entry,
       { deployment: 'self-contained' },
-      forceReinstall
+      forceReinstall,
+      beforeReplace
     );
   }
 
@@ -691,12 +837,13 @@ export class ConnectorUpdater {
     packageEntry: ConnectorPackageEntry,
     activation: ConnectorPackageActivation,
     forceReinstall = false,
+    beforeReplace?: BeforeConnectorReplace,
     wholeFileDownload = false
   ): Promise<string> {
     const connectorRoot = this.getConnectorRoot(connectorId);
     const versionDirectory = path.join(connectorRoot, entry.version);
-    const executableName = EXECUTABLE_NAMES[connectorId];
-    const executable = path.join(versionDirectory, executableName);
+    const preferredExecutableName =
+      AWOO_CONNECTOR_EXECUTABLE_NAMES[connectorId];
 
     const currentActive = await this.readActive(connectorId);
     const currentDeployment = currentActive?.deployment || 'self-contained';
@@ -713,13 +860,14 @@ export class ConnectorUpdater {
           && activation.runtimeRoot
           && path.resolve(currentActive.runtimeRoot)
             === path.resolve(activation.runtimeRoot)
-        )
+          )
       )
-      && await isFile(executable)
+      && currentActive?.executable
+      && await isFile(currentActive.executable)
     );
-    if (canReuse) {
+    if (canReuse && currentActive) {
       await validateConnectorExecutable(
-        executable,
+        currentActive.executable,
         connectorId,
         entry.version,
         activation.runtimeRid && activation.runtimeRoot
@@ -732,11 +880,11 @@ export class ConnectorUpdater {
       await this.writeActive(connectorId, {
         id: connectorId,
         version: entry.version,
-        executable,
+        executable: currentActive.executable,
         ...activation,
         activatedAt: new Date().toISOString()
       });
-      return executable;
+      return currentActive.executable;
     }
 
     await fs.promises.mkdir(connectorRoot, { recursive: true });
@@ -755,6 +903,7 @@ export class ConnectorUpdater {
     );
     let installedNewDirectory = false;
     let movedPreviousDirectory = false;
+    let preserveOccupiedNeteaseBackup = false;
 
     try {
       const downloadOptions: Parameters<
@@ -815,15 +964,22 @@ export class ConnectorUpdater {
       await fs.promises.writeFile(archivePath, archive, {
         flag: 'wx'
       });
-      await extract(archivePath, { dir: stagingDirectory });
+      await extractZipSafely(archivePath, stagingDirectory);
 
+      let stagedExecutableName = '';
+      for (const candidate of connectorExecutableNames(connectorId)) {
+        if (await isFile(path.join(stagingDirectory, candidate))) {
+          stagedExecutableName = candidate;
+          break;
+        }
+      }
+      if (!stagedExecutableName) {
+        throw new Error(`发布包缺少 ${preferredExecutableName}`);
+      }
       const stagedExecutable = path.join(
         stagingDirectory,
-        executableName
+        stagedExecutableName
       );
-      if (!await isFile(stagedExecutable)) {
-        throw new Error(`发布包缺少 ${executableName}`);
-      }
       await validateConnectorExecutable(
         stagedExecutable,
         connectorId,
@@ -836,12 +992,21 @@ export class ConnectorUpdater {
           : {}
       );
 
+      await beforeReplace?.();
+      if (connectorId === 'netease') {
+        await this.cleanupStaleNeteaseBackups(connectorRoot);
+      }
+
       if (await pathExists(versionDirectory)) {
         await fs.promises.rename(versionDirectory, backupDirectory);
         movedPreviousDirectory = true;
       }
       await fs.promises.rename(stagingDirectory, versionDirectory);
       installedNewDirectory = true;
+      const executable = path.join(
+        versionDirectory,
+        stagedExecutableName
+      );
       await this.writeActive(connectorId, {
         id: connectorId,
         version: entry.version,
@@ -850,8 +1015,23 @@ export class ConnectorUpdater {
         activatedAt: new Date().toISOString()
       });
       if (movedPreviousDirectory) {
-        await removeInside(connectorRoot, backupDirectory);
-        movedPreviousDirectory = false;
+        try {
+          await removeInside(connectorRoot, backupDirectory);
+          movedPreviousDirectory = false;
+        } catch (error: unknown) {
+          if (
+            connectorId !== 'netease'
+            || !isTransientNeteaseFileLock(error)
+          ) {
+            throw error;
+          }
+          preserveOccupiedNeteaseBackup = true;
+          movedPreviousDirectory = false;
+          this.onLog(
+            '[网易云连接器更新] 新连接器已安装；旧备份仍被短暂占用，'
+            + '已保留并将在下次安装时清理'
+          );
+        }
       }
       return executable;
     } catch (error) {
@@ -870,8 +1050,42 @@ export class ConnectorUpdater {
       if (await pathExists(stagingDirectory)) {
         await removeInside(connectorRoot, stagingDirectory);
       }
-      if (!movedPreviousDirectory && await pathExists(backupDirectory)) {
+      if (
+        !movedPreviousDirectory
+        && !preserveOccupiedNeteaseBackup
+        && await pathExists(backupDirectory)
+      ) {
         await removeInside(connectorRoot, backupDirectory);
+      }
+    }
+  }
+
+  private async cleanupStaleNeteaseBackups(
+    connectorRoot: string
+  ): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(connectorRoot, {
+        withFileTypes: true
+      });
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+      throw error;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith('.backup-')) {
+        continue;
+      }
+      const backupPath = path.join(connectorRoot, entry.name);
+      try {
+        await removeInside(connectorRoot, backupPath);
+        this.onLog('[网易云连接器更新] 已清理上次保留的旧连接器备份');
+      } catch (error: unknown) {
+        if (!isTransientNeteaseFileLock(error)) throw error;
+        this.onLog(
+          '[网易云连接器更新] 上次的旧备份仍被占用，继续保留等待下次清理'
+        );
       }
     }
   }
@@ -917,7 +1131,10 @@ export class ConnectorUpdater {
       || entry.size <= 0
       || !/^[a-f0-9]{64}$/i.test(entry.sha256)
       || !entry.signature
-      || entry.asset !== `bilincm-qqmusic-profiles-${entry.version}.zip`
+      || !isRecognizedQQMusicProfileAssetName(
+        entry.asset,
+        entry.version
+      )
       || !entry.downloadUrl.startsWith(
         'https://app.enkianss.us/connectors/v1/profiles/qqmusic/download/'
       )
@@ -926,12 +1143,29 @@ export class ConnectorUpdater {
       throw new Error('QQ 音乐画像更新清单无效');
     }
 
+    const awooPackage = entry.awooPackage;
+    if (awooPackage && (
+      !Number.isSafeInteger(awooPackage.size)
+      || awooPackage.size <= 0
+      || !/^[a-f0-9]{64}$/i.test(awooPackage.sha256)
+      || !awooPackage.signature
+      || awooPackage.asset !== `awoo-qqmusic-profiles-${entry.version}.zip`
+      || !awooPackage.downloadUrl.startsWith(
+        'https://app.enkianss.us/connectors/v1/profiles/qqmusic/download/'
+      )
+      || path.basename(new URL(awooPackage.downloadUrl).pathname)
+        !== awooPackage.asset
+    )) {
+      throw new Error('QQ 音乐 Awoo 画像更新清单无效');
+    }
+
     if (active && compareVersions(active.version, entry.version) >= 0) {
       return active.directory;
     }
 
     const profileRoot = this.getQQMusicProfileRoot();
     const versionDirectory = path.join(profileRoot, entry.version);
+    const packageEntry = entry.awooPackage || entry;
     const nonce = crypto.randomBytes(8).toString('hex');
     const archivePath = path.join(profileRoot, `.download-${nonce}.zip`);
     const stagingDirectory = path.join(profileRoot, `.staging-${nonce}`);
@@ -944,7 +1178,7 @@ export class ConnectorUpdater {
       );
       let archive: Buffer;
       try {
-        const response = await fetch(entry.downloadUrl, {
+        const response = await fetch(packageEntry.downloadUrl, {
           method: 'GET',
           cache: 'no-store',
           signal: downloadController.signal
@@ -954,13 +1188,15 @@ export class ConnectorUpdater {
       } finally {
         clearTimeout(downloadTimeout);
       }
-      if (archive.length !== entry.size) {
-        throw new Error(`画像大小不匹配：${archive.length}/${entry.size}`);
+      if (archive.length !== packageEntry.size) {
+        throw new Error(
+          `画像大小不匹配：${archive.length}/${packageEntry.size}`
+        );
       }
       const digest = crypto.createHash('sha256').update(archive).digest('hex');
       if (!crypto.timingSafeEqual(
         Buffer.from(digest, 'hex'),
-        Buffer.from(entry.sha256, 'hex')
+        Buffer.from(packageEntry.sha256, 'hex')
       )) {
         throw new Error('QQ 画像 SHA-256 校验失败');
       }
@@ -968,13 +1204,16 @@ export class ConnectorUpdater {
         null,
         archive,
         RELEASE_PUBLIC_KEY,
-        Buffer.from(entry.signature, 'base64')
+        Buffer.from(packageEntry.signature, 'base64')
       )) {
         throw new Error('QQ 画像 Ed25519 签名校验失败');
       }
 
       await fs.promises.writeFile(archivePath, archive, { flag: 'wx' });
-      await extract(archivePath, { dir: stagingDirectory });
+      await extractZipSafely(archivePath, stagingDirectory, {
+        maxEntries: 100,
+        maxUncompressedBytes: 4 * 1024 * 1024
+      });
       const profileFiles = (await fs.promises.readdir(stagingDirectory))
         .filter(file => /^\d+\.\d+\.json$/i.test(file));
       if (profileFiles.length === 0) {
@@ -1072,15 +1311,15 @@ export class ConnectorUpdater {
         return null;
       }
 
-      const expected = path.join(
+      const versionDirectory = path.join(
         this.getConnectorRoot(connectorId),
-        active.version,
-        EXECUTABLE_NAMES[connectorId]
+        active.version
       );
-      if (
-        path.resolve(active.executable) !== path.resolve(expected)
-        || !await isFile(expected)
-      ) {
+      const activeExecutable = path.resolve(active.executable);
+      const expected = connectorExecutableNames(connectorId)
+        .map(name => path.join(versionDirectory, name))
+        .find(candidate => path.resolve(candidate) === activeExecutable);
+      if (!expected || !await isFile(expected)) {
         return null;
       }
 

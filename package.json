@@ -1,7 +1,7 @@
 {
   "name": "awoo-musicbot",
   "private": true,
-  "version": "1.1.7",
+  "version": "1.1.8",
   "type": "module",
   "description": "嗷呜点歌机 - 支持多播放器的 Bilibili 弹幕点歌机器人",
   "author": "Enkianssus",
@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && electron-builder",
-    "build:dev": "tsc && vite build && electron-builder --dir --config.directories.output=dist_electron_dev_1.1.7",
+    "build:dev": "tsc && vite build && electron-builder --dir --config.directories.output=dist_electron_dev_1.1.8",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "test": "node --test tests/*.test.mjs",
     "preview": "vite preview"

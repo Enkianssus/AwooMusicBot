@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   planImmediatePlaybackCommand,
+  planManagedActionTimeout,
   planObservedNextAction,
   planQueueHeadMutation,
   queueSongIdentity,
@@ -86,6 +87,48 @@ test('observed fallback ID still matches the numeric queue item metadata', () =>
   ), true);
 });
 
+test('instrumental aliases match only the same singer', () => {
+  const expected = {
+    Id: '395562465',
+    SongName: 'September (纯音乐)',
+    ArtistName: 'Sparky Deathcap',
+    PlayerKey: 'qqmusic'
+  };
+  assert.equal(tracksRepresentSameSong(expected, {
+    id: 'September (Instrumental)|Sparky Deathcap',
+    title: 'September (Instrumental)',
+    artist: 'Sparky Deathcap'
+  }), true);
+  assert.equal(tracksRepresentSameSong(expected, {
+    id: 'September|Sparky Deathcap',
+    title: 'September',
+    artist: 'Sparky Deathcap'
+  }), false);
+  assert.equal(tracksRepresentSameSong(expected, {
+    id: 'September (Live)|Sparky Deathcap',
+    title: 'September (Live)',
+    artist: 'Sparky Deathcap'
+  }), false);
+  assert.equal(tracksRepresentSameSong(expected, {
+    id: 'September (Remix)|Sparky Deathcap',
+    title: 'September (Remix)',
+    artist: 'Sparky Deathcap'
+  }), false);
+  assert.equal(tracksRepresentSameSong(expected, {
+    id: 'September (Inst.)|Other Artist',
+    title: 'September (Inst.)',
+    artist: 'Other Artist'
+  }), false);
+  assert.equal(tracksRepresentSameSong({
+    ...expected,
+    PlayerKey: 'netease'
+  }, {
+    id: 'September (Inst.)|Sparky Deathcap',
+    title: 'September (Inst.)',
+    artist: 'Sparky Deathcap'
+  }), false);
+});
+
 test('different stable IDs are an authoritative track transition', () => {
   assert.equal(tracksHaveDifferentStableIds(
     { id: '1839140774', title: 'Musician', artist: 'Porter Robinson' },
@@ -119,6 +162,36 @@ test('exact platform ID remains authoritative when metadata is incomplete', () =
     { Id: '218338', SongName: '开不了口', ArtistName: '周杰伦' },
     { id: '218338', title: '', artist: '' }
   ), true);
+});
+
+test('same stable ID remains authoritative despite a title variant', () => {
+  assert.equal(tracksRepresentSameSong(
+    { Id: '395562465', SongName: 'September (纯音乐)', ArtistName: 'Sparky Deathcap' },
+    { id: '395562465', title: 'September (Live)', artist: 'Other Artist' }
+  ), true);
+});
+
+test('unconfirmed managed action restores observed playback after timeout', () => {
+  assert.equal(planManagedActionTimeout({
+    targetObserved: false,
+    targetStillCurrent: true,
+    previousCurrentObserved: true
+  }), 'restore-previous');
+  assert.equal(planManagedActionTimeout({
+    targetObserved: false,
+    targetStillCurrent: true,
+    previousCurrentObserved: false
+  }), 'clear-requested');
+  assert.equal(planManagedActionTimeout({
+    targetObserved: true,
+    targetStillCurrent: true,
+    previousCurrentObserved: false
+  }), 'keep-requested');
+  assert.equal(planManagedActionTimeout({
+    targetObserved: false,
+    targetStillCurrent: false,
+    previousCurrentObserved: true
+  }), 'keep-requested');
 });
 
 test('real next-track observation suppresses duplicate insertion', () => {

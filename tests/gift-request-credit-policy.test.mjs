@@ -9,8 +9,10 @@ import {
   isGiftRequestRequirementEnabled,
   matchesGiftRequestRequirement,
   normalizeGiftQuantity,
+  normalizeLearnedGifts,
   normalizeGiftRequestRequirements,
-  parseBilibiliGiftCreditEvent
+  parseBilibiliGiftCreditEvent,
+  rememberLearnedGift
 } from '../electron/gift-request-credit-policy.ts';
 
 test('maps Bilibili guard levels to the four configurable tiers', () => {
@@ -49,12 +51,12 @@ test('an empty tier disables the gift requirement', () => {
   assert.equal(canRequestWithGiftCredits(empty, 0, false), true);
 });
 
-test('matches either the configured gift name or stable gift id', () => {
+test('uses the stable gift id ahead of the display name', () => {
   const requirement = { giftName: '牛哇牛哇', giftId: '31036' };
   assert.equal(matchesGiftRequestRequirement(requirement, {
     giftName: ' 牛哇牛哇 ',
     giftId: 1
-  }), true);
+  }), false);
   assert.equal(matchesGiftRequestRequirement(requirement, {
     giftName: '别的礼物',
     giftId: 31036
@@ -63,6 +65,87 @@ test('matches either the configured gift name or stable gift id', () => {
     giftName: '辣条',
     giftId: 1
   }), false);
+  assert.equal(matchesGiftRequestRequirement({
+    giftName: '辣条',
+    giftId: ''
+  }, {
+    giftName: ' 辣条 ',
+    giftId: 999
+  }), true);
+});
+
+test('normalizes, deduplicates, and bounds the learned gift library', () => {
+  const normalized = normalizeLearnedGifts([
+    {
+      giftName: '旧名称',
+      giftId: '31036',
+      lastSeenAt: 100,
+      lastQuantity: 1,
+      uid: 'must-not-survive',
+      userName: 'must-not-survive'
+    },
+    {
+      GiftName: '新名称',
+      GiftId: 31036,
+      lastSeenAt: 200,
+      quantity: 5
+    },
+    {
+      giftName: '辣条',
+      giftId: '',
+      lastSeenAt: 150,
+      lastQuantity: 2
+    },
+    { giftName: '', giftId: '' }
+  ], 2);
+
+  assert.deepEqual(normalized, [
+    {
+      giftName: '新名称',
+      giftId: '31036',
+      lastSeenAt: 200,
+      lastQuantity: 5
+    },
+    {
+      giftName: '辣条',
+      giftId: '',
+      lastSeenAt: 150,
+      lastQuantity: 2
+    }
+  ]);
+});
+
+test('remembering a gift updates its metadata and keeps newest gifts first', () => {
+  const first = rememberLearnedGift([], {
+    giftName: '牛哇牛哇',
+    giftId: 31036,
+    quantity: 1
+  }, 100);
+  const second = rememberLearnedGift(first, {
+    giftName: '牛哇牛哇（新名称）',
+    giftId: '31036',
+    quantity: 10
+  }, 300);
+  const final = rememberLearnedGift(second, {
+    giftName: '辣条',
+    giftId: 1,
+    quantity: 2
+  }, 400);
+
+  assert.deepEqual(final, [
+    {
+      giftName: '辣条',
+      giftId: '1',
+      lastSeenAt: 400,
+      lastQuantity: 2
+    },
+    {
+      giftName: '牛哇牛哇（新名称）',
+      giftId: '31036',
+      lastSeenAt: 300,
+      lastQuantity: 10
+    }
+  ]);
 });
 
 test('gift quantity adds the real unit count and is safely bounded', () => {

@@ -56,6 +56,43 @@ function normalizeTrackText(value: unknown): string {
     .replace(/\/+$/g, '');
 }
 
+// QQ Music has historically exposed the same instrumental recording with
+// different, explicitly instrumental suffixes across its catalog and desktop
+// metadata. Only this player gets the narrow alias rule; version markers such
+// as Live, Remix and Acoustic remain part of the title.
+const INSTRUMENTAL_SUFFIX = /\((?:纯音乐|inst\.?|instrumental)\)$/iu;
+
+function normalizeTrackTitle(value: unknown): {
+  full: string;
+  base: string;
+  explicitlyInstrumental: boolean;
+} {
+  const full = normalizeTrackText(value);
+  const explicitlyInstrumental = INSTRUMENTAL_SUFFIX.test(full);
+  return {
+    full,
+    base: explicitlyInstrumental
+      ? full.replace(INSTRUMENTAL_SUFFIX, '')
+      : full,
+    explicitlyInstrumental
+  };
+}
+
+function trackTitlesRepresentSameSong(
+  first: unknown,
+  second: unknown,
+  allowInstrumentalAliases: boolean
+): boolean {
+  const normalizedFirst = normalizeTrackTitle(first);
+  const normalizedSecond = normalizeTrackTitle(second);
+  if (!normalizedFirst.full || !normalizedSecond.full) return false;
+  if (normalizedFirst.full === normalizedSecond.full) return true;
+  return allowInstrumentalAliases
+    && normalizedFirst.explicitlyInstrumental
+    && normalizedSecond.explicitlyInstrumental
+    && normalizedFirst.base === normalizedSecond.base;
+}
+
 /**
  * Matches a queue item with an observed player track. Some native players
  * temporarily report title/artist-derived IDs while metadata caches catch up,
@@ -79,13 +116,14 @@ export function tracksRepresentSameSong(
     return false;
   }
 
-  const expectedTitle = normalizeTrackText(
-    readTrackField(expected, 'SongName', 'title')
-  );
-  const observedTitle = normalizeTrackText(
-    readTrackField(observed, 'SongName', 'title')
-  );
-  if (!expectedTitle || expectedTitle !== observedTitle) return false;
+  const playerKey = String(
+    expected.PlayerKey || observed.PlayerKey || ''
+  ).toLowerCase();
+  if (!trackTitlesRepresentSameSong(
+    readTrackField(expected, 'SongName', 'title'),
+    readTrackField(observed, 'SongName', 'title'),
+    playerKey === 'qqmusic'
+  )) return false;
 
   const expectedArtist = normalizeTrackText(
     readTrackField(expected, 'ArtistName', 'artist')
@@ -201,6 +239,29 @@ export function shouldDeferManagedTrackObservation(
   return Boolean(target)
     && Boolean(observed)
     && !tracksRepresentSameSong(target, observed);
+}
+
+export type ManagedActionTimeoutDecision =
+  | 'keep-requested'
+  | 'restore-previous'
+  | 'clear-requested';
+
+/**
+ * Decide what to show when an immediate-player transaction expires without
+ * observing its target. The queue is deliberately left to the caller; this
+ * only prevents an unverified target from remaining the displayed request.
+ */
+export function planManagedActionTimeout(options: {
+  targetObserved: boolean;
+  targetStillCurrent: boolean;
+  previousCurrentObserved: boolean;
+}): ManagedActionTimeoutDecision {
+  if (options.targetObserved || !options.targetStillCurrent) {
+    return 'keep-requested';
+  }
+  return options.previousCurrentObserved
+    ? 'restore-previous'
+    : 'clear-requested';
 }
 
 export function shouldPreserveGuardAfterImmediate(options: {

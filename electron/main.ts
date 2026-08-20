@@ -12,6 +12,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import QRCode from 'qrcode';
 import {
   planImmediatePlaybackCommand,
+  planManagedActionTimeout,
   planObservedNextAction,
   planQueueHeadMutation,
   queueSongIdentity,
@@ -47,10 +48,13 @@ import {
   giftRequestTierFromGuardLevel,
   giftRequestTierLabel,
   matchesGiftRequestRequirement,
+  normalizeLearnedGifts,
   normalizeGiftRequestRequirements,
   parseBilibiliGiftCreditEvent,
+  rememberLearnedGift,
   type BilibiliGiftCreditEvent,
-  type GiftRequestRequirement
+  type GiftRequestRequirement,
+  type LearnedGift
 } from './gift-request-credit-policy';
 import {
   MAX_OVERLAY_ARCHIVE_BYTES,
@@ -459,6 +463,7 @@ let appConfig: any = {
   myRoomId: 0,
   biliCookie: '',
   biliUid: 0,
+  learnedGifts: [],
   widgetStyle: null,
   sysConfig: {
     PlayerType: 'NCM',
@@ -513,6 +518,9 @@ function loadConfig() {
         normalizeGiftRequestRequirements(
           appConfig.sysConfig.GiftRequestRequirements
         );
+      appConfig.learnedGifts = normalizeLearnedGifts(
+        appConfig.learnedGifts
+      );
 
       biliCookie = appConfig.biliCookie || '';
       biliUid = appConfig.biliUid || 0;
@@ -600,6 +608,7 @@ interface ManagedPlayerAction {
   expiresAt: number;
   inFlight: boolean;
   targetObserved: boolean;
+  previousCurrentPlayingSong: any;
 }
 
 let activeManagedPlayerAction: ManagedPlayerAction | null = null;
@@ -694,7 +703,96 @@ const playerManager = new PlayerManager({
 const userCooldowns = new Map<string, number>();
 const giftRequestCredits = new Map<string, number>();
 const recentGiftEvents = new Map<string, number>();
+const GIFT_LEARNING_DURATION_MS = 60_000;
+const MAX_GIFT_LEARNING_SESSION_ITEMS = 20;
+let giftLearningStartedAt = 0;
+let giftLearningExpiresAt = 0;
+let giftLearningCaptured: LearnedGift[] = [];
+let giftLibrarySaveTimer: NodeJS.Timeout | null = null;
 let recentRejects: { id: number, user: any, reason: string }[] = [];
+
+function isGiftLearningActive(now = Date.now()): boolean {
+  return giftLearningExpiresAt > now;
+}
+
+function getGiftLearningState(now = Date.now()) {
+  return {
+    active: isGiftLearningActive(now),
+    startedAt: giftLearningStartedAt || null,
+    expiresAt: giftLearningExpiresAt || null,
+    capturedGifts: normalizeLearnedGifts(
+      giftLearningCaptured,
+      MAX_GIFT_LEARNING_SESSION_ITEMS
+    ),
+    knownGifts: normalizeLearnedGifts(appConfig.learnedGifts)
+  };
+}
+
+function scheduleGiftLibrarySave(): void {
+  if (giftLibrarySaveTimer) clearTimeout(giftLibrarySaveTimer);
+  giftLibrarySaveTimer = setTimeout(() => {
+    giftLibrarySaveTimer = null;
+    saveConfig();
+  }, 300);
+}
+
+function startGiftLearning(): void {
+  const now = Date.now();
+  giftLearningStartedAt = now;
+  giftLearningExpiresAt = now + GIFT_LEARNING_DURATION_MS;
+  giftLearningCaptured = [];
+  writeLog('[礼物学习] 已开始监听直播间礼物，持续 60 秒', 'Magenta');
+  setGlobalStatus('🎁 正在监听直播间礼物…');
+}
+
+function stopGiftLearning(): void {
+  giftLearningExpiresAt = 0;
+  writeLog('[礼物学习] 已停止监听直播间礼物', 'DarkGray');
+}
+
+function clearLearnedGiftLibrary(): void {
+  if (giftLibrarySaveTimer) {
+    clearTimeout(giftLibrarySaveTimer);
+    giftLibrarySaveTimer = null;
+  }
+  appConfig.learnedGifts = [];
+  giftLearningCaptured = [];
+  saveConfig();
+  writeLog('[礼物学习] 已清空本地礼物缓存', 'DarkGray');
+}
+
+function captureGiftForLearning(event: BilibiliGiftCreditEvent): void {
+  if (!isGiftLearningActive()) return;
+  const hadGift = giftLearningCaptured.some(item => (
+    event.giftId
+      ? item.giftId === event.giftId
+      : !item.giftId
+        && item.giftName.toLocaleLowerCase('zh-CN')
+          === event.giftName.toLocaleLowerCase('zh-CN')
+  ));
+  const seenAt = Date.now();
+  giftLearningCaptured = rememberLearnedGift(
+    giftLearningCaptured,
+    event,
+    seenAt,
+    MAX_GIFT_LEARNING_SESSION_ITEMS
+  );
+  appConfig.learnedGifts = rememberLearnedGift(
+    appConfig.learnedGifts,
+    event,
+    seenAt
+  );
+  scheduleGiftLibrarySave();
+
+  const displayGift = event.giftName || `ID ${event.giftId}`;
+  if (!hadGift) {
+    writeLog(
+      `[礼物学习] 已捕获 ${displayGift}${event.giftId ? `（ID ${event.giftId}）` : ''}`,
+      'Magenta'
+    );
+  }
+  setGlobalStatus(`🎁 已捕获 ${displayGift}`);
+}
 
 function isConfiguredSuperUser(user: any): boolean {
   if (!isBiliLoginReady()) return false;
@@ -1121,6 +1219,8 @@ function handleGiftEvent(doc: any): void {
     return;
   }
 
+  captureGiftForLearning(event);
+
   const { tier, requirement } = getGiftRequirementForGuardLevel(
     event.guardLevel
   );
@@ -1253,12 +1353,7 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
 
   const managedAction = activeManagedPlayerAction;
   if (managedAction && Date.now() > managedAction.expiresAt) {
-    writeLog(
-      `[动作归因] 点歌机动作 #${managedAction.id} 已超时；`
-      + '后续切歌恢复按播放器端/用户操作处理。',
-      'Yellow'
-    );
-    activeManagedPlayerAction = null;
+    expireManagedAction(managedAction);
   } else if (managedAction) {
     const observed = {
       id: currId,
@@ -1857,7 +1952,8 @@ async function playSongNow(
       startedAt: Date.now(),
       expiresAt: Date.now() + 12_000,
       inFlight: true,
-      targetObserved: false
+      targetObserved: false,
+      previousCurrentPlayingSong
     };
     activeManagedPlayerAction = managedAction;
     setTimeout(() => {
@@ -1865,12 +1961,7 @@ async function playSongNow(
         activeManagedPlayerAction?.id === managedAction.id
         && Date.now() >= managedAction.expiresAt
       ) {
-        activeManagedPlayerAction = null;
-        writeLog(
-          `[动作归因] 点歌机动作 #${managedAction.id} 等待最终目标超时；`
-          + '已恢复识别播放器端/用户切歌。',
-          'Yellow'
-        );
+        expireManagedAction(managedAction);
       }
     }, Math.max(0, managedAction.expiresAt - Date.now() + 50));
     writeLog(
@@ -1935,6 +2026,52 @@ async function playSongNow(
 
 function isObservedSong(songInfo: any): boolean {
   return tracksRepresentSameSong(songInfo, playerCurrentTrack);
+}
+
+function expireManagedAction(action: ManagedPlayerAction): void {
+  if (activeManagedPlayerAction?.id !== action.id) return;
+
+  const targetObserved = action.targetObserved
+    || isObservedSong(action.target);
+  const targetIdentity = getQueueSongIdentity(action.target);
+  const targetStillCurrent = Boolean(currentPlayingSong)
+    && getQueueSongIdentity(currentPlayingSong) === targetIdentity;
+  const previousCurrentObserved = Boolean(action.previousCurrentPlayingSong)
+    && isObservedSong(action.previousCurrentPlayingSong);
+  const decision = planManagedActionTimeout({
+    targetObserved,
+    targetStillCurrent,
+    previousCurrentObserved
+  });
+
+  if (decision !== 'keep-requested' && targetStillCurrent) {
+    currentPlayingSong = decision === 'restore-previous'
+      ? action.previousCurrentPlayingSong
+      : null;
+    queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+    writeLog(
+      `[动作归因] 点歌机动作 #${action.id} 超时且未确认目标；`
+      + (currentPlayingSong
+        ? `已恢复上一首: ${currentPlayingSong.SongName}`
+        : '已恢复播放器实际状态，不再标记为点歌播放。'),
+      'Yellow'
+    );
+    setGlobalStatus(
+      currentPlayingSong
+        ? `[播放] ${currentPlayingSong.SongName}`
+        : playerCurrentTrack
+          ? `[播放器] ${playerCurrentTrack.SongName}`
+          : '点歌目标未确认'
+    );
+  } else {
+    writeLog(
+      `[动作归因] 点歌机动作 #${action.id} 已超时；`
+      + '后续切歌恢复按播放器端/用户操作处理。',
+      'Yellow'
+    );
+  }
+
+  activeManagedPlayerAction = null;
 }
 
 function getWebSocketClient() {
@@ -3435,6 +3572,40 @@ function startBackendServer() {
       return;
     }
 
+    if (url.pathname === '/api/gifts/learning') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      if (req.method === 'GET') {
+        res.end(JSON.stringify({
+          success: true,
+          ...getGiftLearningState()
+        }));
+        return;
+      }
+      if (req.method === 'POST') {
+        const body = await readJsonRequest(req);
+        if (body.action === 'start') startGiftLearning();
+        else if (body.action === 'stop') stopGiftLearning();
+        else if (body.action === 'clear-cache') clearLearnedGiftLibrary();
+        else {
+          res.writeHead(400);
+          res.end(JSON.stringify({
+            success: false,
+            message: '不支持的礼物学习操作'
+          }));
+          return;
+        }
+        res.end(JSON.stringify({
+          success: true,
+          ...getGiftLearningState()
+        }));
+        return;
+      }
+      res.writeHead(405);
+      res.end(JSON.stringify({ success: false, message: '请求方法不受支持' }));
+      return;
+    }
+
     if (url.pathname === '/api/config') {
       if (req.method === 'POST') {
         const body = await readJsonRequest(req);
@@ -3514,6 +3685,7 @@ function startBackendServer() {
         playerSnapshot: activePlayerSnapshot,
         playerControlNotice,
         connectorMaintenanceStatus,
+        giftLearning: getGiftLearningState(),
         commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand },
         current: currentPlayingSong || playerCurrentTrack,
         currentIsRequested: Boolean(currentPlayingSong),
@@ -3976,6 +4148,11 @@ app.whenReady().then(() => {
 });
 
 app.on('before-quit', () => {
+  if (giftLibrarySaveTimer) {
+    clearTimeout(giftLibrarySaveTimer);
+    giftLibrarySaveTimer = null;
+    saveConfig();
+  }
   if (connectorMaintenanceTimer) {
     clearInterval(connectorMaintenanceTimer);
     connectorMaintenanceTimer = null;

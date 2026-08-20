@@ -24,6 +24,13 @@ export interface BilibiliGiftCreditEvent {
   eventId: string;
 }
 
+export interface LearnedGift {
+  giftName: string;
+  giftId: string;
+  lastSeenAt: number;
+  lastQuantity: number;
+}
+
 const TIER_KEYS: readonly GiftRequestTier[] = [
   'Normal',
   'Captain',
@@ -33,6 +40,7 @@ const TIER_KEYS: readonly GiftRequestTier[] = [
 
 const MAX_GIFT_QUANTITY_PER_EVENT = 10_000;
 const MAX_SESSION_CREDITS = 1_000_000;
+export const MAX_LEARNED_GIFTS = 50;
 
 export function createEmptyGiftRequestRequirements(): GiftRequestRequirements {
   return {
@@ -117,10 +125,87 @@ export function matchesGiftRequestRequirement(
   const eventName = normalizeIdentifier(gift.giftName)
     .toLocaleLowerCase('zh-CN');
   const eventId = normalizeIdentifier(gift.giftId);
-  return Boolean(
-    (configuredName && eventName === configuredName)
-    || (configuredId && eventId === configuredId)
-  );
+  if (configuredId) return Boolean(eventId && eventId === configuredId);
+  return Boolean(configuredName && eventName === configuredName);
+}
+
+function learnedGiftKey(
+  gift: Pick<LearnedGift, 'giftName' | 'giftId'>
+): string {
+  const id = normalizeIdentifier(gift.giftId);
+  if (id) return `id:${id}`;
+  return `name:${normalizeIdentifier(gift.giftName).toLocaleLowerCase('zh-CN')}`;
+}
+
+export function normalizeLearnedGifts(
+  value: unknown,
+  limit = MAX_LEARNED_GIFTS
+): LearnedGift[] {
+  if (!Array.isArray(value)) return [];
+  const byKey = new Map<string, LearnedGift>();
+
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const source = raw as Record<string, unknown>;
+    const giftName = normalizeIdentifier(source.giftName ?? source.GiftName);
+    const giftId = normalizeIdentifier(source.giftId ?? source.GiftId);
+    if (!giftName && !giftId) continue;
+
+    const timestamp = Number(source.lastSeenAt);
+    const lastSeenAt = Number.isFinite(timestamp) && timestamp > 0
+      ? Math.floor(timestamp)
+      : 0;
+    const lastQuantity = normalizeGiftQuantity(
+      source.lastQuantity ?? source.quantity
+    ) || 1;
+    const gift: LearnedGift = {
+      giftName,
+      giftId,
+      lastSeenAt,
+      lastQuantity
+    };
+    const key = learnedGiftKey(gift);
+    const previous = byKey.get(key);
+    if (!previous || gift.lastSeenAt >= previous.lastSeenAt) {
+      byKey.set(key, gift);
+    }
+  }
+
+  const safeLimit = Math.max(0, Math.min(
+    MAX_LEARNED_GIFTS,
+    Math.floor(Number(limit) || 0)
+  ));
+  return [...byKey.values()]
+    .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
+    .slice(0, safeLimit);
+}
+
+export function rememberLearnedGift(
+  existing: unknown,
+  gift: { giftName?: unknown; giftId?: unknown; quantity?: unknown },
+  seenAt: unknown,
+  limit = MAX_LEARNED_GIFTS
+): LearnedGift[] {
+  const giftName = normalizeIdentifier(gift.giftName);
+  const giftId = normalizeIdentifier(gift.giftId);
+  if (!giftName && !giftId) return normalizeLearnedGifts(existing, limit);
+
+  const timestamp = Number(seenAt);
+  const next: LearnedGift = {
+    giftName,
+    giftId,
+    lastSeenAt: Number.isFinite(timestamp) && timestamp > 0
+      ? Math.floor(timestamp)
+      : 0,
+    lastQuantity: normalizeGiftQuantity(gift.quantity) || 1
+  };
+  const key = learnedGiftKey(next);
+  return normalizeLearnedGifts([
+    next,
+    ...normalizeLearnedGifts(existing, limit).filter(item => (
+      learnedGiftKey(item) !== key
+    ))
+  ], limit);
 }
 
 export function normalizeGiftQuantity(value: unknown): number {

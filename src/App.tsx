@@ -186,6 +186,21 @@ type NativeConnectorId = 'netease' | 'kugou' | 'qqmusic' | 'folia';
 
 type GiftRequestTier = 'Normal' | 'Captain' | 'Admiral' | 'Governor';
 
+interface LearnedGift {
+    giftName: string;
+    giftId: string;
+    lastSeenAt: number;
+    lastQuantity: number;
+}
+
+interface GiftLearningState {
+    active: boolean;
+    startedAt: number | null;
+    expiresAt: number | null;
+    capturedGifts: LearnedGift[];
+    knownGifts: LearnedGift[];
+}
+
 const GIFT_REQUEST_TIER_OPTIONS: ReadonlyArray<{
     key: GiftRequestTier;
     label: string;
@@ -1292,6 +1307,7 @@ const AdminWidget: React.FC = () => {
 
     const [superUserInput, setSuperUserInput] = useState<string>('');
     const [debugInput, setDebugInput] = useState<string>('');
+    const [giftLearningNow, setGiftLearningNow] = useState(Date.now());
 
     const [adminToast, setAdminToast] = useState<string>('');
     const [connectorStatuses, setConnectorStatuses] = useState<
@@ -1899,6 +1915,14 @@ const AdminWidget: React.FC = () => {
         const timer = setInterval(fetchConfig, 2000);
         return () => clearInterval(timer);
     }, []);
+
+    useEffect(() => {
+        const expiresAt = Number(config?.giftLearning?.expiresAt || 0);
+        if (!config?.giftLearning?.active || expiresAt <= Date.now()) return;
+        setGiftLearningNow(Date.now());
+        const timer = setInterval(() => setGiftLearningNow(Date.now()), 1000);
+        return () => clearInterval(timer);
+    }, [config?.giftLearning?.active, config?.giftLearning?.expiresAt]);
 
     useEffect(() => {
         if (!config || !config.config) return;
@@ -2590,6 +2614,70 @@ const AdminWidget: React.FC = () => {
         }));
     };
 
+    const assignLearnedGift = (tier: GiftRequestTier, gift: LearnedGift) => {
+        setConfig((prev: any) => ({
+            ...prev,
+            config: {
+                ...prev.config,
+                GiftRequestRequirements: {
+                    ...(prev.config.GiftRequestRequirements || {}),
+                    [tier]: {
+                        giftName: gift.giftName || '',
+                        giftId: gift.giftId || ''
+                    }
+                }
+            }
+        }));
+        const tierLabel = GIFT_REQUEST_TIER_OPTIONS.find(item => item.key === tier)?.label || tier;
+        showAdminToast(`✅ 已将“${gift.giftName || `礼物 ID ${gift.giftId}`}”设为${tierLabel}的点歌礼物`);
+    };
+
+    const clearGiftRequestRequirement = (tier: GiftRequestTier) => {
+        setConfig((prev: any) => ({
+            ...prev,
+            config: {
+                ...prev.config,
+                GiftRequestRequirements: {
+                    ...(prev.config.GiftRequestRequirements || {}),
+                    [tier]: { giftName: '', giftId: '' }
+                }
+            }
+        }));
+    };
+
+    const handleGiftLearningAction = async (
+        action: 'start' | 'stop' | 'clear-cache'
+    ) => {
+        try {
+            const response = await fetch('http://127.0.0.1:5555/api/gifts/learning', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action })
+            });
+            const result = await response.json();
+            if (!response.ok || result.success === false) {
+                throw new Error(result.message || '礼物监听操作失败');
+            }
+            const giftLearning: GiftLearningState = {
+                active: result.active === true,
+                startedAt: result.startedAt ?? null,
+                expiresAt: result.expiresAt ?? null,
+                capturedGifts: Array.isArray(result.capturedGifts) ? result.capturedGifts : [],
+                knownGifts: Array.isArray(result.knownGifts) ? result.knownGifts : []
+            };
+            setGiftLearningNow(Date.now());
+            setConfig((previous: any) => previous ? ({
+                ...previous,
+                giftLearning
+            }) : previous);
+            if (action === 'start') showAdminToast('🎁 已开始监听，请在 60 秒内向直播间投喂要设置的礼物');
+            else if (action === 'stop') showAdminToast('已停止礼物监听，捕获结果仍可继续选择');
+            else showAdminToast('已清空本地礼物缓存');
+        } catch (error: unknown) {
+            showAdminToast(`❌ ${error instanceof Error ? error.message : '礼物监听操作失败'}`);
+        }
+    };
+
     const addSuperUser = () => {
         if(!superUserInput.trim()) return;
         const currentSu = config.config.SuperUsers || [];
@@ -2743,6 +2831,25 @@ const AdminWidget: React.FC = () => {
             || playerControlNotice.testedPlayerVersion
         : '';
     const playerAccessBlocked = playerControlNotice?.kind === 'process-access';
+    const giftLearning = (config?.giftLearning || {
+        active: false,
+        startedAt: null,
+        expiresAt: null,
+        capturedGifts: [],
+        knownGifts: []
+    }) as GiftLearningState;
+    const giftLearningRemainingSeconds = Math.max(
+        0,
+        Math.ceil((Number(giftLearning.expiresAt || 0) - giftLearningNow) / 1000)
+    );
+    const giftLearningActive = giftLearning.active && giftLearningRemainingSeconds > 0;
+    const knownGifts = Array.isArray(giftLearning.knownGifts)
+        ? giftLearning.knownGifts
+        : [];
+    const capturedGiftKeys = new Set(
+        (Array.isArray(giftLearning.capturedGifts) ? giftLearning.capturedGifts : [])
+            .map(gift => gift.giftId ? `id:${gift.giftId}` : `name:${gift.giftName}`)
+    );
 
     return (
         <div className="admin-widget-root animate-fade-in text-gray-200 flex flex-col font-sans select-none w-full h-screen overflow-hidden" style={{ backgroundColor: '#0d1117' }}>
@@ -3834,14 +3941,109 @@ const AdminWidget: React.FC = () => {
                                     </div>
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-pink-500/20 space-y-5 mb-6">
-                                        <div className="border-b border-white/10 pb-3">
-                                            <h3 className="text-sm font-bold text-pink-400 uppercase tracking-widest">🎁 礼物点歌次数</h3>
-                                            <p className="text-xs text-gray-500 mt-2 leading-relaxed">
-                                                可为每档观众指定礼物。每送出 1 个匹配礼物增加 1 次点歌，连续赠送 10 个就增加 10 次；只有歌曲成功加入队列或进入播放后才扣除 1 次。名称和 ID 任一匹配即可，两项都留空表示该档无需礼物。
-                                            </p>
-                                            <p className="text-xs text-pink-300/70 mt-1.5">
-                                                点歌次数仅在本次点歌机运行期间保留；超级用户不受此限制。
-                                            </p>
+                                        <div className="border-b border-white/10 pb-3 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                                            <div>
+                                                <h3 className="text-sm font-bold text-pink-400 uppercase tracking-widest">🎁 礼物点歌次数</h3>
+                                                <p className="text-xs text-gray-500 mt-2 leading-relaxed">
+                                                    可为每档观众指定礼物。每送出 1 个匹配礼物增加 1 次点歌，连续赠送 10 个就增加 10 次；只有歌曲成功加入队列或进入播放后才扣除 1 次。
+                                                </p>
+                                                <p className="text-xs text-pink-300/70 mt-1.5">
+                                                    有礼物 ID 时会按 ID 精确匹配；只有未填写 ID 时才按名称兜底。两项都留空表示该档无需礼物，点歌次数仅在本次运行期间保留；超级用户不受此限制。
+                                                </p>
+                                            </div>
+                                            <div className="flex flex-wrap gap-2 shrink-0">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => void handleGiftLearningAction(giftLearningActive ? 'stop' : 'start')}
+                                                    className={`px-4 py-2 rounded-lg text-xs font-bold border transition-colors ${giftLearningActive
+                                                        ? 'border-pink-400/50 bg-pink-500/20 text-pink-200 hover:bg-pink-500/30'
+                                                        : 'border-pink-500/30 bg-pink-600 text-white hover:bg-pink-500'
+                                                    }`}
+                                                >
+                                                    {giftLearningActive
+                                                        ? `⏹ 停止监听（${giftLearningRemainingSeconds} 秒）`
+                                                        : '🎧 开始监听礼物'}
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    disabled={knownGifts.length === 0}
+                                                    onClick={() => void handleGiftLearningAction('clear-cache')}
+                                                    className="px-3 py-2 rounded-lg text-xs border border-white/10 bg-black/20 text-gray-400 hover:text-white hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                                                >
+                                                    清空缓存
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <div className={`rounded-xl border p-4 transition-colors ${giftLearningActive
+                                            ? 'border-pink-400/40 bg-pink-500/10'
+                                            : 'border-white/10 bg-black/20'
+                                        }`}>
+                                            <div className="flex items-start gap-3">
+                                                <div className={`mt-0.5 h-3 w-3 rounded-full shrink-0 ${giftLearningActive
+                                                    ? 'bg-pink-400 animate-pulse shadow-[0_0_12px_rgba(244,114,182,0.8)]'
+                                                    : 'bg-gray-600'
+                                                }`} />
+                                                <div className="min-w-0 flex-1">
+                                                    <div className="text-sm font-bold text-gray-200">
+                                                        {giftLearningActive ? '正在等待直播间投喂礼物…' : '礼物学习模式'}
+                                                    </div>
+                                                    <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+                                                        点击开始后，在 60 秒内向当前直播间投喂想要设置的礼物。点歌机只缓存礼物名称、ID、数量和出现时间，不保存送礼人的账号信息。
+                                                    </p>
+                                                </div>
+                                            </div>
+
+                                            {knownGifts.length > 0 ? (
+                                                <div className="mt-4 space-y-2 max-h-72 overflow-y-auto pr-1">
+                                                    {knownGifts.map(gift => {
+                                                        const giftKey = gift.giftId
+                                                            ? `id:${gift.giftId}`
+                                                            : `name:${gift.giftName}`;
+                                                        const capturedNow = capturedGiftKeys.has(giftKey);
+                                                        const displayName = gift.giftName || `礼物 ID ${gift.giftId}`;
+                                                        return (
+                                                            <div key={giftKey} className="rounded-lg border border-white/10 bg-black/30 p-3 flex flex-col gap-3 xl:flex-row xl:items-center">
+                                                                <div className="flex items-center gap-3 min-w-0 xl:flex-1">
+                                                                    <div className="h-10 w-10 rounded-lg bg-pink-500/15 border border-pink-400/20 grid place-items-center text-xl shrink-0">🎁</div>
+                                                                    <div className="min-w-0">
+                                                                        <div className="flex flex-wrap items-center gap-2">
+                                                                            <span className="text-sm font-bold text-white truncate">{displayName}</span>
+                                                                            {capturedNow && (
+                                                                                <span className="rounded-full bg-pink-500/20 px-2 py-0.5 text-[10px] font-bold text-pink-300">刚刚捕获</span>
+                                                                            )}
+                                                                        </div>
+                                                                        <div className="mt-1 text-[11px] text-gray-500 flex flex-wrap gap-x-3 gap-y-1">
+                                                                            <span>{gift.giftId ? `ID ${gift.giftId}` : '该事件未提供礼物 ID'}</span>
+                                                                            <span>最近 ×{gift.lastQuantity || 1}</span>
+                                                                            <span>{gift.lastSeenAt ? new Date(gift.lastSeenAt).toLocaleString('zh-CN') : '时间未知'}</span>
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                                <div className="flex flex-wrap gap-1.5 xl:justify-end">
+                                                                    {GIFT_REQUEST_TIER_OPTIONS.map(tier => (
+                                                                        <button
+                                                                            key={tier.key}
+                                                                            type="button"
+                                                                            onClick={() => assignLearnedGift(tier.key, gift)}
+                                                                            className="rounded-md border border-white/10 bg-white/5 px-2.5 py-1.5 text-[11px] font-bold text-gray-300 hover:border-pink-400/40 hover:bg-pink-500/15 hover:text-white transition-colors"
+                                                                            title={`设为${tier.label}获得一次点歌机会所需的礼物`}
+                                                                        >
+                                                                            设为{tier.label}
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            ) : (
+                                                <div className="mt-4 rounded-lg border border-dashed border-white/10 px-4 py-5 text-center text-xs text-gray-500">
+                                                    {giftLearningActive
+                                                        ? '还没有捕获到礼物，请在直播间投喂一次。'
+                                                        : '暂时没有缓存的礼物，点击“开始监听礼物”进行学习。'}
+                                                </div>
+                                            )}
                                         </div>
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                             {GIFT_REQUEST_TIER_OPTIONS.map(tier => {
@@ -3851,7 +4053,27 @@ const AdminWidget: React.FC = () => {
                                                 };
                                                 return (
                                                     <div key={tier.key} className="bg-black/25 border border-white/5 rounded-xl p-4 space-y-3">
-                                                        <div className={`text-sm font-bold ${tier.accent}`}>{tier.label}</div>
+                                                        <div className="flex items-start justify-between gap-3">
+                                                            <div>
+                                                                <div className={`text-sm font-bold ${tier.accent}`}>{tier.label}</div>
+                                                                <div className="text-[11px] text-gray-500 mt-1">
+                                                                    {requirement.giftId
+                                                                        ? `当前：${requirement.giftName || '礼物'}（ID ${requirement.giftId}）`
+                                                                        : requirement.giftName
+                                                                            ? `当前：${requirement.giftName}（按名称兜底）`
+                                                                            : '当前：无需礼物'}
+                                                                </div>
+                                                            </div>
+                                                            {(requirement.giftName || requirement.giftId) && (
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => clearGiftRequestRequirement(tier.key)}
+                                                                    className="text-[11px] text-gray-500 hover:text-pink-300"
+                                                                >
+                                                                    设为无需礼物
+                                                                </button>
+                                                            )}
+                                                        </div>
                                                         <div>
                                                             <label className="block text-[11px] text-gray-500 mb-1.5">礼物名称</label>
                                                             <input
@@ -3868,7 +4090,7 @@ const AdminWidget: React.FC = () => {
                                                             />
                                                         </div>
                                                         <div>
-                                                            <label className="block text-[11px] text-gray-500 mb-1.5">礼物 ID（可选）</label>
+                                                            <label className="block text-[11px] text-gray-500 mb-1.5">礼物 ID（优先精确匹配）</label>
                                                             <input
                                                                 type="text"
                                                                 inputMode="numeric"

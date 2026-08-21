@@ -41,31 +41,34 @@ test('suggests upgrading QQ Music 21.21 after playback controls fail', () => {
       ...base,
       playerKey: 'qqmusic',
       playerVersion: '21.21',
-      testedPlayerVersion: '22.22 / 22.41 / 22.51',
+      testedPlayerVersion: '22.22 / 22.41 / 22.51 / 22.52',
       command
     });
     assert.equal(hint?.code, 'qqmusic-player-update-suggested');
     assert.equal(hint?.playerName, 'QQ 音乐');
     assert.equal(hint?.currentVersion, '21.21');
-    assert.equal(hint?.testedPlayerVersion, '22.22 / 22.41 / 22.51');
+    assert.equal(
+      hint?.testedPlayerVersion,
+      '22.22 / 22.41 / 22.51 / 22.52'
+    );
     assert.equal(hint?.blockedCommand, command);
   }
 });
 
 test('does not mistake supported QQ Music failures for an old version', () => {
-  for (const playerVersion of ['22.22', '22.41', '22.51', '23.1']) {
+  for (const playerVersion of ['22.22', '22.41', '22.51', '22.52', '23.1']) {
     assert.equal(buildPlayerUpgradeHint({
       ...base,
       playerKey: 'qqmusic',
       playerVersion,
-      testedPlayerVersion: '22.22 / 22.41 / 22.51'
+      testedPlayerVersion: '22.22 / 22.41 / 22.51 / 22.52'
     }), null);
   }
   assert.equal(buildPlayerUpgradeHint({
     ...base,
     playerKey: 'qqmusic',
     playerVersion: '22.51',
-    testedPlayerVersion: '22.22 / 22.41 / 22.51',
+    testedPlayerVersion: '22.22 / 22.41 / 22.51 / 22.52',
     failureCode: 'process-access-denied'
   }), null);
 });

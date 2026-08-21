@@ -6,6 +6,10 @@ import {
   type ConnectorUpdateStatus,
   type NativeConnectorId
 } from './connector-updater';
+import { ConnectorLifecycleGate } from './connector-lifecycle-gate';
+
+const CONNECTOR_SHUTDOWN_DRAIN_TIMEOUT_MS = 25_000;
+const CONNECTOR_FORCE_EXIT_TIMEOUT_MS = 2_000;
 
 export interface PlayerTrack {
   id: string;
@@ -81,8 +85,8 @@ export class PlayerBridgeClient {
   private stdoutBuffer = '';
   private stopping = false;
   private startPromise: Promise<void> | null = null;
-  private startingPlayer: NativeConnectorId | null = null;
   private lifecycleGeneration = 0;
+  private readonly lifecycleGate = new ConnectorLifecycleGate();
   private readonly updater: ConnectorUpdater;
 
   constructor(
@@ -102,34 +106,32 @@ export class PlayerBridgeClient {
   }
 
   async start(player: NativeConnectorId): Promise<void> {
-    if (this.running && this.activePlayer === player) return;
-
-    const inFlight = this.startPromise;
-    if (inFlight) {
-      if (this.startingPlayer === player) {
-        return inFlight;
-      }
+    await this.lifecycleGate.waitForStop();
+    let inFlight = this.startPromise;
+    while (inFlight) {
       try {
         await inFlight;
       } catch {
-        // The new selection still gets its own connection attempt below.
+        // This caller gets its own connection attempt after the prior start
+        // has completely unwound.
       }
-      if (this.running && this.activePlayer === player) return;
+      await this.lifecycleGate.waitForStop();
+      inFlight = this.startPromise;
     }
 
+    if (this.running && this.activePlayer === player) return;
     if (this.running) {
       await this.stop();
+      return this.start(player);
     }
     const generation = this.lifecycleGeneration;
     const start = this.startInternal(player, generation)
       .finally(() => {
         if (this.startPromise === start) {
           this.startPromise = null;
-          this.startingPlayer = null;
         }
       });
     this.startPromise = start;
-    this.startingPlayer = player;
     return start;
   }
 
@@ -153,6 +155,9 @@ export class PlayerBridgeClient {
     this.activeFeatures.clear();
     const connectorEnvironment =
       await this.updater.getLaunchEnvironment(player);
+    if (generation !== this.lifecycleGeneration || this.stopping) {
+      throw new Error('连接器启动已取消');
+    }
     const child = spawn(executable, [], {
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -189,6 +194,9 @@ export class PlayerBridgeClient {
     });
 
     const ping = await this.request({ action: 'ping' }, 5000);
+    if (generation !== this.lifecycleGeneration || this.stopping) {
+      throw new Error('连接器启动已取消');
+    }
     if (
       ping?.connectorId
       && (
@@ -222,6 +230,9 @@ export class PlayerBridgeClient {
         this.activeFeatures.delete('snapshot-events-v1');
         this.onLog('[播放器桥] 实时事件订阅不可用，已回退到状态轮询');
       }
+    }
+    if (generation !== this.lifecycleGeneration || this.stopping) {
+      throw new Error('连接器启动已取消');
     }
   }
 
@@ -259,29 +270,64 @@ export class PlayerBridgeClient {
   }
 
   async stop(): Promise<void> {
+    if (this.lifecycleGate.stopping) {
+      return this.lifecycleGate.waitForStop();
+    }
     this.lifecycleGeneration++;
     const child = this.process;
     if (!child) return;
 
+    const stoppingPlayer = this.activePlayer;
     this.stopping = true;
-    try {
-      await this.request({ action: 'shutdown' }, 1500);
-      if (!await this.waitForExit(child, 2000)) {
-        child.kill();
-        await this.waitForExit(child, 1000);
+    return this.lifecycleGate.runStop(async () => {
+      const shutdownStartedAt = Date.now();
+      let shutdownError: unknown = null;
+      try {
+        try {
+          await this.request(
+            { action: 'shutdown' },
+            CONNECTOR_SHUTDOWN_DRAIN_TIMEOUT_MS
+          );
+        } catch (error) {
+          shutdownError = error;
+        }
+
+        const remainingDrainMs = Math.max(
+          0,
+          CONNECTOR_SHUTDOWN_DRAIN_TIMEOUT_MS
+            - (Date.now() - shutdownStartedAt)
+        );
+        if (!await this.waitForExit(child, remainingDrainMs)) {
+          const detail = shutdownError instanceof Error
+            ? `（${shutdownError.message}）`
+            : '';
+          this.onLog(
+            `[播放器桥] ${stoppingPlayer || '当前'}连接器在 `
+            + `${CONNECTOR_SHUTDOWN_DRAIN_TIMEOUT_MS / 1000} 秒内未完成清理，`
+            + `正在强制结束${detail}。若随后控制异常，请完全退出并重启播放器。`
+          );
+          child.kill();
+          if (!await this.waitForExit(child, CONNECTOR_FORCE_EXIT_TIMEOUT_MS)) {
+            this.onLog(
+              `[播放器桥] ${stoppingPlayer || '当前'}连接器强制结束后仍未退出`
+            );
+          }
+        } else if (shutdownError instanceof Error) {
+          this.onLog(
+            `[播放器桥] ${stoppingPlayer || '当前'}连接器已退出，`
+            + `但未收到完整清理确认：${shutdownError.message}`
+          );
+        }
+      } finally {
+        if (this.process === child) {
+          this.process = null;
+          this.activePlayer = null;
+          this.activeCapabilities = null;
+          this.activeFeatures.clear();
+          this.rejectAll(new Error('播放器桥已停止'));
+        }
       }
-    } catch {
-      child.kill();
-      await this.waitForExit(child, 1000);
-    } finally {
-      if (this.process === child) {
-        this.process = null;
-        this.activePlayer = null;
-        this.activeCapabilities = null;
-        this.activeFeatures.clear();
-        this.rejectAll(new Error('播放器桥已停止'));
-      }
-    }
+    });
   }
 
   async probe(player: NativeConnectorId): Promise<PlayerSnapshot> {

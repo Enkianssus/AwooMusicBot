@@ -32,6 +32,7 @@ import {
   NeteaseUpdateProcessController,
   type NeteaseUpdateProcessSession
 } from './netease-update-process';
+import { buildConnectorGitHubReleaseUrl } from './connector-release-url';
 
 export type NativeConnectorId =
   | 'netease'
@@ -1578,16 +1579,6 @@ function isPathInside(parent: string, target: string): boolean {
     : value;
   const parentPath = normalize(`${path.resolve(parent)}${path.sep}`);
   return normalize(path.resolve(target)).startsWith(parentPath);
-}
-
-function buildConnectorGitHubReleaseUrl(
-  connectorId: NativeConnectorId,
-  version: string,
-  asset: string
-): string {
-  const tag = `${connectorId}-v${version}`;
-  return 'https://github.com/Enkianssus/BiliNCM-Connectors/releases/download/'
-    + `${encodeURIComponent(tag)}/${encodeURIComponent(asset)}`;
 }
 
 function compareVersions(left: string, right: string): number {

@@ -128,3 +128,39 @@ test('all newly built connector assemblies use Awoo executable names', () => {
     );
   }
 });
+
+test('connector proxy uses the renamed repository without changing public contracts', () => {
+  const workerSource = fs.readFileSync(
+    path.join(connectorRoot, 'cloudflare', 'appdownload', 'worker.js'),
+    'utf8'
+  );
+  assert.match(
+    workerSource,
+    /const CONNECTOR_REPO = 'Enkianssus\/awoo-connectors';/
+  );
+  assert.doesNotMatch(
+    workerSource,
+    /Enkianssus\/BiliNCM-Connectors/
+  );
+  assert.match(
+    workerSource,
+    /\/connectors\/v1\/catalog\.json/
+  );
+  assert.match(
+    workerSource,
+    /qqmusic-profiles-v\$\{version\}/
+  );
+  assert.match(
+    workerSource,
+    /\$\{connectorId\}-v\$\{version\}/
+  );
+
+  for (const fileName of ['catalog.json', 'qqmusic-profile-catalog.json']) {
+    const catalog = JSON.parse(fs.readFileSync(
+      path.join(connectorRoot, fileName),
+      'utf8'
+    ));
+    assert.equal(catalog.repository, 'Enkianssus/awoo-connectors');
+    assert.equal(catalog.publicKeyId, 'bilincm-connectors-2026-01');
+  }
+});

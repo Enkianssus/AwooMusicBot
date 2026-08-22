@@ -14,6 +14,7 @@ import {
     buildNeteaseConnectorSuccessMessage,
     shouldWaitForConnectorPlayer
 } from './connector-update-feedback-policy';
+import { internalApiUrl } from './internal-api';
 
 // ==========================================
 // 0. 环境检测
@@ -636,7 +637,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppe
             };
 
             lastSyncTimeRef.current = timestamp;
-            fetch('http://127.0.0.1:5555/api/config', {
+            fetch(internalApiUrl('/api/config'), {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ widgetStyle: widgetStyleToSave })
             }).catch(()=>{});
@@ -660,7 +661,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppe
     useEffect(() => {
         const fetchData = async () => {
             try {
-                const res = await fetch('http://127.0.0.1:5555/data');
+                const res = await fetch(internalApiUrl('/data'));
                 if (!res.ok) throw new Error("Network response was not ok");
                 const json: any = await res.json();
 
@@ -724,7 +725,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppe
         if (!isElectron || actionLock) return;
         triggerActionLock();
         try {
-            await fetch('http://127.0.0.1:5555/api/queue/action', {
+            await fetch(internalApiUrl('/api/queue/action'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action, ...payload })
@@ -828,7 +829,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppe
         e?.stopPropagation?.();
         triggerActionLock();
         try {
-            await fetch('http://127.0.0.1:5555/api/state/toggle', { method: 'POST' });
+            await fetch(internalApiUrl('/api/state/toggle'), { method: 'POST' });
             setAccepting(!accepting);
         } catch(err) { console.error(err); }
     };
@@ -838,14 +839,14 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppe
         e?.stopPropagation?.();
         triggerActionLock();
         try {
-            await fetch('http://127.0.0.1:5555/api/state/toggle_play', { method: 'POST' });
+            await fetch(internalApiUrl('/api/state/toggle_play'), { method: 'POST' });
             setPlaying(!playing);
         } catch(err) { console.error(err); }
     };
 
     const handleWindowClose = () => {
         if (isElectron) electronAPI?.closeWindow();
-        else { fetch('http://127.0.0.1:5555/api/exit', { method: 'POST' }); window.close(); }
+        else { fetch(internalApiUrl('/api/exit'), { method: 'POST' }); window.close(); }
     };
 
     const handleWindowMinimize = () => {
@@ -1413,7 +1414,7 @@ const AdminWidget: React.FC = () => {
             const results = await Promise.all(ids.map(async id => {
                 try {
                     const response = await fetch(
-                        `http://127.0.0.1:5555/api/feedback/status?id=${encodeURIComponent(id)}`,
+                        `${internalApiUrl('/api/feedback/status')}?id=${encodeURIComponent(id)}`,
                         { cache: 'no-store' }
                     );
                     const result = await response.json();
@@ -1516,7 +1517,7 @@ const AdminWidget: React.FC = () => {
             clearTimeout(appearanceSaveTimerRef.current);
         }
         appearanceSaveTimerRef.current = setTimeout(() => {
-            fetch('http://127.0.0.1:5555/api/config', {
+            fetch(internalApiUrl('/api/config'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ widgetStyle: nextWidgetStyle })
@@ -1540,7 +1541,7 @@ const AdminWidget: React.FC = () => {
 
     const loadOverlayMods = useCallback(async () => {
         try {
-            const response = await fetch('http://127.0.0.1:5555/api/overlays');
+            const response = await fetch(internalApiUrl('/api/overlays'));
             const result = await response.json();
             if (!response.ok || !result.success) {
                 throw new Error(result.message || '读取 Mod UI 列表失败');
@@ -1585,7 +1586,7 @@ const AdminWidget: React.FC = () => {
             pendingOverlaySettingsRef.current = null;
             if (!next) return;
             try {
-                const response = await fetch('http://127.0.0.1:5555/api/overlays/settings', {
+                const response = await fetch(internalApiUrl('/api/overlays/settings'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(next)
@@ -1608,7 +1609,7 @@ const AdminWidget: React.FC = () => {
         }
         pendingOverlaySettingsRef.current = null;
         try {
-            const response = await fetch('http://127.0.0.1:5555/api/overlays/settings', {
+            const response = await fetch(internalApiUrl('/api/overlays/settings'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ id, reset: true })
@@ -1630,7 +1631,7 @@ const AdminWidget: React.FC = () => {
         try {
             const suffix = forceRefresh ? '?refresh=1' : '';
             const response = await fetch(
-                `http://127.0.0.1:5555/api/connectors/status${suffix}`
+                `${internalApiUrl('/api/connectors/status')}${suffix}`
             );
             const result = await response.json();
             if (!result.success) {
@@ -1724,7 +1725,7 @@ const AdminWidget: React.FC = () => {
         setOverlayBusy(true);
         try {
             const response = await fetch(
-                'http://127.0.0.1:5555/api/overlays/install-url',
+                internalApiUrl('/api/overlays/install-url'),
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1770,7 +1771,7 @@ const AdminWidget: React.FC = () => {
         setOverlayBusy(true);
         try {
             const response = await fetch(
-                'http://127.0.0.1:5555/api/overlays/install-zip',
+                internalApiUrl('/api/overlays/install-zip'),
                 {
                     method: 'POST',
                     headers: {
@@ -1802,7 +1803,7 @@ const AdminWidget: React.FC = () => {
         setOverlayBusy(true);
         try {
             const response = await fetch(
-                'http://127.0.0.1:5555/api/overlays/activate',
+                internalApiUrl('/api/overlays/activate'),
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1828,7 +1829,7 @@ const AdminWidget: React.FC = () => {
         setOverlayBusy(true);
         try {
             const response = await fetch(
-                'http://127.0.0.1:5555/api/overlays/remove',
+                internalApiUrl('/api/overlays/remove'),
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1858,7 +1859,7 @@ const AdminWidget: React.FC = () => {
             ExternalWebSocketEnabled: true
         };
         try {
-            const response = await fetch('http://127.0.0.1:5555/api/config', {
+            const response = await fetch(internalApiUrl('/api/config'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ sysConfig: nextSysConfig })
@@ -1888,7 +1889,7 @@ const AdminWidget: React.FC = () => {
     useEffect(() => {
         const fetchConfig = async () => {
             try {
-                const res = await fetch('http://127.0.0.1:5555/api/config');
+                const res = await fetch(internalApiUrl('/api/config'));
                 const json = await res.json();
 
                 setConfig((prev: any) => {
@@ -1939,7 +1940,7 @@ const AdminWidget: React.FC = () => {
 
         const timer = setTimeout(() => {
             lastConfigString.current = currentStr;
-            fetch('http://127.0.0.1:5555/api/config', {
+            fetch(internalApiUrl('/api/config'), {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ sysConfig: config.config })
@@ -1955,7 +1956,7 @@ const AdminWidget: React.FC = () => {
         if (activeTab !== 'login') return;
         const fetchQr = async () => {
             try {
-                const res = await fetch('http://127.0.0.1:5555/api/bili/qrstatus');
+                const res = await fetch(internalApiUrl('/api/bili/qrstatus'));
                 const json = await res.json();
                 setQrState({ loading: false, base64: json.qrBase64, message: json.status });
                 if (json.isLogin) {
@@ -1977,7 +1978,7 @@ const AdminWidget: React.FC = () => {
     useEffect(() => {
         const fetchLogs = async () => {
             try {
-                const res = await fetch('http://127.0.0.1:5555/api/logs');
+                const res = await fetch(internalApiUrl('/api/logs'));
                 const json = await res.json();
                 setSysLogs(json);
             } catch {}
@@ -2027,7 +2028,7 @@ const AdminWidget: React.FC = () => {
         const rid = parseInt(roomIdInput);
         if (!rid) return showAdminToast("❌ 请输入正确的房间号");
         try {
-            const res = await fetch('http://127.0.0.1:5555/api/room', {
+            const res = await fetch(internalApiUrl('/api/room'), {
                 method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ roomId: rid })
             });
             const json = await res.json();
@@ -2044,7 +2045,7 @@ const AdminWidget: React.FC = () => {
             await new Promise(resolve => setTimeout(resolve, 350));
             try {
                 const response = await fetch(
-                    'http://127.0.0.1:5555/api/config'
+                    internalApiUrl('/api/config')
                 );
                 const latest = await response.json();
                 if (latest.playerConnected === true) {
@@ -2073,7 +2074,7 @@ const AdminWidget: React.FC = () => {
             playerSnapshot: null
         }) : prev);
         try {
-            const res = await fetch('http://127.0.0.1:5555/api/sys/reconnect_player', { method: 'POST' });
+            const res = await fetch(internalApiUrl('/api/sys/reconnect_player'), { method: 'POST' });
             const json = await res.json();
             const connected = json.success === true
                 || await waitForPlayerConnection();
@@ -2135,7 +2136,7 @@ const AdminWidget: React.FC = () => {
 
         try {
             const response = await fetch(
-                'http://127.0.0.1:5555/api/connectors/update',
+                internalApiUrl('/api/connectors/update'),
                 {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -2214,7 +2215,7 @@ const AdminWidget: React.FC = () => {
 
         try {
             const response = await fetch(
-                'http://127.0.0.1:5555/api/connectors/reinstall',
+                internalApiUrl('/api/connectors/reinstall'),
                 {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -2294,7 +2295,7 @@ const AdminWidget: React.FC = () => {
     const handleUpdateCheck = async () => {
         setUpdateInfo({ checking: true, info: null });
         try {
-            const res = await fetch('http://127.0.0.1:5555/api/update/check');
+            const res = await fetch(internalApiUrl('/api/update/check'));
             const json = await res.json();
             setUpdateInfo({ checking: false, info: json });
 
@@ -2326,7 +2327,7 @@ const AdminWidget: React.FC = () => {
 
         try {
             const response = await fetch(
-                'http://127.0.0.1:5555/api/update/apply',
+                internalApiUrl('/api/update/apply'),
                 { method: 'POST' }
             );
             const result = await response.json();
@@ -2339,7 +2340,7 @@ const AdminWidget: React.FC = () => {
             const pollUpdateStatus = async (): Promise<void> => {
                 try {
                     const statusResponse = await fetch(
-                        'http://127.0.0.1:5555/api/update/status',
+                        internalApiUrl('/api/update/status'),
                         { cache: 'no-store' }
                     );
                     const statusResult = await statusResponse.json();
@@ -2414,14 +2415,14 @@ const AdminWidget: React.FC = () => {
 
     const startQrLogin = async () => {
         setQrState(prev => ({ ...prev, loading: true, base64: '' }));
-        await fetch('http://127.0.0.1:5555/api/bili/qrstart', { method: 'POST' });
+        await fetch(internalApiUrl('/api/bili/qrstart'), { method: 'POST' });
     };
 
     const loadFeedbackDiagnostics = useCallback(async (includeLogs = false) => {
         setFeedbackLoading(true);
         try {
             const response = await fetch(
-                'http://127.0.0.1:5555/api/feedback/diagnostics'
+                internalApiUrl('/api/feedback/diagnostics')
                 + (includeLogs ? '?logs=1' : '')
             );
             const result = await response.json();
@@ -2470,7 +2471,7 @@ const AdminWidget: React.FC = () => {
         setFeedbackResult(null);
         try {
             const response = await fetch(
-                'http://127.0.0.1:5555/api/feedback/submit',
+                internalApiUrl('/api/feedback/submit'),
                 {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -2512,7 +2513,7 @@ const AdminWidget: React.FC = () => {
     const logoutBili = async () => {
         if (!window.confirm('确定退出当前 B站账号吗？本地保存的登录凭据将被清除。')) return;
         try {
-            const res = await fetch('http://127.0.0.1:5555/api/bili/logout', { method: 'POST' });
+            const res = await fetch(internalApiUrl('/api/bili/logout'), { method: 'POST' });
             const result = await res.json();
             if (!res.ok || !result.success) throw new Error('logout failed');
             setConfig((prev: any) => ({ ...prev, biliLogin: false, uid: 0, currentUser: null }));
@@ -2525,14 +2526,14 @@ const AdminWidget: React.FC = () => {
 
     const toggleAccepting = async () => {
         try {
-            await fetch('http://127.0.0.1:5555/api/state/toggle', { method: 'POST' });
+            await fetch(internalApiUrl('/api/state/toggle'), { method: 'POST' });
             setConfig((prev: any) => ({...prev, accepting: !prev.accepting}));
         } catch(err) { console.error(err); }
     };
 
     const togglePlaying = async () => {
         try {
-            await fetch('http://127.0.0.1:5555/api/state/toggle_play', { method: 'POST' });
+            await fetch(internalApiUrl('/api/state/toggle_play'), { method: 'POST' });
             setConfig((prev: any) => ({...prev, playing: !prev.playing}));
         } catch(err) { console.error(err); }
     };
@@ -2540,7 +2541,7 @@ const AdminWidget: React.FC = () => {
     const handleDebugInsert = async () => {
         if(!debugInput.trim()) return showAdminToast("❌ 请输入需要搜索并插入的歌曲名！");
         try {
-            const res = await fetch('http://127.0.0.1:5555/api/debug/insert_next', {
+            const res = await fetch(internalApiUrl('/api/debug/insert_next'), {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ keyword: debugInput })
@@ -2557,7 +2558,7 @@ const AdminWidget: React.FC = () => {
     // ⭐ 增加了错误状态识别 and Toast 拦截提示
     const handleDebugPlayNext = async () => {
         try {
-            const res = await fetch('http://127.0.0.1:5555/api/debug/play_next', { method: 'POST' });
+            const res = await fetch(internalApiUrl('/api/debug/play_next'), { method: 'POST' });
             const json = await res.json();
             if(json.success) showAdminToast(`✅ ${json.message || '切歌指令已成功发送！'}`);
             else showAdminToast(`❌ ${json.message || '切歌失败，播放器拒绝响应或未连接！'}`);
@@ -2649,7 +2650,7 @@ const AdminWidget: React.FC = () => {
         action: 'start' | 'stop' | 'clear-cache'
     ) => {
         try {
-            const response = await fetch('http://127.0.0.1:5555/api/gifts/learning', {
+            const response = await fetch(internalApiUrl('/api/gifts/learning'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action })
@@ -2712,7 +2713,7 @@ const AdminWidget: React.FC = () => {
         showAdminToast("正在切换并自动连接播放器...");
 
         try {
-            const res = await fetch('http://127.0.0.1:5555/api/config', {
+            const res = await fetch(internalApiUrl('/api/config'), {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ sysConfig: nextSysConfig })
@@ -2767,7 +2768,12 @@ const AdminWidget: React.FC = () => {
         { type: 'QQMusic', name: 'QQ 音乐', method: '单实例命令 + 静音守卫', detail: '错误下一首静音、暂停后接管', connectorId: 'qqmusic' },
         { type: 'Folia', name: 'Folia', method: '独立 Stage 连接器', detail: 'HTTP + WebSocket；支持 ID 校验与封面', connectorId: 'folia' }
     ];
-    const classicObsUrl = 'http://localhost:5555/';
+    const classicObsUrl = internalApiUrl('/');
+    const internalApiInfo = config?.internalApi || {};
+    const internalApiRequestedPort = Number(
+        internalApiInfo.configuredPort || config?.config?.InternalApiPort || internalApiInfo.requestedPort || 5555
+    );
+    const internalApiActualPort = Number(internalApiInfo.actualPort || 0);
     const externalApiPort = Number(
         config?.externalApi?.port || config?.config?.ExternalApiPort || 5556
     );
@@ -4174,6 +4180,40 @@ const AdminWidget: React.FC = () => {
                                         </div>
                                     </div>
 
+                                    <div className="bg-white/5 p-6 rounded-xl border border-violet-500/20 space-y-5 mb-6">
+                                        <div className="border-b border-white/10 pb-3">
+                                            <h3 className="text-sm font-bold text-violet-300 uppercase tracking-widest">🖥️ 内部控制服务</h3>
+                                            <p className="text-xs text-gray-500 mt-2">控制面板和经典 OBS 页面使用的本机服务。默认端口 5555；修改后需要重启点歌机。端口被占用时会自动选择可用端口。</p>
+                                        </div>
+                                        <div className="flex flex-wrap items-end gap-3">
+                                            <div>
+                                                <label className="block text-xs text-gray-400 mb-2">请求端口</label>
+                                                <input
+                                                    type="number"
+                                                    min="1024"
+                                                    max="65535"
+                                                    value={internalApiRequestedPort}
+                                                    onChange={e => setConfig({...config, config: {...config.config, InternalApiPort: parseInt(e.target.value) || 5555}})}
+                                                    className="w-32 bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-violet-500 outline-none"
+                                                />
+                                            </div>
+                                            <button
+                                                onClick={() => setConfig({...config, config: {...config.config, InternalApiPort: 5555}})}
+                                                className="px-3 py-2.5 bg-white/10 hover:bg-white/20 border border-white/10 rounded-lg text-xs text-gray-200"
+                                            >
+                                                恢复默认
+                                            </button>
+                                        </div>
+                                        <div className="text-xs text-gray-400 font-mono break-all">
+                                            当前实际端口：{internalApiActualPort || '未启动'}{internalApiInfo.fallback ? `（启动请求 ${internalApiInfo.requestedPort} 已自动回退）` : ''}<br/>
+                                            经典 OBS 页面：{classicObsUrl}
+                                        </div>
+                                        <div className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3">
+                                            这是主播控制与经典页面的内部服务，不是给观众使用的 Mod UI 接口。端口设置保存后请重启点歌机；重启时如果端口仍被占用，会在运行日志中显示请求端口和实际端口。
+                                            {internalApiInfo.restartRequired && <span className="block mt-1 font-semibold">当前已保存新的请求端口，等待重启生效。</span>}
+                                        </div>
+                                    </div>
+
                                     <div className="bg-white/5 p-6 rounded-xl border border-cyan-500/20 space-y-5 mb-6">
                                         <div className="border-b border-white/10 pb-3">
                                             <h3 className="text-sm font-bold text-cyan-400 uppercase tracking-widest">🔌 外部只读接口</h3>
@@ -4200,7 +4240,7 @@ const AdminWidget: React.FC = () => {
                                             </div>
                                         </div>
                                         <div>
-                                            <label className="block text-xs text-gray-400 mb-2">本地监听端口</label>
+                                            <label className="block text-xs text-gray-400 mb-2">外部只读接口端口（默认 5556）</label>
                                             <input
                                                 type="number"
                                                 min="1024"

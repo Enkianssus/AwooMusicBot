@@ -2,6 +2,7 @@
 
 interface Window {
   electronAPI?: {
+    internalApiOrigin: string;
     openAdmin: (tab?: string) => void;
     openExternal: (url: string) => Promise<void>;
     claimWelcomeHint: (legacyHintWasShown: boolean) => Promise<boolean>;

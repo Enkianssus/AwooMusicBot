@@ -81,7 +81,11 @@ interface FrameworkDependentConnectorPackage extends ConnectorPackageEntry {
   runtimeChannel: '8.0';
 }
 
-interface ConnectorCatalogEntry extends ConnectorPackageEntry {
+interface V2ConnectorPackage extends FrameworkDependentConnectorPackage {
+  deployment: 'framework-dependent';
+}
+
+interface ConnectorCatalogEntryMetadata {
   id: NativeConnectorId;
   version: string;
   protocolVersion: number;
@@ -89,15 +93,62 @@ interface ConnectorCatalogEntry extends ConnectorPackageEntry {
   testedPlayerVersion?: string;
   playerVersionPolicy?: string;
   runtime?: DotnetRuntimeRid;
+}
+
+/**
+ * The v1 catalog shape is kept here so an already installed connector can be
+ * understood when older catalog data is encountered during a repair.  New
+ * 1.1.10 clients never fetch this catalog anymore.
+ */
+interface LegacyConnectorCatalogEntry extends ConnectorCatalogEntryMetadata,
+  ConnectorPackageEntry {
   frameworkDependent?: FrameworkDependentConnectorPackage;
   awooPackage?: ConnectorPackageEntry;
   awooFrameworkDependent?: FrameworkDependentConnectorPackage;
 }
 
+/**
+ * v2 deliberately contains only the signed Awoo framework-dependent package.
+ * Self-contained and legacy package fields are absent by contract.
+ */
+interface SmallOnlyConnectorCatalogEntry extends Omit<
+  ConnectorCatalogEntryMetadata,
+  'runtime'
+> {
+  package: V2ConnectorPackage;
+}
+
+type ConnectorCatalogEntry =
+  | LegacyConnectorCatalogEntry
+  | SmallOnlyConnectorCatalogEntry;
+
 interface ConnectorCatalog {
-  schemaVersion: number;
+  schemaVersion: 1 | 2;
   publicKeyId: string;
   connectors: Partial<Record<NativeConnectorId, ConnectorCatalogEntry>>;
+}
+
+interface FrameworkPackageFields {
+  package?: V2ConnectorPackage;
+  awooFrameworkDependent?: FrameworkDependentConnectorPackage;
+  frameworkDependent?: FrameworkDependentConnectorPackage;
+}
+
+/**
+ * Select the small framework-dependent package used for a new installation.
+ *
+ * The v2 `package` field is preferred.  The Awoo and legacy fields are
+ * intentionally retained as read-only compatibility paths for v1-shaped
+ * catalog data.  Full self-contained packages are not a valid new-install
+ * fallback.
+ */
+export function selectFrameworkDependentConnectorPackage(
+  entry: FrameworkPackageFields
+): FrameworkDependentConnectorPackage | null {
+  return entry.package
+    || entry.awooFrameworkDependent
+    || entry.frameworkDependent
+    || null;
 }
 
 interface ActiveConnector {
@@ -156,12 +207,20 @@ const CONNECTOR_NAMES: Record<NativeConnectorId, string> = {
   qqmusic: 'QQ 音乐',
   folia: 'Folia'
 };
-const CATALOG_URL =
+/**
+ * Frozen endpoint consumed by Awoo MusicBot 1.1.0 through 1.1.9.  It is
+ * exported as a compatibility marker, but the current updater intentionally
+ * does not fall back to it when the v2 endpoint is unavailable.
+ */
+export const LEGACY_CONNECTOR_CATALOG_URL =
   'https://app.enkianss.us/connectors/v1/catalog.json';
+const CATALOG_URL =
+  'https://app.enkianss.us/connectors/v2/catalog.json';
 const QQMUSIC_PROFILE_CATALOG_URL =
   'https://app.enkianss.us/connectors/v1/profiles/qqmusic/catalog.json';
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 const PROTOCOL_VERSION = 1;
+const V2_MINIMUM_CORE_VERSION = '1.1.10';
 const CONNECTOR_VERSION_PATTERN = /^\d+(?:\.\d+){2,4}$/;
 const PUBLIC_KEY_ID = 'bilincm-connectors-2026-01';
 const RELEASE_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
@@ -170,6 +229,7 @@ MCowBQYDK2VwAyEApFy/TMxhGKlxzOS2b1gjvQxnvFhjefK0sbxsCXFS2uc=
 `;
 
 export class ConnectorUpdater {
+  private readonly onLog: (message: string) => void;
   private catalog: ConnectorCatalog | null = null;
   private catalogFetchedAt = 0;
   private readonly updates = new Map<
@@ -182,9 +242,10 @@ export class ConnectorUpdater {
   private readonly neteaseProcessController: NeteaseUpdateProcessController;
 
   constructor(
-    private readonly onLog: (message: string) => void,
+    onLog: (message: string) => void,
     neteaseProcessController?: NeteaseUpdateProcessController
   ) {
+    this.onLog = onLog;
     this.neteaseProcessController = neteaseProcessController
       || new NeteaseUpdateProcessController({ onLog });
   }
@@ -323,7 +384,13 @@ export class ConnectorUpdater {
         if (!entry) {
           throw new Error(`更新清单缺少 ${id} 连接器`);
         }
-        this.validateEntry(id, entry);
+        if (catalog.schemaVersion === 2) {
+          this.validateV2Entry(id, entry);
+        } else {
+          // Keep the v1 validator for repair tooling and old cached data, but
+          // do not fetch v1 as a fallback from the 1.1.10 updater.
+          this.validateEntry(id, entry as LegacyConnectorCatalogEntry);
+        }
         return this.makeStatus(
           id,
           activeConnectors[index],
@@ -632,11 +699,13 @@ export class ConnectorUpdater {
 
       const catalog = await response.json() as ConnectorCatalog;
       if (
-        catalog.schemaVersion !== 1
+        catalog.schemaVersion !== 2
         || catalog.publicKeyId !== PUBLIC_KEY_ID
         || !catalog.connectors
       ) {
-        throw new Error('连接器更新清单格式或签名密钥标识不兼容');
+        throw new Error(
+          '连接器 v2 更新清单格式或签名密钥标识不兼容'
+        );
       }
 
       this.catalog = catalog;
@@ -649,7 +718,7 @@ export class ConnectorUpdater {
 
   private validateEntry(
     connectorId: NativeConnectorId,
-    entry: ConnectorCatalogEntry
+    entry: LegacyConnectorCatalogEntry
   ): void {
     if (
       entry.id !== connectorId
@@ -757,50 +826,118 @@ export class ConnectorUpdater {
     }
   }
 
+  private validateV2Entry(
+    connectorId: NativeConnectorId,
+    entry: ConnectorCatalogEntry
+  ): asserts entry is SmallOnlyConnectorCatalogEntry {
+    const rawEntry = entry as unknown as Record<string, unknown>;
+    const v2Package = 'package' in entry
+      ? entry.package
+      : undefined;
+    const hasLegacyPackageField = [
+      'asset',
+      'size',
+      'sha256',
+      'signature',
+      'downloadUrl',
+      'runtime',
+      'frameworkDependent',
+      'awooPackage',
+      'awooFrameworkDependent'
+    ].some(field => field in rawEntry);
+
+    if (
+      hasLegacyPackageField
+      || entry.id !== connectorId
+      || entry.protocolVersion !== PROTOCOL_VERSION
+      || !CONNECTOR_VERSION_PATTERN.test(entry.version)
+      || !/^\d+\.\d+\.\d+$/.test(entry.minimumCoreVersion)
+      || compareVersions(entry.minimumCoreVersion, V2_MINIMUM_CORE_VERSION) < 0
+      || !(
+        entry.testedPlayerVersion?.trim()
+        || entry.playerVersionPolicy?.trim()
+      )
+      || !v2Package
+      || v2Package.deployment !== 'framework-dependent'
+      || (v2Package.runtime !== 'win-x86' && v2Package.runtime !== 'win-x64')
+      || v2Package.runtimeChannel !== '8.0'
+      || !Number.isSafeInteger(v2Package.size)
+      || v2Package.size <= 0
+      || !/^[a-f0-9]{64}$/i.test(v2Package.sha256)
+      || !v2Package.signature
+      || !v2Package.downloadUrl.startsWith(
+        'https://app.enkianss.us/connectors/v2/download/'
+      )
+      || path.basename(v2Package.asset) !== v2Package.asset
+      || v2Package.asset !== connectorAssetNames(
+        connectorId,
+        entry.version,
+        v2Package.runtime,
+        true
+      )[0]
+      || path.basename(new URL(v2Package.downloadUrl).pathname)
+        !== v2Package.asset
+    ) {
+      throw new Error(
+        `${connectorId} v2 package framework-dependent 连接器清单字段无效`
+      );
+    }
+  }
+
   private async install(
     connectorId: NativeConnectorId,
     entry: ConnectorCatalogEntry,
     forceReinstall = false,
     beforeReplace?: BeforeConnectorReplace
   ): Promise<string> {
-    const framework = entry.awooFrameworkDependent
-      || entry.frameworkDependent;
-    if (framework) {
+    const framework = selectFrameworkDependentConnectorPackage(entry);
+    const v2Package = 'package' in entry
+      ? entry.package
+      : undefined;
+    if (!framework || !v2Package || framework !== v2Package) {
+      throw new Error(
+        `${CONNECTOR_NAMES[connectorId]}更新清单缺少 Framework-dependent 小包，`
+        + '已拒绝下载 SelfContained 完整包；v2 清单只接受 package '
+        + 'framework-dependent 包'
+      );
+    }
+
+    try {
+      const runtimeRoot = await this.getPrivateDotnetRuntime().ensure(
+        framework.runtime,
+        framework.runtimeChannel
+      );
+      const activation: ConnectorPackageActivation = {
+        deployment: 'framework-dependent',
+        runtimeRid: framework.runtime,
+        runtimeRoot
+      };
       try {
-        const runtimeRoot = await this.getPrivateDotnetRuntime().ensure(
-          framework.runtime,
-          framework.runtimeChannel
+        return await this.installPackage(
+          connectorId,
+          entry,
+          framework,
+          activation,
+          forceReinstall,
+          beforeReplace
         );
-        const activation: ConnectorPackageActivation = {
-          deployment: 'framework-dependent',
-          runtimeRid: framework.runtime,
-          runtimeRoot
-        };
-        try {
-          return await this.installPackage(
+      } catch (proxyError: unknown) {
+        if (proxyError instanceof NeteaseProcessControlError) {
+          throw proxyError;
+        }
+        const directPackage: ConnectorPackageEntry = {
+          ...framework,
+          downloadUrl: buildConnectorGitHubReleaseUrl(
             connectorId,
-            entry,
-            framework,
-            activation,
-            forceReinstall,
-            beforeReplace
-          );
-        } catch (proxyError: unknown) {
-          if (proxyError instanceof NeteaseProcessControlError) {
-            throw proxyError;
-          }
-          const directPackage: ConnectorPackageEntry = {
-            ...framework,
-            downloadUrl: buildConnectorGitHubReleaseUrl(
-              connectorId,
-              entry.version,
-              framework.asset
-            )
-          };
-          this.onLog(
-            `[连接器更新] ${connectorId} 本站小体积包下载失败，`
-            + `尝试 GitHub Release 签名资产地址：${getErrorMessage(proxyError)}`
-          );
+            entry.version,
+            framework.asset
+          )
+        };
+        this.onLog(
+          `[连接器更新] ${connectorId} 本站小体积包下载失败，`
+          + `尝试 GitHub Release 签名资产地址：${getErrorMessage(proxyError)}`
+        );
+        try {
           return await this.installPackage(
             connectorId,
             entry,
@@ -810,26 +947,30 @@ export class ConnectorUpdater {
             beforeReplace,
             true
           );
+        } catch (directError: unknown) {
+          if (directError instanceof NeteaseProcessControlError) {
+            throw directError;
+          }
+          throw new Error(
+            `本站小体积包安装失败：${getErrorMessage(proxyError)}；`
+            + `GitHub 签名小体积包安装失败：${getErrorMessage(directError)}`
+          );
         }
-      } catch (error: unknown) {
-        if (error instanceof NeteaseProcessControlError) {
-          throw error;
-        }
-        this.onLog(
-          `[连接器更新] ${connectorId} 小体积包或私有 .NET Runtime 安装失败，`
-          + `自动回退完整包：${getErrorMessage(error)}`
-        );
       }
+    } catch (error: unknown) {
+      if (error instanceof NeteaseProcessControlError) {
+        throw error;
+      }
+      const message = getErrorMessage(error);
+      this.onLog(
+        `[连接器更新] ${connectorId} 小体积包或私有 .NET Runtime 安装失败，`
+        + `未回退完整包：${message}`
+      );
+      throw new Error(
+        `${CONNECTOR_NAMES[connectorId]}连接器 Framework-dependent 更新失败，`
+        + `未下载 SelfContained 完整包：${message}`
+      );
     }
-
-    return this.installPackage(
-      connectorId,
-      entry,
-      entry.awooPackage || entry,
-      { deployment: 'self-contained' },
-      forceReinstall,
-      beforeReplace
-    );
   }
 
   private async installPackage(

@@ -32,11 +32,19 @@ test('the updater keeps the public proxy catalog and download endpoints', () => 
   );
   assert.match(
     updaterSource,
+    /https:\/\/app\.enkianss\.us\/connectors\/v2\/catalog\.json/
+  );
+  assert.match(
+    updaterSource,
     /https:\/\/app\.enkianss\.us\/connectors\/v1\/catalog\.json/
   );
   assert.match(
     updaterSource,
     /https:\/\/app\.enkianss\.us\/connectors\/v1\/download\//
+  );
+  assert.match(
+    updaterSource,
+    /https:\/\/app\.enkianss\.us\/connectors\/v2\/download\//
   );
   assert.doesNotMatch(
     updaterSource,

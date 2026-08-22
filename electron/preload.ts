@@ -1,6 +1,14 @@
 import { ipcRenderer, contextBridge } from 'electron'
 
+let internalApiOrigin = '';
+try {
+  internalApiOrigin = String(ipcRenderer.sendSync('get-internal-api-origin') || '');
+} catch {
+  // 旧版主进程或非 Electron 预览环境没有这个 IPC 时，renderer 会使用当前 origin。
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
+  internalApiOrigin,
   openAdmin: (tab?: string) => ipcRenderer.send('open-admin', tab),
   openExternal: (url: string) => ipcRenderer.invoke('open-external', url),
   claimWelcomeHint: (legacyHintWasShown: boolean) =>

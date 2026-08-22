@@ -41,12 +41,34 @@
   - `https://app.enkianss.us/connectors/v1/catalog.json`
   - `https://app.enkianss.us/connectors/v1/profiles/qqmusic/catalog.json`
   - `https://app.enkianss.us/connectors/v1/download/...`
+- Awoo MusicBot 1.1.10 and newer consume the separate
+  `https://app.enkianss.us/connectors/v2/catalog.json` endpoint.  It uses
+  `schemaVersion: 2`, the same `publicKeyId`, and contains only signed
+  `package` objects with `deployment: framework-dependent`; their download
+  URLs are under
+  `/connectors/v2/download/`; the current client must not silently fall back
+  to the frozen v1 catalog.
 - Keep `publicKeyId` equal to `bilincm-connectors-2026-01` unless performing an
   explicitly planned key rotation with old-client compatibility.
-- Every connector release must retain both Awoo and legacy archive names, in
-  both self-contained and framework-dependent forms. Do not remove legacy
-  catalog fields or `BiliNCM.Connector.*.exe` aliases while supported old cores
-  still consume them.
+- Historical v1 connector Releases retain their existing Awoo/legacy archive
+  names, self-contained/framework-dependent forms, catalog fields, and
+  `BiliNCM.Connector.*.exe` aliases while old cores may consume them. Do not
+  rewrite or delete those immutable v1 assets.
+- Every future v2 connector Release contains exactly three assets: one Awoo
+  framework-dependent ZIP and its `.sig` and `.sha256`; it does not publish
+  legacy or SelfContained archives.
+- Awoo MusicBot 1.1.10 and newer must install only the framework-dependent
+  connector package and its private shared .NET Runtime. Do not reintroduce a
+  SelfContained download fallback into the current client. Existing installed
+  SelfContained connectors must remain launchable and recoverable.
+- Before tagging Awoo MusicBot 1.1.10, push the v2 workflow/catalog/proxy code,
+  seed `catalog-v2.json` from existing signed Awoo framework-dependent assets,
+  and deploy and verify `/connectors/v2/...`. Do not create a new connector
+  revision or Tag solely for this migration. Future connector code updates use
+  the three-asset v2 Release workflow.
+- SelfContained assets remain only in historical v1 Releases and the frozen v1
+  Catalog for Awoo MusicBot 1.1.0-1.1.9 compatibility. Future v2 workflow runs
+  must not add new SelfContained or legacy assets.
 - Do not overwrite an already published version or replace signed Release
   assets. Publish a higher connector revision instead.
 - Raise `minimumCoreVersion` only for a real core protocol/behavior dependency,
@@ -81,10 +103,11 @@
   `npm run build` before tagging. Keep `package.json`, `package-lock.json`, and
   the versioned `build:dev` output directory synchronized.
 - Connectors: build the full solution and run all tests relevant to the changed
-  connector. The Release workflow must also pass both Awoo and legacy smoke
-  tests before assets are accepted.
+  connector. Future v2 Release workflows must pass the Awoo framework-dependent
+  small-package smoke test; they do not publish or smoke-test legacy packages.
 - Worker changes: run `node --check` and `wrangler deploy --dry-run` before a
   production deploy.
-- After release, verify GitHub assets, signatures/hashes, catalog contents,
-  HTTP Range downloads, and compatibility with both a current core and an old
-  core that selects the legacy package.
+- After release, verify the three v2 assets, signatures/hashes, `catalog-v2.json`,
+  HTTP Range downloads, and installation by the current core. Historical v1
+  assets and endpoints remain immutable; a future v2 release does not require
+  reinstalling an old core.

@@ -190,7 +190,8 @@ https://app.enkianss.us/download/awoo
 
 ## 5. 连接器 Release 的固定资产合同
 
-每次连接器 Release 必须生成四个 ZIP：
+已发布的 v1 Release 是不可变的历史兼容资产。每个历史 v1 Release 原本包含
+四个 ZIP 及其签名和哈希，共 12 个资产：
 
 ```text
 awoo-connector-{id}-{version}-{rid}.zip
@@ -199,16 +200,27 @@ bilincm-connector-{id}-{version}-{rid}.zip
 bilincm-connector-{id}-{version}-{rid}-framework-dependent.zip
 ```
 
-其中：
+这些历史资产继续服务 1.1.0–1.1.9，不能覆盖、重打包或删除。未来连接器
+Release 不再沿用这组兼容资产合同；每次未来 Release 必须严格只生成 3 个资产：
+
+```text
+awoo-connector-{id}-{version}-{rid}-framework-dependent.zip
+awoo-connector-{id}-{version}-{rid}-framework-dependent.zip.sig
+awoo-connector-{id}-{version}-{rid}-framework-dependent.zip.sha256
+```
+
+未来 Release 的唯一 ZIP 必须满足：
 
 - Awoo 包使用 `Awoo.Connector.<Player>.exe`。
-- legacy 包使用 `BiliNCM.Connector.<Player>.exe`，供旧版点歌机继续安装。
-- self-contained ZIP 自带所需 .NET Runtime。
+- 不包含 legacy ZIP、self-contained ZIP 或 legacy smoke 目标。
 - framework-dependent ZIP 使用点歌机私有、按架构共享的 .NET 8 Runtime；
-  私有 Runtime 失败时点歌机必须能回退 self-contained 包。
+  1.1.10 起的新客户端只安装该小包。本站代理失败时可以重试同一个签名小包
+  的 GitHub Release 直链，但不得下载 SelfContained 完整包。
+- `.sig` 和 `.sha256` 必须对应唯一 ZIP 的最终字节；签名后不得重新压缩、改内容
+  或覆盖文件。
 
-每个 ZIP 还必须有同名 `.sig` 与 `.sha256`，因此一个连接器 Release 固定为
-12 个资产。签名对象是最终 ZIP 字节；签名后不得重新压缩、改内容或覆盖文件。
+未来 Release 的 v2 Catalog 只记录这个唯一的 `package` 对象。旧版连接器归档和
+旧版 Catalog 字段只存在于历史 v1，不得复制到未来 v2 Release。
 
 必须保持：
 
@@ -225,10 +237,11 @@ publicKeyId = bilincm-connectors-2026-01
 
 - `src/<Player>/BiliNCM.Connector.<Player>.csproj` 的版本。
 - Adapter 的 `TestedVersion`。
-- `scripts/update-catalog.mjs` 的 `playerVersionPolicy` 与
+- v2 Catalog 生成输入中的 `playerVersionPolicy` 与
   `testedPlayerVersion`。
 - 新播放器画像、DLL SHA-256、CEF/API hash 或 Stage API 合约。
-- 若协议字段发生变化，旧 core 和旧 connector 是否仍能忽略可选字段。
+- 若协议字段发生变化，当前 Awoo connector smoke test 与 v2 package metadata
+  是否仍保持一致；历史 v1 Catalog 不随未来 Release 改写。
 
 最低构建验证：
 
@@ -237,14 +250,27 @@ dotnet build .\BiliNCM.Connectors.slnx -c Release
 ```
 
 还要运行与改动相关的 `tests/` PowerShell 规则测试或 .NET 测试 Harness。
-Release workflow 会分别发布 Awoo 与 legacy 版本，并用
-`scripts/smoke-connector.mjs` 验证 `ping`、版本、协议和 `shutdown`；该 smoke
-test 不是功能测试的替代品。
+未来 Release workflow 只发布 Awoo framework-dependent 小包，并运行 Awoo
+小包 smoke test 验证 `ping`、版本、协议和 `shutdown`；该 smoke test 不是
+功能测试的替代品。历史 v1 Release 不重跑、不覆盖，也不要求用未来 workflow
+重新生成 legacy 资产。
 
 ## 7. 连接器上传方式
 
-先把源代码提交推送到连接器仓库 `main`，再在同一个已验证提交上创建
-annotated tag。以 QQ `22.52.2` 为例：
+首次 v2 迁移与 Awoo MusicBot 1.1.10 的发布顺序必须保持：先完成 v2
+Catalog/代理，再发布点歌机本体。迁移使用已经存在且已签名的 Awoo
+framework-dependent 资产，不需要为了迁移虚构新的连接器修订号或 Tag：
+
+1. 将 v2 workflow、Catalog 生成和 Worker/下载代理变更推送到各自已确认的远端
+   分支，并从现有签名 Awoo framework-dependent 资产初始化 `catalog-v2.json`。
+2. 部署并验证 `app.enkianss.us/connectors/v2/catalog.json` 及其 v2 下载代理；
+   确认 Catalog 中 3 个既有资产的哈希、签名和大小一致。
+3. v2 代理和 Catalog 验收通过后，才给 Awoo MusicBot 创建并推送 `v1.1.10`
+   Tag。v2 尚未可用时禁止标记或发布 1.1.10。
+
+只有未来连接器代码确实发生变化时，才将变更推送到仓库 `main` 并创建连接器
+Tag；每次未来 Tag 由 workflow 生成唯一 Awoo 小包 Release 和 3 个资产。以
+QQ `22.52.2` 为例：
 
 ```powershell
 git push origin HEAD:main
@@ -264,17 +290,17 @@ folia-v...
 `.github/workflows/release-connector.yml` 会自动：
 
 1. 从 Tag 解析连接器、版本和 Runtime。
-2. 构建 Awoo/legacy、self-contained/framework-dependent 四个包。
-3. 执行 Awoo 与 legacy smoke test。
-4. 对四个最终 ZIP 计算 SHA-256 并使用 Ed25519 签名。
-5. 创建含 12 个资产的 GitHub Release。
-6. 切回 `origin/main` 并运行 `scripts/update-catalog.mjs`。
-7. 由 `github-actions[bot]` 提交并推送 `catalog.json`。
+2. 只构建一个 Awoo framework-dependent ZIP。
+3. 只执行 Awoo 小包 smoke test。
+4. 对唯一 ZIP 计算 SHA-256 并使用 Ed25519 签名，创建恰好 3 个资产的
+   GitHub Release。
+5. 生成并由 `github-actions[bot]` 提交 `catalog-v2.json`。
 
-不要手工重复创建 Release，也不要手工填写 Catalog 中的哈希、签名、大小或
+不要手工重复创建 Release，也不要手工填写 v2 Catalog 中的哈希、签名、大小或
 下载 URL。多个连接器连续发布时逐个等待完成；虽然 workflow 使用
 `concurrency.group = connector-catalog` 且不会取消前一个任务，但 Release
-出现不代表 Catalog 机器人提交已经完成。
+出现不代表 v2 Catalog 机器人提交已经完成。历史 v1 Release 的旧 Catalog
+机器人记录保持不变，不要让未来 workflow 改写它。
 
 ## 8. QQ 兼容画像发布
 
@@ -313,17 +339,43 @@ bilincm-qqmusic-profiles-<version>.zip
 https://app.enkianss.us/connectors/v1/catalog.json
 https://app.enkianss.us/connectors/v1/profiles/qqmusic/catalog.json
 https://app.enkianss.us/connectors/v1/download/{id}/{version}/{asset}
+https://app.enkianss.us/connectors/v2/catalog.json
+https://app.enkianss.us/connectors/v2/download/{id}/{version}/{asset}
 ```
 
-Catalog 顶层连接器条目保留 legacy 包，`awooPackage` 和
-`awooFrameworkDependent` 提供新命名包：
+v1 是 1.1.0–1.1.9 的冻结兼容合同。其 Catalog 顶层连接器条目保留
+legacy 包，`awooPackage` 和 `awooFrameworkDependent` 提供新命名包；历史 v1
+Release 的 12 个资产保持原样：
 
-- Awoo MusicBot 1.1.7 及以后优先 Awoo 包。
+- Awoo MusicBot 1.1.7–1.1.9 优先 Awoo 包，并保留完整包回退。
 - 更早的点歌机继续读取顶层 legacy 包。
 - 已发布旧二进制不回改、不重新打包，通过稳定的本站 URL、legacy 资产和
   GitHub 旧地址重定向继续兼容。
 
-不得删除 legacy ZIP、legacy Catalog 字段、旧 Tag 或旧 Release。仓库由
+1.1.10 及以后使用独立的 v2 Catalog，不回退到 v1：
+
+- 顶层必须是 `schemaVersion: 2`，`publicKeyId` 仍为
+  `bilincm-connectors-2026-01`。
+- 每个连接器只包含版本、协议、播放器兼容信息和一个签名的 `package` 对象；
+  `package.deployment` 必须为 `framework-dependent`，并在对象内携带
+  `runtime`、`runtimeChannel`、`asset`、`size`、`sha256`、`signature` 和
+  `downloadUrl`。不再包含顶层 `asset`、`size`、`sha256`、`signature`、
+  `downloadUrl`、`runtime`、`frameworkDependent`、`awooPackage` 或
+  `awooFrameworkDependent` 字段。
+- `package.asset` 必须是 Awoo 命名的 framework-dependent ZIP，并且
+  `package.downloadUrl` 必须指向本站 `/connectors/v2/download/` 路径。包仍由
+  私有共享 .NET 8 Runtime 启动；本站失败时只允许重试同一个签名 ZIP 的
+  GitHub Release 直链。
+- v2 条目的 `minimumCoreVersion` 不得低于 `1.1.10`。QQ 音乐画像继续使用
+  独立的 v1 profile Catalog，因为它本身就是小体积资源。
+
+因此，未来停止发布 SelfContained/legacy 大包时，先部署 v2 Worker 路由和只含
+小包的 v2 Catalog，再发布使用 v2 的点歌机；不得在原 v1 Pipeline 或历史
+Release 中删除资产，也不得让新客户端在 v2 不可用时静默回退 v1。若 v2 尚未
+部署，1.1.10 的更新应明确报告 v2 清单 HTTP 错误，而不是下载旧的大包。
+
+不得删除历史 v1 Release、legacy ZIP、legacy Catalog 字段、旧 Tag 或旧
+Release。未来 v2 Release 不再附带这些旧资产。仓库由
 `BiliNCM-Connectors` 改为 `awoo-connectors` 后，不能重新创建或复用旧仓库名，
 否则 GitHub 对旧版硬编码 URL 的重定向会失效。
 
@@ -353,8 +405,9 @@ npx wrangler deploy
 
 - Worker 名称与自定义域名
 - `FEEDBACK_DB` D1 绑定
-- `/connectors/v1/...` 路由
-- Catalog schema 与 `publicKeyId`
+- `/connectors/v1/...` 路由与历史 v1 Catalog schema
+- `/connectors/v2/...` 路由与 `catalog-v2.json` schema
+- 两个 Catalog 的 `publicKeyId`
 
 只有 D1 schema 真正变化时才执行 migration；下载路由、仓库名或页面文案变化
 不需要 D1 migration。Catalog 缓存 TTL 为 300 秒，连接器版本 ZIP 使用长期
@@ -364,17 +417,23 @@ immutable 缓存，因此绝对不能用相同版本号覆盖不同内容。
 
 ### 连接器或 QQ profile
 
-发布只有同时满足以下条件才算完成：
+未来连接器 v2 Release 只有同时满足以下条件才算完成：
 
 1. 对应 GitHub Action 成功。
 2. GitHub Release 已创建。
-3. 连接器有 12 个资产；QQ profile 有 6 个资产。
-4. 所有 ZIP 的 `.sig`、`.sha256` 和 Catalog 数据一致。
-5. `github-actions[bot]` 的 Catalog 提交已经进入 `main`。
-6. `app.enkianss.us` Catalog 在缓存传播后返回新版本。
+3. 连接器 Release 恰好有 3 个资产：一个 Awoo framework-dependent ZIP、同名
+   `.sig` 和 `.sha256`；历史 v1 Release 的 12 个资产不改动。
+4. 三个资产的哈希、签名和 v2 Catalog 数据一致。
+5. `github-actions[bot]` 的 `catalog-v2.json` 提交已经进入 `main`。
+6. `app.enkianss.us` v2 Catalog 在缓存传播后返回新版本。
 7. 本站 ZIP 完整下载可用，`Range: bytes=0-0` 返回 `206`。
-8. 新版点歌机选择 Awoo 包，受支持的旧版点歌机选择 legacy 包并安装成功。
-9. Connector smoke test 返回正确的 `connectorId`、版本与协议版本。
+8. 1.1.10 从 v2 Catalog 选择 `package` framework-dependent 小包且不会下载
+   SelfContained 完整包。
+9. Awoo 小包 smoke test 返回正确的 `connectorId`、版本与协议版本。
+
+QQ profile 仍按独立规则验收：两个 ZIP、各自的 `.sig` 和 `.sha256`，合计 6
+个资产；profile Catalog 继续使用 v1 地址。v2 连接器发布不要求重新安装或
+验收旧版点歌机；旧版兼容性由历史 v1 Release 和 Catalog 的不可变保留保证。
 
 ### 点歌机
 
@@ -386,13 +445,14 @@ immutable 缓存，因此绝对不能用相同版本号覆盖不同内容。
 6. 从上一个稳定版执行一次真实更新，确认安装、重启和版本显示正确。
 
 最终交付报告应列出提交、Tag、Release、Action 和生产代理地址，并明确写出
-测试数量、构建结果以及旧版兼容验收结果。
+测试数量、构建结果、v2 Catalog bot 提交和历史 v1 资产保留结果。
 
 ## 12. 失败处理与回滚
 
 - Action 失败时先保留日志和现场，不要立即删除 Tag 或 Release。
 - 资产已经公开或进入 immutable 缓存后，使用更高版本修复，禁止覆盖原版本。
-- Catalog 机器人提交尚未完成时不要手工抢写 Catalog；先确认 workflow 队列。
+- v2 Catalog 机器人提交尚未完成时不要手工抢写 `catalog-v2.json`；先确认
+  workflow 队列。历史 v1 Catalog 不得被未来 workflow 改写。
 - 坏连接器优先发布更高 connector revision；点歌机本地会保留前一版本用于
   安装失败回滚。
 - 删除 Release、删除 Tag、回退生产 Worker、清 Cloudflare 缓存或重写历史

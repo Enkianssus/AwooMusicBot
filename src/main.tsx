@@ -2,12 +2,15 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App.tsx'
 import './index.css'
+import { internalApiOrigin } from './internal-api'
 
 const originalFetch = window.fetch;
 window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-    // 拦截所有根路径开头的 API 请求，强行重定向到我们的大脑 5555 端口
-    if (typeof input === 'string' && input.startsWith('/')) {
-        input = `http://127.0.0.1:5555${input}`;
+    // Electron 通过安全 preload 提供实际端口；浏览器捕捉页面则使用当前 origin。
+    if (typeof input === 'string' && input.startsWith('/') && internalApiOrigin) {
+        input = `${internalApiOrigin}${input}`;
+    } else if (input instanceof URL && input.origin === window.location.origin && input.pathname.startsWith('/') && internalApiOrigin) {
+        input = new URL(`${internalApiOrigin}${input.pathname}${input.search}${input.hash}`);
     }
     return originalFetch(input, init);
 };

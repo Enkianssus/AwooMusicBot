@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, session, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import http from 'http';
@@ -80,6 +80,15 @@ import {
   type PlayerOperationResult,
   type PlayerSnapshot
 } from './players/types';
+import {
+  buildLocalApiOrigin,
+  DEFAULT_EXTERNAL_API_PORT,
+  DEFAULT_INTERNAL_API_PORT,
+  listenLoopbackWithFallback,
+  MAX_LOCAL_API_PORT,
+  MIN_LOCAL_API_PORT,
+  normalizeLocalApiPort
+} from './internal-api-port';
 
 // ⭐ 动态引入 Velopack 规避静态打包分析
 const customRequire = createRequire(import.meta.url);
@@ -103,9 +112,17 @@ try {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const INTERNAL_HTTP_PORT = Number(process.env['BILINCM_INTERNAL_PORT']) || 5555;
+const ENV_INTERNAL_API_PORT = normalizeLocalApiPort(
+  process.env['AWOO_INTERNAL_API_PORT'] || process.env['BILINCM_INTERNAL_PORT'],
+  DEFAULT_INTERNAL_API_PORT
+);
 const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
 const INTERNAL_API_BROWSER_TOKEN = randomBytes(32).toString('base64url');
+let requestedInternalApiPort = ENV_INTERNAL_API_PORT;
+let configuredInternalApiPort = ENV_INTERNAL_API_PORT;
+let actualInternalApiPort: number | null = null;
+let internalApiServer: http.Server | null = null;
+let internalApiFallbackReason: 'conflict' | 'reserved' | null = null;
 let overlayModManager: OverlayModManager | null = null;
 let skinMarketplaceInstallInProgress = false;
 
@@ -411,6 +428,42 @@ function createAdminWindow(initialTab?: unknown) {
   });
 }
 
+function getInternalApiOrigin(): string {
+  return actualInternalApiPort === null
+    ? ''
+    : buildLocalApiOrigin(actualInternalApiPort);
+}
+
+function getInternalApiInfo() {
+  return {
+    requestedPort: requestedInternalApiPort,
+    configuredPort: configuredInternalApiPort,
+    actualPort: actualInternalApiPort,
+    origin: getInternalApiOrigin(),
+    fallback: actualInternalApiPort !== null
+      && actualInternalApiPort !== requestedInternalApiPort,
+    fallbackReason: internalApiFallbackReason,
+    restartRequired: configuredInternalApiPort !== requestedInternalApiPort
+  };
+}
+
+function isActualInternalApiOrigin(origin: string | undefined): boolean {
+  if (!origin || actualInternalApiPort === null) return false;
+  try {
+    const parsed = new URL(origin);
+    const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+    return parsed.protocol === 'http:'
+      && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+      && port === actualInternalApiPort;
+  } catch {
+    return false;
+  }
+}
+
+ipcMain.on('get-internal-api-origin', event => {
+  event.returnValue = getInternalApiOrigin();
+});
+
 ipcMain.on('open-admin', (_event, tab) => createAdminWindow(tab));
 ipcMain.handle('open-external', async (_event, value) => {
   let target: URL;
@@ -478,7 +531,8 @@ let appConfig: any = {
     SuperUsers: [],
     ExternalHttpEnabled: false,
     ExternalWebSocketEnabled: false,
-    ExternalApiPort: 5556
+    ExternalApiPort: DEFAULT_EXTERNAL_API_PORT,
+    InternalApiPort: ENV_INTERNAL_API_PORT
   }
 };
 
@@ -489,7 +543,7 @@ function loadConfig() {
       appConfig = { ...appConfig, ...saved };
 
       if (!appConfig.sysConfig) {
-        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, GiftRequestRequirements: createEmptyGiftRequestRequirements(), IdleWaitNext: true, ShowPlayerCurrentTrack: true, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], ExternalHttpEnabled: false, ExternalWebSocketEnabled: false, ExternalApiPort: 5556 };
+        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, GiftRequestRequirements: createEmptyGiftRequestRequirements(), IdleWaitNext: true, ShowPlayerCurrentTrack: true, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], ExternalHttpEnabled: false, ExternalWebSocketEnabled: false, ExternalApiPort: DEFAULT_EXTERNAL_API_PORT, InternalApiPort: ENV_INTERNAL_API_PORT };
       }
       if (!['NCM', 'Kugou', 'QQMusic', 'Folia'].includes(appConfig.sysConfig.PlayerType)) appConfig.sysConfig.PlayerType = 'NCM';
       if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
@@ -498,13 +552,18 @@ function loadConfig() {
       if (!['bili_avatar', 'song_cover'].includes(appConfig.sysConfig.RequestedSongArtwork)) appConfig.sysConfig.RequestedSongArtwork = 'bili_avatar';
       if (appConfig.sysConfig.ExternalHttpEnabled === undefined) appConfig.sysConfig.ExternalHttpEnabled = false;
       if (appConfig.sysConfig.ExternalWebSocketEnabled === undefined) appConfig.sysConfig.ExternalWebSocketEnabled = false;
+      appConfig.sysConfig.InternalApiPort = normalizeLocalApiPort(
+        appConfig.sysConfig.InternalApiPort,
+        ENV_INTERNAL_API_PORT
+      );
+      configuredInternalApiPort = appConfig.sysConfig.InternalApiPort;
+      requestedInternalApiPort = configuredInternalApiPort;
       const apiPort = Number(appConfig.sysConfig.ExternalApiPort);
       appConfig.sysConfig.ExternalApiPort = (
         Number.isInteger(apiPort)
         && apiPort >= 1024
         && apiPort <= 65535
-        && apiPort !== INTERNAL_HTTP_PORT
-      ) ? apiPort : 5556;
+      ) ? apiPort : DEFAULT_EXTERNAL_API_PORT;
       delete appConfig.sysConfig.EnableCDP;
       delete appConfig.sysConfig.CdpPort;
       delete appConfig.sysConfig.NcmExePath;
@@ -2772,10 +2831,7 @@ function isTrustedInternalMutationRequest(
     const parsed = new URL(origin);
     const internalOrigin =
       `${parsed.protocol}//${parsed.hostname}:${parsed.port || (parsed.protocol === 'https:' ? '443' : '80')}`;
-    if (
-      internalOrigin === `http://localhost:${INTERNAL_HTTP_PORT}`
-      || internalOrigin === `http://127.0.0.1:${INTERNAL_HTTP_PORT}`
-    ) {
+    if (isActualInternalApiOrigin(internalOrigin)) {
       return true;
     }
     const devUrl = getDevUrl();
@@ -2789,13 +2845,15 @@ function attachInternalApiTokenToAppSession(): void {
   session.defaultSession.webRequest.onBeforeSendHeaders(
     {
       urls: [
-        `http://localhost:${INTERNAL_HTTP_PORT}/*`,
-        `http://127.0.0.1:${INTERNAL_HTTP_PORT}/*`
+        'http://localhost/*',
+        'http://127.0.0.1/*'
       ]
     },
     (details, callback) => {
-      details.requestHeaders['X-Awoo-Internal-Token'] =
-        INTERNAL_API_BROWSER_TOKEN;
+      if (isActualInternalApiOrigin(details.url)) {
+        details.requestHeaders['X-Awoo-Internal-Token'] =
+          INTERNAL_API_BROWSER_TOKEN;
+      }
       callback({ requestHeaders: details.requestHeaders });
     }
   );
@@ -3131,12 +3189,20 @@ let lastExternalStateFingerprint = '';
 
 function getExternalApiPort(): number {
   const value = Number(appConfig.sysConfig?.ExternalApiPort);
-  return (
+  const configured = (
     Number.isInteger(value)
     && value >= 1024
     && value <= 65535
-    && value !== INTERNAL_HTTP_PORT
-  ) ? value : 5556;
+  ) ? value : DEFAULT_EXTERNAL_API_PORT;
+  if (actualInternalApiPort === null || configured !== actualInternalApiPort) {
+    return configured;
+  }
+  for (let offset = 1; offset <= MAX_LOCAL_API_PORT - MIN_LOCAL_API_PORT; offset += 1) {
+    const candidate = MIN_LOCAL_API_PORT
+      + ((configured - MIN_LOCAL_API_PORT + offset) % (MAX_LOCAL_API_PORT - MIN_LOCAL_API_PORT + 1));
+    if (candidate !== actualInternalApiPort) return candidate;
+  }
+  return DEFAULT_EXTERNAL_API_PORT;
 }
 
 function stopExternalApiServer(): Promise<void> {
@@ -3281,7 +3347,7 @@ async function restartExternalApiServer(): Promise<void> {
 // ==========================================
 // 后端 API 与 静态网页托管服务
 // ==========================================
-function startBackendServer() {
+async function startBackendServer(): Promise<void> {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || '/', `http://${req.headers.host}`);
@@ -3499,7 +3565,7 @@ function startBackendServer() {
           localOnly: true,
           serialized: true,
           bypassesDanmakuChecks: true,
-          endpoint: `http://127.0.0.1:${INTERNAL_HTTP_PORT}/api/test/request-song`,
+          endpoint: `${getInternalApiOrigin()}/api/test/request-song`,
           method: 'POST',
           body: {
             keyword: 'Shelter Porter Robinson Madeon',
@@ -3610,6 +3676,7 @@ function startBackendServer() {
       if (req.method === 'POST') {
         const body = await readJsonRequest(req);
         const previousPlayerType = appConfig.sysConfig?.PlayerType;
+        const previousInternalApiPort = configuredInternalApiPort;
         const previousExternalSettings = JSON.stringify({
           http: appConfig.sysConfig?.ExternalHttpEnabled === true,
           ws: appConfig.sysConfig?.ExternalWebSocketEnabled === true,
@@ -3631,11 +3698,22 @@ function startBackendServer() {
           normalizeGiftRequestRequirements(
             appConfig.sysConfig.GiftRequestRequirements
           );
+        appConfig.sysConfig.InternalApiPort = normalizeLocalApiPort(
+          appConfig.sysConfig.InternalApiPort,
+          ENV_INTERNAL_API_PORT
+        );
+        configuredInternalApiPort = appConfig.sysConfig.InternalApiPort;
         appConfig.sysConfig.ExternalApiPort = getExternalApiPort();
         delete appConfig.sysConfig.EnableCDP;
         delete appConfig.sysConfig.CdpPort;
         delete appConfig.sysConfig.NcmExePath;
         saveConfig();
+        if (configuredInternalApiPort !== previousInternalApiPort) {
+          writeLog(
+            `[内部 API] 已保存请求端口 ${configuredInternalApiPort}，重启点歌机后生效（当前启动请求 ${requestedInternalApiPort}，实际使用 ${actualInternalApiPort || '未启动'}）`,
+            'Yellow'
+          );
+        }
 
         if (previousPlayerType !== appConfig.sysConfig.PlayerType) {
           targetQueue = [];
@@ -3663,7 +3741,8 @@ function startBackendServer() {
         res.end(JSON.stringify({
           success: true,
           playerConnected: isPlayerConnected,
-          playerConnecting
+          playerConnecting,
+          internalApi: getInternalApiInfo()
         }));
         return;
       }
@@ -3690,6 +3769,7 @@ function startBackendServer() {
         current: currentPlayingSong || playerCurrentTrack,
         currentIsRequested: Boolean(currentPlayingSong),
         playerPausedAfterRequests,
+        internalApi: getInternalApiInfo(),
         externalApi: {
           running: externalApiRunning,
           httpEnabled: appConfig.sysConfig?.ExternalHttpEnabled === true,
@@ -4117,12 +4197,32 @@ function startBackendServer() {
     }
   });
 
-  server.listen(INTERNAL_HTTP_PORT, '127.0.0.1', () => {
-    writeLog(
-      `✅ 内部 API 及静态网页服务已启动于 http://127.0.0.1:${INTERNAL_HTTP_PORT}`,
-      'Green'
-    );
+  internalApiServer = server;
+  // 即使外部接口暂时关闭，也保留其配置端口，避免稍后开启时与内部服务冲突。
+  const reservedPorts = [getExternalApiPort()];
+  const result = await listenLoopbackWithFallback(
+    server,
+    requestedInternalApiPort,
+    reservedPorts
+  );
+  requestedInternalApiPort = result.requestedPort;
+  actualInternalApiPort = result.actualPort;
+  internalApiFallbackReason = result.reason || null;
+  server.on('error', (error: any) => {
+    writeLog(`[内部 API] 运行中发生错误：${error?.message || error}`, 'Red');
   });
+  if (result.fallback) {
+    const reason = result.reason === 'reserved' ? '与外部只读接口端口冲突' : '请求端口已被占用';
+    writeLog(
+      `⚠️ 内部 API 请求端口 ${result.requestedPort}${reason}，已自动使用 ${result.actualPort}`,
+      'Yellow'
+    );
+  }
+  writeLog(
+    `✅ 内部 API 及静态网页服务已启动于 ${getInternalApiOrigin()}`
+      + (result.fallback ? `（请求端口 ${result.requestedPort}）` : ''),
+    'Green'
+  );
 }
 
 // ==========================================
@@ -4131,20 +4231,28 @@ function startBackendServer() {
 app.whenReady().then(() => {
   writeLog('=== 嗷呜点歌机内部日志已连接 ===', 'Cyan');
   loadConfig();
-  attachInternalApiTokenToAppSession();
   void startPlayerBridge();
   connectorMaintenanceTimer = setInterval(
     () => void maintainPlayerConnectors(true),
     CONNECTOR_MAINTENANCE_INTERVAL_MS
   );
   // 先开始监听本地接口，再加载悬浮窗，避免首次轮询撞上尚未启动的后端。
-  startBackendServer();
-  createOverlayWindow();
-
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createOverlayWindow(); });
-  void restartExternalApiServer();
-  if (biliCookie) updateCurrentUserInfo();
-  if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);
+  void startBackendServer().then(() => {
+    attachInternalApiTokenToAppSession();
+    createOverlayWindow();
+    app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createOverlayWindow(); });
+    void restartExternalApiServer();
+    if (biliCookie) updateCurrentUserInfo();
+    if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);
+  }).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    writeLog(`❌ 内部 API 启动失败：${message}`, 'Red');
+    dialog.showErrorBox(
+      '嗷呜点歌机启动失败',
+      `内部服务无法监听本机端口，控制面板不会继续运行。\n\n${message}`
+    );
+    app.quit();
+  });
 });
 
 app.on('before-quit', () => {
@@ -4158,6 +4266,10 @@ app.on('before-quit', () => {
     connectorMaintenanceTimer = null;
   }
   void playerManager.stop();
+  const internalServer = internalApiServer;
+  internalApiServer = null;
+  actualInternalApiPort = null;
+  if (internalServer?.listening) internalServer.close();
   void stopExternalApiServer();
 });
 

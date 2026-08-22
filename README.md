@@ -127,6 +127,9 @@ OBS 始终使用同一个 `/overlay/` 地址，安装或切换 UI 后不需要�
 
 ## 本地开发
 
+版本号、连接器签名资产、GitHub Actions 上传、Cloudflare 部署和旧版兼容的
+完整规范见 [`docs/RELEASING.md`](docs/RELEASING.md)。
+
 ```powershell
 npm ci
 npm test

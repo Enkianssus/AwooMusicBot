@@ -17,6 +17,13 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v6
 
+      - name: Checkout connector contracts
+        uses: actions/checkout@v6
+        with:
+          repository: Enkianssus/awoo-connectors
+          ref: main
+          path: BiliNCM-Connectors
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:

@@ -6,7 +6,6 @@ import fs from 'fs';
 import os from 'os';
 import zlib from 'zlib';
 import { randomBytes } from 'crypto';
-import { execSync } from 'child_process';
 import { createRequire } from 'module';
 import { WebSocket, WebSocketServer } from 'ws';
 import QRCode from 'qrcode';
@@ -102,13 +101,6 @@ if (process.platform === 'win32') {
     path.join(app.getPath('appData'), '嗷呜点歌机')
   );
 }
-
-// 强制修复 Windows 终端 of UTF-8 中文乱码问题
-try {
-  if (process.platform === 'win32') {
-    execSync('chcp 65001');
-  }
-} catch { /* 忽略 */ }
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -383,6 +375,7 @@ function createOverlayWindow() {
   const { width, height } = getSavedOverlaySize();
   overlayWindow = new BrowserWindow({
     width, height, minWidth: MIN_OVERLAY_SIZE.width, minHeight: MIN_OVERLAY_SIZE.height,
+    show: false,
     frame: false, transparent: true, hasShadow: false,
     backgroundColor: '#00000000', alwaysOnTop: true,
     resizable: false,
@@ -392,6 +385,10 @@ function createOverlayWindow() {
       contextIsolation: true,
       sandbox: true
     }
+  });
+  const initialWindow = overlayWindow;
+  initialWindow.once('ready-to-show', () => {
+    if (!initialWindow.isDestroyed()) initialWindow.show();
   });
   loadWindow(overlayWindow, 'mode=electron');
   overlayWindow.on('closed', () => { overlayWindow = null; app.quit(); });
@@ -1563,6 +1560,8 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
 const CONNECTOR_MAINTENANCE_INTERVAL_MS = 30 * 60 * 1000;
 let connectorMaintenanceTimer: NodeJS.Timeout | null = null;
 let connectorMaintenanceRunning = false;
+let startupBackgroundServicesStarted = false;
+const STARTUP_BACKGROUND_FALLBACK_MS = 2_000;
 
 function getSelectedNativeConnector(): NativeConnectorId {
   return getSelectedPlayerKey();
@@ -1715,6 +1714,32 @@ async function startPlayerBridge(): Promise<void> {
     () => playerManager.start()
   );
   void maintainPlayerConnectors(true);
+}
+
+function startStartupBackgroundServices(): void {
+  if (startupBackgroundServicesStarted) return;
+  startupBackgroundServicesStarted = true;
+  void startPlayerBridge();
+  void restartExternalApiServer();
+  if (biliCookie) updateCurrentUserInfo();
+  if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);
+}
+
+function scheduleStartupBackgroundServices(win: BrowserWindow): void {
+  let scheduled = false;
+  let fallbackTimer: NodeJS.Timeout | null = null;
+  const schedule = () => {
+    if (scheduled) return;
+    scheduled = true;
+    if (fallbackTimer) clearTimeout(fallbackTimer);
+    setImmediate(startStartupBackgroundServices);
+  };
+  // `ready-to-show` follows the renderer's first completed paint.  The
+  // fallback keeps all non-visual services available even if a damaged local
+  // renderer never reaches that event.
+  win.once('ready-to-show', schedule);
+  win.webContents.once('did-fail-load', schedule);
+  fallbackTimer = setTimeout(schedule, STARTUP_BACKGROUND_FALLBACK_MS);
 }
 
 async function reconnectPlayerBridge(): Promise<boolean> {
@@ -4231,7 +4256,6 @@ async function startBackendServer(): Promise<void> {
 app.whenReady().then(() => {
   writeLog('=== 嗷呜点歌机内部日志已连接 ===', 'Cyan');
   loadConfig();
-  void startPlayerBridge();
   connectorMaintenanceTimer = setInterval(
     () => void maintainPlayerConnectors(true),
     CONNECTOR_MAINTENANCE_INTERVAL_MS
@@ -4240,10 +4264,15 @@ app.whenReady().then(() => {
   void startBackendServer().then(() => {
     attachInternalApiTokenToAppSession();
     createOverlayWindow();
+    if (overlayWindow) {
+      // 先让透明悬浮窗完成首屏加载，再启动连接器、直播间和外部接口。
+      // 这些后台任务会拉起 .NET 子进程并访问网络，冷启动时与 Chromium
+      // 抢占磁盘和杀毒扫描资源会放大“点击后很久才出现窗口”的体感。
+      scheduleStartupBackgroundServices(overlayWindow);
+    } else {
+      startStartupBackgroundServices();
+    }
     app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createOverlayWindow(); });
-    void restartExternalApiServer();
-    if (biliCookie) updateCurrentUserInfo();
-    if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);
   }).catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     writeLog(`❌ 内部 API 启动失败：${message}`, 'Red');

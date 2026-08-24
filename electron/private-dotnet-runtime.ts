@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { FileHandle } from 'node:fs/promises';
 import { downloadBufferWithRanges } from './connector-download.ts';
 import { extractZipSafely } from './safe-zip.ts';
 
@@ -44,8 +45,13 @@ interface RuntimeMarker {
   sha512: string;
 }
 
-interface RuntimeDownloadSize {
+type RuntimeDownloadPlan =
+  | { strategy: 'ranges'; size: number }
+  | { strategy: 'whole'; response?: Response };
+
+interface RuntimeArchiveDownloadResult {
   size: number;
+  sha512: string;
 }
 
 const DOTNET_RUNTIME_HOSTS = new Set([
@@ -57,6 +63,10 @@ const CHANNEL_PATTERN = /^(\d+)\.(\d+)$/;
 const MARKER_NAME = '.awoo-dotnet-runtime.json';
 const DEFAULT_CHANNEL = '8.0';
 const MIN_RUNTIME_ARCHIVE_SIZE = 1024 * 1024;
+const WHOLE_DOWNLOAD_MAX_ATTEMPTS = 3;
+const WHOLE_DOWNLOAD_RETRY_DELAY_MS = 500;
+const WHOLE_DOWNLOAD_INACTIVITY_TIMEOUT_MS = 60_000;
+const UNKNOWN_SIZE_PROGRESS_STEP = 256 * 1024;
 
 /**
  * Select and validate the runtime archive advertised by the official
@@ -233,23 +243,6 @@ export class PrivateDotnetRuntimeManager {
     }, '.NET Runtime 元数据');
     const metadata = await metadataResponse.json() as unknown;
     const artifact = selectDotnetRuntimeArtifact(metadata, runtimeRid, channel);
-    const downloadSize = await this.resolveDownloadSize(artifact.url);
-    const archive = await downloadBufferWithRanges({
-      url: artifact.url,
-      expectedSize: downloadSize.size,
-      fetchImpl: this.fetchImpl,
-      onProgress: progress => {
-        this.onLog(
-          `[.NET Runtime] ${runtimeRid} 下载进度 ${progress.percent}% `
-          + `(${progress.received}/${progress.total})`
-        );
-      }
-    });
-    if (archive.length !== downloadSize.size) {
-      throw new Error(`.NET Runtime 文件大小不匹配：${archive.length}/${downloadSize.size}`);
-    }
-    verifySha512(archive, artifact.sha512);
-
     const nonce = crypto.randomBytes(8).toString('hex');
     const archivePath = path.join(
       ridRoot,
@@ -261,7 +254,46 @@ export class PrivateDotnetRuntimeManager {
     );
     const versionDirectory = path.join(ridRoot, artifact.version);
     try {
-      await fs.promises.writeFile(archivePath, archive, { flag: 'wx' });
+      const downloadPlan = await this.resolveDownloadSize(artifact.url);
+      if (downloadPlan.strategy === 'whole') {
+        const downloaded = await downloadRuntimeArchiveToFile({
+          url: artifact.url,
+          outputPath: archivePath,
+          fetchImpl: this.fetchImpl,
+          initialResponse: downloadPlan.response,
+          onProgress: progress => {
+            if (progress.total > 0) {
+              this.onLog(
+                `[.NET Runtime] ${runtimeRid} 下载进度 ${progress.percent}% `
+                + `(${progress.received}/${progress.total})`
+              );
+            } else {
+              this.onLog(
+                `[.NET Runtime] ${runtimeRid} 已接收 ${progress.received} 字节 `
+                + '（总大小未知）'
+              );
+            }
+          }
+        });
+        verifySha512Digest(downloaded.sha512, artifact.sha512);
+      } else {
+        const archive = await downloadBufferWithRanges({
+          url: artifact.url,
+          expectedSize: downloadPlan.size,
+          fetchImpl: this.fetchImpl,
+          onProgress: progress => {
+            this.onLog(
+              `[.NET Runtime] ${runtimeRid} 下载进度 ${progress.percent}% `
+              + `(${progress.received}/${progress.total})`
+            );
+          }
+        });
+        if (archive.length !== downloadPlan.size) {
+          throw new Error(`.NET Runtime 文件大小不匹配：${archive.length}/${downloadPlan.size}`);
+        }
+        verifySha512(archive, artifact.sha512);
+        await fs.promises.writeFile(archivePath, archive, { flag: 'wx' });
+      }
       await extractZipSafely(archivePath, stagingDirectory);
       await verifyRuntimeDirectory(stagingDirectory, artifact.version);
       const marker: RuntimeMarker = {
@@ -295,7 +327,7 @@ export class PrivateDotnetRuntimeManager {
     }
   }
 
-  private async resolveDownloadSize(url: string): Promise<RuntimeDownloadSize> {
+  private async resolveDownloadSize(url: string): Promise<RuntimeDownloadPlan> {
     try {
       const head = await this.fetchImpl(url, {
         method: 'HEAD',
@@ -307,43 +339,82 @@ export class PrivateDotnetRuntimeManager {
           head.headers
         );
         if (responseSize && responseSize >= MIN_RUNTIME_ARCHIVE_SIZE) {
-          return { size: responseSize };
+          return { strategy: 'ranges', size: responseSize };
         }
       }
     } catch {
       // Some CDNs reject HEAD; the one-byte range probe below is equivalent.
     }
 
-    const rangeResponse = await this.fetchWithRetry(url, {
-      method: 'GET',
-      cache: 'no-store',
-      headers: { Range: 'bytes=0-0' }
-    }, '.NET Runtime 文件大小探测');
+    let rangeResponse: Response;
+    try {
+      rangeResponse = await this.fetchWithRetry(url, {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { Range: 'bytes=0-0' }
+      }, '.NET Runtime 文件大小探测', {
+        shouldRetryStatus: status => !isRangeProbeFallbackStatus(status)
+      });
+    } catch (error: unknown) {
+      if (error instanceof DotnetHttpError && isRangeProbeFallbackStatus(error.status)) {
+        this.onLog(
+          `[.NET Runtime] 文件大小探测返回 HTTP ${error.status}，改用完整下载`
+        );
+        return { strategy: 'whole' };
+      }
+      throw error;
+    }
     if (rangeResponse.status !== 206) {
+      if (rangeResponse.status === 200) {
+        if (rangeResponse.body) {
+          this.onLog('[.NET Runtime] 服务器忽略 Range，直接使用完整响应');
+          return { strategy: 'whole', response: rangeResponse };
+        }
+        this.onLog('[.NET Runtime] 服务器忽略 Range，改用完整下载');
+        return { strategy: 'whole' };
+      }
+      if (isRangeProbeFallbackStatus(rangeResponse.status)) {
+        this.onLog(
+          `[.NET Runtime] 文件大小探测返回 HTTP ${rangeResponse.status}，改用完整下载`
+        );
+        return { strategy: 'whole' };
+      }
       throw new Error(`.NET Runtime 无法获取文件大小：HTTP ${rangeResponse.status}`);
     }
     const contentRange = parseContentRange(
       rangeResponse.headers.get('content-range')
     );
     if (!contentRange || contentRange.start !== 0) {
-      throw new Error(
-        `.NET Runtime Content-Range 无效：${rangeResponse.headers.get('content-range') || '缺失'}`
+      await cancelResponseBody(rangeResponse);
+      this.onLog(
+        `[.NET Runtime] Content-Range 无效（${rangeResponse.headers.get('content-range') || '缺失'}），`
+        + '改用完整下载'
       );
+      return { strategy: 'whole' };
     }
-    return { size: contentRange.total };
+    if (contentRange.total < MIN_RUNTIME_ARCHIVE_SIZE) {
+      await cancelResponseBody(rangeResponse);
+      this.onLog('[.NET Runtime] Content-Range 文件大小异常，改用完整下载');
+      return { strategy: 'whole' };
+    }
+    await cancelResponseBody(rangeResponse);
+    return { strategy: 'ranges', size: contentRange.total };
   }
 
   private async fetchWithRetry(
     url: string,
     init: RequestInit,
-    label: string
+    label: string,
+    options: { shouldRetryStatus?: (status: number) => boolean } = {}
   ): Promise<Response> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
         const response = await this.fetchImpl(url, init);
         if (response.ok) return response;
-        lastError = new Error(`HTTP ${response.status}`);
+        await cancelResponseBody(response);
+        lastError = new DotnetHttpError(response.status);
+        if (options.shouldRetryStatus?.(response.status) === false) break;
       } catch (error: unknown) {
         lastError = error;
       }
@@ -354,7 +425,188 @@ export class PrivateDotnetRuntimeManager {
     const message = lastError instanceof Error
       ? lastError.message
       : String(lastError);
+    if (lastError instanceof DotnetHttpError) {
+      throw new DotnetHttpError(lastError.status, `${label}失败：`);
+    }
     throw new Error(`${label}失败：${message}`);
+  }
+}
+
+class DotnetHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, prefix = '') {
+    super(`${prefix}HTTP ${status}`);
+    this.name = 'DotnetHttpError';
+    this.status = status;
+  }
+}
+
+function isRangeProbeFallbackStatus(status: number): boolean {
+  return status === 400
+    || status === 405
+    || status === 408
+    || status === 416
+    || status === 429
+    || (status >= 500 && status <= 599);
+}
+
+async function downloadRuntimeArchiveToFile(options: {
+  url: string;
+  outputPath: string;
+  fetchImpl: PrivateDotnetFetch;
+  initialResponse?: Response;
+  onProgress?: (progress: {
+    received: number;
+    total: number;
+    percent: number;
+  }) => void;
+}): Promise<RuntimeArchiveDownloadResult> {
+  let lastError: unknown;
+  let initialResponse = options.initialResponse;
+  for (let attempt = 1; attempt <= WHOLE_DOWNLOAD_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    let fileHandle: FileHandle | undefined;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let result: RuntimeArchiveDownloadResult | undefined;
+    let currentError: unknown;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const armTimeout = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = setTimeout(
+        () => {
+          timedOut = true;
+          controller.abort();
+          if (reader) {
+            void reader.cancel(new Error('完整下载等待数据超时')).catch(() => undefined);
+          }
+        },
+        WHOLE_DOWNLOAD_INACTIVITY_TIMEOUT_MS
+      );
+    };
+    armTimeout();
+    try {
+      const response = initialResponse || await options.fetchImpl(options.url, {
+        method: 'GET',
+        cache: 'no-store',
+        signal: controller.signal
+      });
+      initialResponse = undefined;
+      if (!response.ok) {
+        throw new Error(`下载 HTTP ${response.status}`);
+      }
+      if (!response.body) {
+        throw new Error('完整下载响应不支持流式读取');
+      }
+
+      const declaredSize = readDotnetDownloadSize(response.status, response.headers);
+      fileHandle = await fs.promises.open(options.outputPath, 'wx');
+      reader = response.body.getReader();
+      const hash = crypto.createHash('sha512');
+      let received = 0;
+      let lastProgressReceived = 0;
+      let lastProgressPercent = -1;
+      const reportProgress = (total: number, force = false) => {
+        const percent = total > 0
+          ? Math.min(100, Math.floor(received * 100 / total))
+          : 0;
+        const changed = total > 0
+          ? percent !== lastProgressPercent
+          : received - lastProgressReceived >= UNKNOWN_SIZE_PROGRESS_STEP;
+        if (!force && !changed) return;
+        if (
+          force
+          && received === lastProgressReceived
+          && percent === lastProgressPercent
+        ) return;
+        options.onProgress?.({
+          received,
+          total,
+          percent
+        });
+        lastProgressReceived = received;
+        lastProgressPercent = percent;
+      };
+      let chunk = await reader.read();
+      while (!chunk.done) {
+        armTimeout();
+        if (chunk.value && chunk.value.byteLength > 0) {
+          await writeFileChunk(fileHandle, chunk.value);
+          hash.update(chunk.value);
+          received += chunk.value.byteLength;
+          const total = declaredSize || 0;
+          reportProgress(total);
+        }
+        chunk = await reader.read();
+      }
+      if (timedOut) {
+        throw new Error('完整下载等待数据超时');
+      }
+      if (declaredSize !== null && received !== declaredSize) {
+        throw new Error(`下载文件大小不匹配：${received}/${declaredSize}`);
+      }
+      result = {
+        size: received,
+        sha512: hash.digest('hex')
+      };
+      reportProgress(declaredSize ?? received, true);
+    } catch (error: unknown) {
+      currentError = error;
+    } finally {
+      if (reader) {
+        try {
+          if (currentError) await reader.cancel();
+          reader.releaseLock();
+        } catch {
+          // The response owns the reader lifecycle after a failed download.
+        }
+      }
+      if (fileHandle) {
+        try {
+          await fileHandle.close();
+        } catch {
+          // The retry cleanup below is still attempted.
+        }
+      }
+      if (timeout) clearTimeout(timeout);
+      if (currentError) controller.abort();
+    }
+
+    if (result && !currentError) return result;
+    lastError = currentError || new Error('完整下载未返回结果');
+    await removePath(options.outputPath);
+    if (attempt < WHOLE_DOWNLOAD_MAX_ATTEMPTS) {
+      await delay(WHOLE_DOWNLOAD_RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  const message = lastError instanceof Error
+    ? lastError.message
+    : String(lastError);
+  throw new Error(`.NET Runtime 完整下载失败：${message}`);
+}
+
+async function writeFileChunk(fileHandle: FileHandle, chunk: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const result = await fileHandle.write(chunk, offset, chunk.byteLength - offset);
+    if (!result.bytesWritten) {
+      throw new Error('完整下载写入文件失败');
+    }
+    offset += result.bytesWritten;
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Probe cleanup is best effort; the subsequent full request remains safe.
   }
 }
 
@@ -399,10 +651,17 @@ function validateSha512(value: unknown): string {
 
 function verifySha512(archive: Buffer, expected: string): void {
   const actual = crypto.createHash('sha512').update(archive).digest();
+  verifySha512Digest(actual, expected);
+}
+
+function verifySha512Digest(actual: Buffer | string, expected: string): void {
+  const actualDigest = typeof actual === 'string'
+    ? Buffer.from(actual, 'hex')
+    : actual;
   const expectedBuffer = Buffer.from(expected, 'hex');
   if (
-    actual.length !== expectedBuffer.length
-    || !crypto.timingSafeEqual(actual, expectedBuffer)
+    actualDigest.length !== expectedBuffer.length
+    || !crypto.timingSafeEqual(actualDigest, expectedBuffer)
   ) {
     throw new Error('.NET Runtime SHA-512 校验失败');
   }

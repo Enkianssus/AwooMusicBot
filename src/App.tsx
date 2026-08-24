@@ -3533,6 +3533,20 @@ const AdminWidget: React.FC = () => {
                                 <div className="space-y-6 animate-slide-in-right pb-10">
                                     <h2 className="text-2xl font-bold text-white mb-6">❓ 常见问题与自助诊断</h2>
 
+                                    <div className="rounded-xl border border-cyan-400/25 bg-cyan-500/10 p-5 shadow-inner">
+                                        <div className="text-sm font-bold text-cyan-200">遇到播放器相关问题，请先更新再排查</div>
+                                        <div className="mt-3 flex flex-wrap items-center gap-2 text-sm font-bold text-white">
+                                            <span className="rounded-lg bg-black/25 px-3 py-2">1. 更新播放器</span>
+                                            <span className="text-cyan-400">→</span>
+                                            <span className="rounded-lg bg-black/25 px-3 py-2">2. 更新对应连接器</span>
+                                            <span className="text-cyan-400">→</span>
+                                            <span className="rounded-lg bg-black/25 px-3 py-2">3. 更新嗷呜点歌机</span>
+                                        </div>
+                                        <p className="mt-3 text-xs leading-relaxed text-gray-400">
+                                            三项都更新并重新打开播放器和点歌机后，再尝试“重新连接”。仍然异常时，才继续检查运行日志、程序权限和杀毒软件拦截。
+                                        </p>
+                                    </div>
+
                                     {/* FAQ CARD 1: 播放器无法控制 */}
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-4 shadow-inner">
                                         <h3 className="text-md font-bold text-red-400 flex items-center gap-2 pb-2 border-b border-white/5">
@@ -3541,23 +3555,25 @@ const AdminWidget: React.FC = () => {
 
                                         <div className="space-y-4 text-sm leading-relaxed text-gray-300">
                                             <div>
-                                                <strong className="text-white block mb-1">第一步：确认播放器已启动并显示主窗口</strong>
+                                                <strong className="text-white block mb-1.5">第一步：依次更新播放器、连接器和点歌机</strong>
+                                                <ol className="list-decimal space-y-1.5 pl-5 text-xs leading-relaxed text-gray-400">
+                                                    <li>先在网易云、酷狗或 QQ 音乐中检查更新；Folia 用户请更新对应的 Stage 环境。</li>
+                                                    <li>再到 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('settings')}>基础设置</button> 更新当前播放器的连接器。播放器跨版本分支时，需要手动确认连接器更新。</li>
+                                                    <li>最后到 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('update')}>版本升级</button>，把嗷呜点歌机更新到最新版。</li>
+                                                </ol>
+                                            </div>
+
+                                            <div className="border-t border-white/5 pt-3">
+                                                <strong className="text-white block mb-1">第二步：重新打开播放器并重新连接</strong>
                                                 <p className="text-xs text-gray-400 leading-relaxed">
-                                                    v1.1.1 不再启动、结束或重启播放器。请先手动打开网易云、酷狗或 QQ 音乐；使用 Folia 时请启动 Stage API。再到 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('settings')}>基础设置</button> 选择对应方式并点击“重新连接”。
+                                                    完全退出后重新打开网易云、酷狗或 QQ 音乐；使用 Folia 时请确认 Stage API 已启动。随后到 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('settings')}>基础设置</button> 选择对应播放器并点击“重新连接”。
                                                 </p>
                                             </div>
 
                                             <div className="border-t border-white/5 pt-3">
-                                                <strong className="text-white block mb-1">第二步：查看播放器版本和运行日志</strong>
+                                                <strong className="text-white block mb-1">第三步：仍未恢复时再查看日志并主动测试</strong>
                                                 <p className="text-xs text-gray-400 leading-relaxed">
-                                                    网易云通过原生 IPC 连接；酷狗使用窗口消息与内部 IPC；QQ 使用单实例命令；Folia 使用本机 Stage API。播放器更新后若某项能力被拒绝，请把 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('logs')}>运行日志</button> 中的版本和错误信息发来。网易云不再需要调试端口。
-                                                </p>
-                                            </div>
-
-                                            <div className="border-t border-white/5 pt-3">
-                                                <strong className="text-white block mb-1">第三步：用调试页做主动测试</strong>
-                                                <p className="text-xs text-gray-400 leading-relaxed">
-                                                    前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('debug')}>调试测试</button> 搜索一首歌并登记下一首，或手动触发下一首。该操作会真实控制当前选中的播放器。
+                                                    先查看 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('logs')}>运行日志</button> 中记录的播放器、连接器和点歌机版本及错误信息，再前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300" onClick={() => setActiveTab('debug')}>调试测试</button> 搜索一首歌并登记下一首，或手动触发下一首。该操作会真实控制当前选中的播放器。
                                                 </p>
                                             </div>
                                         </div>

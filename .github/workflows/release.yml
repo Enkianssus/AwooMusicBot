@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: app-release-r2
+  cancel-in-progress: false
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -100,3 +104,90 @@ jobs:
           files: Releases/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prewarm release assets in R2
+        shell: pwsh
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.ENKIANSSUS_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 48a310efe84107a68b7ea095719805bb
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_API_TOKEN)) {
+            throw 'ENKIANSSUS_CLOUDFLARE_API_TOKEN is required for R2 prewarm.'
+          }
+
+          $wranglerVersion = '4.125.0'
+          $bucket = 'awoo-download-cache'
+          $releasePrefix = "github-release-v1/github.com/Enkianssus/AwooMusicBot/releases/download/$env:TAG_NAME"
+          $immutableCacheControl = 'public, max-age=31536000, immutable'
+          $channelCacheControl = 'public, max-age=300'
+
+          $assets = Get-ChildItem -Path 'Releases' -File
+          if (-not $assets) {
+            throw 'No release assets were found in Releases/.'
+          }
+
+          foreach ($asset in $assets) {
+            $contentType = switch ($asset.Extension.ToLowerInvariant()) {
+              '.zip' { 'application/zip'; break }
+              '.nupkg' { 'application/octet-stream'; break }
+              '.json' { 'application/json; charset=utf-8'; break }
+              '.sig' { 'text/plain; charset=utf-8'; break }
+              '.sha256' { 'text/plain; charset=utf-8'; break }
+              default { 'application/octet-stream' }
+            }
+            $cacheControl = if ($asset.Name -in @('RELEASES', 'assets.win.json', 'releases.win.json')) {
+              $channelCacheControl
+            } else {
+              $immutableCacheControl
+            }
+            $objectPath = "$bucket/$releasePrefix/$($asset.Name)"
+            $contentDisposition = 'attachment; filename="' + $asset.Name + '"'
+            $arguments = @(
+              '--yes',
+              "wrangler@$wranglerVersion",
+              'r2',
+              'object',
+              'put',
+              $objectPath,
+              '--remote',
+              '--file',
+              $asset.FullName,
+              '--content-type',
+              $contentType,
+              '--content-disposition',
+              $contentDisposition,
+              '--cache-control',
+              $cacheControl,
+              '--force'
+            )
+            Write-Host "Prewarming R2 object $objectPath"
+            & npx.cmd @arguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "R2 prewarm failed for $($asset.Name) with exit code $LASTEXITCODE"
+            }
+          }
+
+          $tag = $env:TAG_NAME
+          $releasePrefix = "github-release-v1/github.com/Enkianssus/AwooMusicBot/releases/download/$tag"
+          $arguments = @(
+            'scripts/cleanup-r2-release-cache.mjs',
+            '--account-id', $env:CLOUDFLARE_ACCOUNT_ID,
+            '--bucket', $bucket,
+            '--repository', 'Enkianssus/AwooMusicBot',
+            '--current-tag', $tag,
+            '--tag-prefix', 'v',
+            '--version-parts', '3'
+          )
+          foreach ($asset in $assets) {
+            $arguments += @('--expected-key', "$releasePrefix/$($asset.Name)")
+          }
+          $verifyArguments = @($arguments)
+          $verifyArguments += '--dry-run'
+          & node @verifyArguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "R2 upload verification failed for app release $tag with exit code $LASTEXITCODE"
+          }
+          & node @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "R2 cleanup failed for app release $tag with exit code $LASTEXITCODE"
+          }

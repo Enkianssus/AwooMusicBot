@@ -42,6 +42,8 @@ export interface PlayerSnapshot {
   next?: PlayerTrack | null;
   nextSource?: string;
   nextObservation?: 'unknown' | 'track' | 'empty' | null;
+  /** QQ reports true only after the native playlist playback cursor exists. */
+  playbackAnchorReady?: boolean;
   observedAt: string;
   capabilities?: PlayerCapabilities | null;
 }

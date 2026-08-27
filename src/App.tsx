@@ -14,6 +14,10 @@ import {
     buildNeteaseConnectorSuccessMessage,
     shouldWaitForConnectorPlayer
 } from './connector-update-feedback-policy';
+import {
+    checkFeedbackSubmissionEvidence,
+    isTechnicalFeedbackCategory
+} from './feedback-submission-policy';
 import { internalApiUrl } from './internal-api';
 
 // ==========================================
@@ -515,10 +519,9 @@ const defaultTheme: Theme = {
 // ==========================================
 interface OverlayWidgetProps {
     onToggleAdmin: () => void;
-    onOpenAppearance: () => void;
 }
 
-const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppearance }) => {
+const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [data, setData] = useState<{ current: SongInfo | null; currentIsRequested: boolean; playerPausedAfterRequests: boolean; requestedSongArtwork: RequestedSongArtwork; queue: SongInfo[]; status: string }>({ current: null, currentIsRequested: false, playerPausedAfterRequests: false, requestedSongArtwork: 'bili_avatar', queue: [], status: '' });
     const [isConnected, setIsConnected] = useState<boolean>(true);
     const [isCdpConnected, setIsCdpConnected] = useState<boolean>(true);
@@ -531,6 +534,14 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppe
 
     const [dragInfo, setDragInfo] = useState<DragInfo | null>(null);
     const [titleBarActionsOpen, setTitleBarActionsOpen] = useState<boolean>(false);
+    const [alwaysOnTop, setAlwaysOnTop] = useState<boolean>(() => {
+        if (!isElectron) return true;
+        try {
+            return electronAPI?.getOverlayAlwaysOnTop?.() ?? true;
+        } catch {
+            return true;
+        }
+    });
 
     // ⭐ 新增: 全局 UI 500ms 冷却锁定
     const [actionLock, setActionLock] = useState<boolean>(false);
@@ -853,6 +864,22 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppe
         if (isElectron) electronAPI?.minimizeWindow();
     };
 
+    const handleAlwaysOnTopToggle = () => {
+        if (!isElectron) return;
+        const requestedState = !alwaysOnTop;
+        try {
+            const actualState = electronAPI?.setOverlayAlwaysOnTop?.(requestedState);
+            setAlwaysOnTop(typeof actualState === 'boolean' ? actualState : requestedState);
+        } catch {
+            // Keep the last known state if the native window is unavailable.
+            try {
+                setAlwaysOnTop(electronAPI?.getOverlayAlwaysOnTop?.() ?? alwaysOnTop);
+            } catch {
+                // The renderer can continue using the existing window controls.
+            }
+        }
+    };
+
     const handleDragStart = (e: React.MouseEvent<HTMLDivElement>) => {
         if (isElectron) return;
         const targetElement = e.target as HTMLElement;
@@ -1060,9 +1087,15 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppe
 
                 {!theme.showTitleBar && isElectron && (
                     <div className="no-drag absolute top-3 right-3 flex gap-2 z-50 drop-shadow-md opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+                        <button
+                            onMouseDown={e => e.stopPropagation()}
+                            onClick={handleAlwaysOnTopToggle}
+                            aria-pressed={alwaysOnTop}
+                            aria-label={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'}
+                            className={`transition-colors cursor-pointer text-lg ${alwaysOnTop ? 'text-cyan-300 hover:text-cyan-100' : 'text-white/40 hover:text-white'}`}
+                            title={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'}
+                        >{alwaysOnTop ? '📌' : '📍'}</button>
                         <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="控制面板">⚙️</button>
-                        <button onMouseDown={e => e.stopPropagation()} onClick={onOpenAppearance} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="在控制面板打开外观设置">🎨</button>
-
                         <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="flex items-center justify-center w-6 h-6 rounded-full transition-colors text-white/50 hover:text-white hover:bg-white/20 text-md font-bold" title="最小化">—</button>
                         <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="flex items-center justify-center w-6 h-6 rounded-full transition-colors text-white/50 hover:text-red-400 hover:bg-red-500/20 text-md" title="关闭点歌机">✖</button>
                     </div>
@@ -1098,8 +1131,15 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin, onOpenAppe
                                     className={`no-drag absolute right-0 top-1/2 -translate-y-1/2 h-8 overflow-hidden z-20 transition-[width] duration-150 ease-out ${titleBarActionsVisible ? 'w-[116px]' : 'w-8'}`}
                                 >
                                     <div className={`ml-auto flex h-full w-[112px] items-center justify-end gap-2 transition-all duration-150 ${titleBarActionsVisible ? 'translate-x-0 opacity-100' : 'translate-x-2 opacity-0 pointer-events-none'}`}>
+                                        <button
+                                            onMouseDown={e => e.stopPropagation()}
+                                            onClick={handleAlwaysOnTopToggle}
+                                            aria-pressed={alwaysOnTop}
+                                            aria-label={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'}
+                                            className={`no-drag transition-colors cursor-pointer text-sm ${alwaysOnTop ? 'text-cyan-300 hover:text-cyan-100' : 'text-white/40 hover:text-white'}`}
+                                            title={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'}
+                                        >{alwaysOnTop ? '📌' : '📍'}</button>
                                         <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="no-drag text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="控制面板">⚙️</button>
-                                        <button onMouseDown={e => e.stopPropagation()} onClick={onOpenAppearance} className="no-drag text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="在控制面板打开外观设置">🎨</button>
                                         <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-white hover:bg-white/20 text-xs font-bold" title="最小化">−</button>
                                         <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-red-400 hover:bg-red-500/20 text-xs" title="关闭本窗口">✖</button>
                                     </div>
@@ -1294,6 +1334,7 @@ const AdminWidget: React.FC = () => {
     const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
     const [updateDownloadStatus, setUpdateDownloadStatus] = useState<AppUpdateDownloadStatus | null>(null);
     const updateStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const updateApplyRequestInFlightRef = useRef(false);
 
     const [qrState, setQrState] = useState<QrState>({ loading: false, base64: '', message: '' });
     const [roomIdInput, setRoomIdInput] = useState<string>('');
@@ -1328,7 +1369,10 @@ const AdminWidget: React.FC = () => {
     });
     const [feedbackDiagnostics, setFeedbackDiagnostics] = useState<any>(null);
     const [feedbackIncludeDiagnostics, setFeedbackIncludeDiagnostics] = useState(true);
-    const [feedbackIncludeLogs, setFeedbackIncludeLogs] = useState(false);
+    const [feedbackIncludeLogs, setFeedbackIncludeLogs] = useState(true);
+    const [feedbackTriedUpdates, setFeedbackTriedUpdates] = useState(false);
+    const [feedbackReproducedInSession, setFeedbackReproducedInSession] = useState(false);
+    const [feedbackLogsCapturedAfterReproduction, setFeedbackLogsCapturedAfterReproduction] = useState(false);
     const [feedbackLoading, setFeedbackLoading] = useState(false);
     const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
     const [feedbackResult, setFeedbackResult] = useState<any>(null);
@@ -2311,7 +2355,12 @@ const AdminWidget: React.FC = () => {
     };
 
     const handleApplyUpdate = async () => {
+        if (updateApplyRequestInFlightRef.current) {
+            showAdminToast('更新任务已在进行，请等待唯一一次最终重启。');
+            return;
+        }
         if(!confirm("确定要开始更新吗？程序将会自动下载并重启。")) return;
+        updateApplyRequestInFlightRef.current = true;
         if (updateStatusTimerRef.current) {
             clearTimeout(updateStatusTimerRef.current);
             updateStatusTimerRef.current = null;
@@ -2334,7 +2383,11 @@ const AdminWidget: React.FC = () => {
             if (!response.ok || !result.success) {
                 throw new Error(result.message || '更新任务启动失败');
             }
-            showAdminToast("正在后台下载更新，请稍候，程序将自动重启...");
+            showAdminToast(
+                result.alreadyRunning
+                    ? '已继续监视当前更新任务，不会重复启动安装器。'
+                    : '正在后台下载更新，完成后只会进行一次最终重启。'
+            );
 
             let consecutiveFailures = 0;
             const pollUpdateStatus = async (): Promise<void> => {
@@ -2354,6 +2407,7 @@ const AdminWidget: React.FC = () => {
                     setUpdateDownloadStatus(status);
 
                     if (status.state === 'error') {
+                        updateApplyRequestInFlightRef.current = false;
                         setDownloadProgress(null);
                         setUpdateInfo({
                             checking: false,
@@ -2363,6 +2417,7 @@ const AdminWidget: React.FC = () => {
                         return;
                     }
                     if (status.state === 'no-update') {
+                        updateApplyRequestInFlightRef.current = false;
                         setDownloadProgress(null);
                         setUpdateInfo({
                             checking: false,
@@ -2394,6 +2449,7 @@ const AdminWidget: React.FC = () => {
                     const message = error instanceof Error
                         ? error.message
                         : '读取更新进度失败';
+                    updateApplyRequestInFlightRef.current = false;
                     setDownloadProgress(null);
                     setUpdateInfo({
                         checking: false,
@@ -2404,6 +2460,7 @@ const AdminWidget: React.FC = () => {
             };
             void pollUpdateStatus();
         } catch (error: unknown) {
+            updateApplyRequestInFlightRef.current = false;
             setDownloadProgress(null);
             const message = error instanceof Error
                 ? error.message
@@ -2418,7 +2475,10 @@ const AdminWidget: React.FC = () => {
         await fetch(internalApiUrl('/api/bili/qrstart'), { method: 'POST' });
     };
 
-    const loadFeedbackDiagnostics = useCallback(async (includeLogs = false) => {
+    const loadFeedbackDiagnostics = useCallback(async (
+        includeLogs = false,
+        captureAfterReproduction = false
+    ): Promise<boolean> => {
         setFeedbackLoading(true);
         try {
             const response = await fetch(
@@ -2430,26 +2490,61 @@ const AdminWidget: React.FC = () => {
                 throw new Error(result.message || '诊断信息读取失败');
             }
             setFeedbackDiagnostics(result);
+            if (captureAfterReproduction) {
+                setFeedbackLogsCapturedAfterReproduction(
+                    includeLogs
+                    && Array.isArray(result.diagnostics?.recentLogs)
+                    && result.diagnostics.recentLogs.length > 0
+                );
+            }
+            return true;
         } catch (error: unknown) {
             const message = error instanceof Error
                 ? error.message
                 : '诊断信息读取失败';
             showAdminToast(`❌ ${message}`);
+            if (captureAfterReproduction) {
+                setFeedbackLogsCapturedAfterReproduction(false);
+            }
+            return false;
         } finally {
             setFeedbackLoading(false);
         }
     }, [showAdminToast]);
 
+    const technicalFeedback = isTechnicalFeedbackCategory(feedbackForm.category);
+    const feedbackDiagnosticsLoaded = Boolean(feedbackDiagnostics?.diagnostics);
+
     useEffect(() => {
         if (activeTab !== 'feedback') return;
-        void loadFeedbackDiagnostics(feedbackIncludeLogs);
+        void loadFeedbackDiagnostics(technicalFeedback || feedbackIncludeLogs);
         void refreshFeedbackHistory(false);
     }, [
         activeTab,
         feedbackIncludeLogs,
+        technicalFeedback,
         loadFeedbackDiagnostics,
         refreshFeedbackHistory
     ]);
+
+    useEffect(() => {
+        if (!technicalFeedback) return;
+        // Technical reports always include the evidence needed to investigate
+        // them. Keep state aligned when the user switches from an optional
+        // category so the diagnostics preview and payload stay in sync.
+        setFeedbackIncludeDiagnostics(true);
+        setFeedbackIncludeLogs(true);
+    }, [technicalFeedback]);
+
+    const handleFeedbackReproductionChange = (checked: boolean) => {
+        setFeedbackReproducedInSession(checked);
+        setFeedbackLogsCapturedAfterReproduction(false);
+        if (checked) {
+            // Capture immediately after the user's reproduction so the report
+            // contains the relevant tail of sanitized logs, not an old preview.
+            void loadFeedbackDiagnostics(true, true);
+        }
+    };
 
     const handleFeedbackSubmit = async () => {
         if (feedbackSubmitting) return;
@@ -2459,6 +2554,20 @@ const AdminWidget: React.FC = () => {
         }
         if (feedbackForm.description.trim().length < 10) {
             showAdminToast('❌ 请至少用 10 个字符描述问题');
+            return;
+        }
+
+        const evidenceCheck = checkFeedbackSubmissionEvidence({
+            category: feedbackForm.category,
+            updatesRetried: feedbackTriedUpdates,
+            reproductionConfirmed: feedbackReproducedInSession,
+            includeDiagnostics: technicalFeedback || feedbackIncludeDiagnostics,
+            includeLogs: technicalFeedback || feedbackIncludeLogs,
+            diagnosticsLoaded: feedbackDiagnosticsLoaded,
+            logsCapturedAfterReproduction: feedbackLogsCapturedAfterReproduction
+        });
+        if (!evidenceCheck.allowed) {
+            showAdminToast(`❌ ${evidenceCheck.message || '请先完成提交前检查'}`);
             return;
         }
 
@@ -2477,9 +2586,14 @@ const AdminWidget: React.FC = () => {
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
                         ...feedbackForm,
-                        includeDiagnostics: feedbackIncludeDiagnostics,
-                        includeLogs:
-                            feedbackIncludeDiagnostics && feedbackIncludeLogs
+                        updatesRetried: feedbackTriedUpdates,
+                        reproductionConfirmed: feedbackReproducedInSession,
+                        includeDiagnostics: technicalFeedback
+                            ? true
+                            : feedbackIncludeDiagnostics,
+                        includeLogs: technicalFeedback
+                            ? true
+                            : feedbackIncludeDiagnostics && feedbackIncludeLogs
                     })
                 }
             );
@@ -2499,6 +2613,9 @@ const AdminWidget: React.FC = () => {
                 title: '',
                 description: ''
             }));
+            setFeedbackTriedUpdates(false);
+            setFeedbackReproducedInSession(false);
+            setFeedbackLogsCapturedAfterReproduction(false);
             showAdminToast(`✅ 已提交反馈 ${result.id}`);
         } catch (error: unknown) {
             const message = error instanceof Error
@@ -4368,6 +4485,122 @@ const AdminWidget: React.FC = () => {
                                         </p>
                                     </div>
 
+                                    <div className="rounded-xl border border-amber-400/30 bg-amber-500/[0.08] p-5 space-y-4">
+                                        <div>
+                                            <div className="flex flex-wrap items-center gap-2 font-bold text-amber-200">
+                                                <span>🧭</span>
+                                                <span>提交前请先完成一次排查</span>
+                                                {technicalFeedback ? (
+                                                    <span className="rounded-full bg-amber-400/15 px-2 py-0.5 text-[10px] text-amber-200 ring-1 ring-amber-300/25">
+                                                        会一并附带必要信息
+                                                    </span>
+                                                ) : (
+                                                    <span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-gray-400 ring-1 ring-white/10">
+                                                        功能建议可跳过
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <p className="mt-2 text-xs leading-relaxed text-gray-300">
+                                                问题反馈主要用于仍未解决的情况。请先按顺序更新播放器、连接器和嗷呜点歌机，再重新尝试一次；只有仍然失败时才提交反馈。
+                                            </p>
+                                        </div>
+
+                                        <ol className="space-y-2 text-xs leading-relaxed text-gray-300">
+                                            <li className="flex items-start gap-2">
+                                                <span className="mt-0.5 shrink-0 text-amber-300">1.</span>
+                                                <span>先将当前使用的网易云、酷狗或 QQ 音乐播放器更新到官方最新版。</span>
+                                            </li>
+                                            <li className="flex items-start gap-2">
+                                                <span className="mt-0.5 shrink-0 text-amber-300">2.</span>
+                                                <span>
+                                                    在
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setActiveTab('update')}
+                                                        className="mx-1 font-bold text-cyan-300 underline decoration-cyan-300/40 underline-offset-2 hover:text-cyan-200"
+                                                    >
+                                                        版本升级
+                                                    </button>
+                                                    更新嗷呜点歌机本体。
+                                                </span>
+                                            </li>
+                                            <li className="flex items-start gap-2">
+                                                <span className="mt-0.5 shrink-0 text-amber-300">3.</span>
+                                                <span>
+                                                    在
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setActiveTab('settings')}
+                                                        className="mx-1 font-bold text-cyan-300 underline decoration-cyan-300/40 underline-offset-2 hover:text-cyan-200"
+                                                    >
+                                                        基础设置
+                                                    </button>
+                                                    更新对应连接器；完成后重新打开播放器和点歌机，再重试相同操作。
+                                                </span>
+                                            </li>
+                                        </ol>
+
+                                        <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-xs text-gray-200">
+                                            <input
+                                                type="checkbox"
+                                                checked={feedbackTriedUpdates}
+                                                onChange={event => {
+                                                    const checked = event.target.checked;
+                                                    setFeedbackTriedUpdates(checked);
+                                                    if (!checked) {
+                                                        setFeedbackReproducedInSession(false);
+                                                        setFeedbackLogsCapturedAfterReproduction(false);
+                                                    }
+                                                }}
+                                                className="mt-0.5 h-4 w-4 shrink-0 accent-cyan-500"
+                                            />
+                                            <span>
+                                                <span className="block font-bold text-gray-100">我已更新播放器、连接器和嗷呜点歌机，并重试过，问题仍然存在</span>
+                                                <span className="mt-1 block text-[10px] leading-relaxed text-gray-500">功能建议和其他类型也可以保留未勾选。</span>
+                                            </span>
+                                        </label>
+
+                                        {technicalFeedback && (
+                                            <div className="space-y-2 rounded-lg border border-cyan-400/20 bg-cyan-500/[0.06] px-3 py-3">
+                                                <label className={`flex items-start gap-3 text-xs ${feedbackTriedUpdates ? 'cursor-pointer text-gray-200' : 'cursor-not-allowed text-gray-600'}`}>
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={feedbackReproducedInSession}
+                                                        disabled={!feedbackTriedUpdates || feedbackLoading}
+                                                        onChange={event => handleFeedbackReproductionChange(event.target.checked)}
+                                                        className="mt-0.5 h-4 w-4 shrink-0 accent-cyan-500"
+                                                    />
+                                                    <span>
+                                                        <span className="block font-bold">我已在本次点歌机运行期间复现了一次问题</span>
+                                                        <span className="mt-1 block text-[10px] leading-relaxed text-gray-500">
+                                                            勾选后会立即抓取复现后的最近脱敏日志。请不要在复现后重启点歌机或清空运行日志；如果重启过，请重新复现并再次抓取。
+                                                        </span>
+                                                    </span>
+                                                </label>
+                                                {feedbackReproducedInSession && (
+                                                    <div className={`flex items-center justify-between gap-3 pl-7 text-[10px] ${feedbackLogsCapturedAfterReproduction ? 'text-green-300' : 'text-amber-300'}`}>
+                                                        <span>
+                                                            {feedbackLogsCapturedAfterReproduction
+                                                                ? '✓ 复现后的脱敏日志已准备好，可以继续填写反馈。'
+                                                                : feedbackLoading
+                                                                    ? '正在抓取复现后的脱敏日志…'
+                                                                    : '日志尚未抓取成功，请保持点歌机运行并重新抓取。'}
+                                                        </span>
+                                                        {!feedbackLogsCapturedAfterReproduction && !feedbackLoading && (
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => void loadFeedbackDiagnostics(true, true)}
+                                                                className="shrink-0 rounded-md border border-amber-300/25 bg-amber-400/10 px-2 py-1 font-bold text-amber-200 hover:bg-amber-400/20"
+                                                            >
+                                                                重新抓取日志
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+
                                     <div className="rounded-xl border border-violet-400/20 bg-violet-500/[0.06] p-5 space-y-4">
                                         <div className="flex flex-wrap items-start justify-between gap-3">
                                             <div>
@@ -4462,7 +4695,16 @@ const AdminWidget: React.FC = () => {
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                             <div>
                                                 <label className="block text-xs text-gray-400 mb-2">反馈类型</label>
-                                                <select value={feedbackForm.category} onChange={event => setFeedbackForm(previous => ({...previous, category: event.target.value}))} className="w-full bg-black/40 border border-white/10 rounded-lg p-3 text-sm text-white outline-none">
+                                                <select
+                                                    value={feedbackForm.category}
+                                                    onChange={event => {
+                                                        setFeedbackForm(previous => ({...previous, category: event.target.value}));
+                                                        setFeedbackTriedUpdates(false);
+                                                        setFeedbackReproducedInSession(false);
+                                                        setFeedbackLogsCapturedAfterReproduction(false);
+                                                    }}
+                                                    className="w-full bg-black/40 border border-white/10 rounded-lg p-3 text-sm text-white outline-none"
+                                                >
                                                     <option value="bug">软件问题</option>
                                                     <option value="connector">连接器问题</option>
                                                     <option value="compatibility">播放器兼容性</option>
@@ -4500,15 +4742,42 @@ const AdminWidget: React.FC = () => {
                                             <div>
                                                 <div className="font-bold text-cyan-300">诊断信息</div>
                                                 <div className="text-xs text-gray-400 mt-1">包含本体、系统、播放器与四个连接器版本，以及队列数量和连接状态。</div>
+                                                {technicalFeedback && (
+                                                    <div className="mt-1 text-[10px] text-cyan-300">提交技术问题时会一并附带诊断信息和复现后的最近脱敏运行日志。</div>
+                                                )}
                                             </div>
-                                            <button onClick={() => setFeedbackIncludeDiagnostics(previous => !previous)} className={`w-11 h-6 rounded-full p-1 transition-colors shrink-0 ${feedbackIncludeDiagnostics ? 'bg-cyan-600' : 'bg-gray-600'}`}>
-                                                <div className={`w-4 h-4 rounded-full bg-white transition-transform ${feedbackIncludeDiagnostics ? 'translate-x-5' : 'translate-x-0'}`}></div>
-                                            </button>
+                                            {technicalFeedback ? (
+                                                <span className="shrink-0 rounded-full border border-cyan-300/25 bg-cyan-400/10 px-2.5 py-1 text-[10px] font-bold text-cyan-200">
+                                                    会一并附带
+                                                </span>
+                                            ) : (
+                                                <button
+                                                    type="button"
+                                                    aria-label="切换诊断信息附带状态"
+                                                    onClick={() => setFeedbackIncludeDiagnostics(previous => !previous)}
+                                                    className={`w-11 h-6 rounded-full p-1 transition-colors shrink-0 ${feedbackIncludeDiagnostics ? 'bg-cyan-600' : 'bg-gray-600'}`}
+                                                >
+                                                    <div className={`w-4 h-4 rounded-full bg-white transition-transform ${feedbackIncludeDiagnostics ? 'translate-x-5' : 'translate-x-0'}`}></div>
+                                                </button>
+                                            )}
                                         </div>
-                                        <label className={`flex items-center gap-3 text-sm ${feedbackIncludeDiagnostics ? 'text-gray-300' : 'text-gray-600'}`}>
-                                            <input type="checkbox" disabled={!feedbackIncludeDiagnostics} checked={feedbackIncludeLogs} onChange={event => setFeedbackIncludeLogs(event.target.checked)} className="w-4 h-4" />
-                                            同时附带最近 80 条运行日志（令牌、Cookie 等字段会自动隐藏）
-                                        </label>
+                                        {technicalFeedback ? (
+                                            <div className="rounded-lg border border-cyan-400/20 bg-cyan-500/[0.06] px-3 py-3 text-xs leading-relaxed text-cyan-100">
+                                                <div className="font-bold text-cyan-200">运行日志</div>
+                                                <div className="mt-1">提交反馈时会一并提交复现后的最近脱敏日志（令牌、Cookie 等会自动隐藏）。</div>
+                                            </div>
+                                        ) : (
+                                            <label className={`flex items-center gap-3 text-sm ${feedbackIncludeDiagnostics ? 'text-gray-300' : 'text-gray-600'}`}>
+                                                <input
+                                                    type="checkbox"
+                                                    disabled={!feedbackIncludeDiagnostics}
+                                                    checked={feedbackIncludeLogs}
+                                                    onChange={event => setFeedbackIncludeLogs(event.target.checked)}
+                                                    className="w-4 h-4"
+                                                />
+                                                同时附带最近 80 条运行日志（令牌、Cookie 等字段会自动隐藏）
+                                            </label>
+                                        )}
                                         {feedbackIncludeDiagnostics && (
                                             <details className="bg-black/30 rounded-lg border border-white/5">
                                                 <summary className="cursor-pointer px-4 py-3 text-xs text-cyan-300 font-bold">
@@ -4604,12 +4873,12 @@ const AdminWidget: React.FC = () => {
                                                         style={{ width: `${downloadProgress}%` }}
                                                     ></div>
                                                 </div>
-                                                <div className="text-xs text-green-400/70 mt-3 text-center">这里显示安装器返回的真实下载进度；完成后程序将自动重启</div>
+                                                <div className="text-xs text-green-400/70 mt-3 text-center">这里显示安装器返回的真实下载进度；安装完成后只会进行一次最终重启</div>
                                             </div>
                                         ) : updateInfo.info?.hasUpdate ? (
                                             <div className="bg-green-900/30 border border-green-500/30 p-5 rounded-xl w-full">
                                                 <div className="text-green-400 font-bold text-md mb-4">🎉 发现新版本: {updateInfo.info.version}</div>
-                                                <button onClick={handleApplyUpdate} className="px-5 py-3 bg-green-600 hover:bg-green-500 text-white text-md rounded-xl font-bold shadow-lg w-full transition-colors">立刻下载并重启更新</button>
+                                                <button onClick={handleApplyUpdate} className="px-5 py-3 bg-green-600 hover:bg-green-500 text-white text-md rounded-xl font-bold shadow-lg w-full transition-colors">下载更新并最终重启一次</button>
                                             </div>
                                         ) : (
                                             <button onClick={handleUpdateCheck} disabled={updateInfo.checking} className="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white text-md rounded-xl font-bold shadow-lg disabled:opacity-50 transition-colors w-full">
@@ -4649,9 +4918,6 @@ const App: React.FC = () => {
             <OverlayWidget
                 onToggleAdmin={() => {
                     if (isElectron) electronAPI?.openAdmin();
-                }}
-                onOpenAppearance={() => {
-                    if (isElectron) electronAPI?.openAdmin('appearance');
                 }}
             />
         </>

@@ -20,6 +20,16 @@ import {
   tracksRepresentSameSong
 } from './queue-head-policy';
 import type { NextObservation } from './queue-head-policy';
+import {
+  markAppUpdateApplying,
+  markAppUpdateExitRequested,
+  markAppUpdateRetryable,
+  markAppUpdateStarted,
+  planAppUpdateRequest,
+  shouldAllowMultipleInstances,
+  shouldRequestAppQuit,
+  type AppUpdatePhase
+} from './app-update-policy';
 import { shouldAutoUpgradeConnectorAfterFailure } from './connector-recovery-policy';
 import {
   isLoopbackRemoteAddress,
@@ -37,6 +47,10 @@ import {
   sanitizeFeedbackLog,
   submitFeedback
 } from './feedback-service';
+import {
+  checkFeedbackSubmissionEvidence,
+  isTechnicalFeedbackCategory
+} from '../src/feedback-submission-policy';
 import { buildExternalApiState } from './external-api-state';
 import {
   addGiftRequestCredits,
@@ -72,6 +86,18 @@ import {
   type PlayerUpgradeHint
 } from './player-upgrade-hint-policy';
 import {
+  isQqPlaybackAnchorMissing,
+  planQqDeferredPlaybackAction,
+  planQqAnchorObservation,
+  shouldDeferQqQueueHeadUntilAnchor,
+  shouldSkipDuplicateQqAnchorInsert,
+  shouldSuppressQqQueueHeadPlayNow
+} from './qq-playback-anchor-policy';
+import {
+  DEFAULT_OVERLAY_ALWAYS_ON_TOP,
+  normalizeOverlayAlwaysOnTop
+} from './overlay-window-policy';
+import {
   isSuccessfulPlayerResult,
   PLAYER_LABELS,
   playerKeyFromConfig,
@@ -88,10 +114,18 @@ import {
   MIN_LOCAL_API_PORT,
   normalizeLocalApiPort
 } from './internal-api-port';
-
 // ⭐ 动态引入 Velopack 规避静态打包分析
 const customRequire = createRequire(import.meta.url);
 const { UpdateManager } = customRequire('velopack');
+
+let applicationQuitRequested = false;
+
+function requestApplicationQuit(): boolean {
+  if (!shouldRequestAppQuit(applicationQuitRequested)) return false;
+  applicationQuitRequested = true;
+  app.quit();
+  return true;
+}
 
 // 1.1 起底层包名与仓库改为 Awoo MusicBot；面向用户仍使用“嗷呜点歌机”。
 // 继续沿用旧用户数据目录，确保升级时保留登录信息、播放器选择和连接器安装状态。
@@ -101,6 +135,21 @@ if (process.platform === 'win32') {
     path.join(app.getPath('appData'), '嗷呜点歌机')
   );
 }
+
+// Production builds share one user-data directory and must have only one
+// updater owner.  The regular Electron runner and build:dev output are
+// explicitly exempt so a development build can be tested beside production;
+// copied dev builds can also opt in with --allow-multiple-instances (or
+// AWOO_ALLOW_MULTIPLE_INSTANCES=1).
+const allowMultipleInstances = shouldAllowMultipleInstances(
+  process.argv,
+  process.env,
+  process.execPath,
+  app.isPackaged
+);
+const hasSingleInstanceLock = allowMultipleInstances
+  || app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) requestApplicationQuit();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -188,6 +237,7 @@ let appUpdateDownloadStatus: AppUpdateDownloadStatus = {
   message: '',
   updatedAt: new Date().toISOString()
 };
+let appUpdatePhase: AppUpdatePhase = 'idle';
 let appUpdateOperation: Promise<void> | null = null;
 
 function setAppUpdateDownloadStatus(
@@ -218,8 +268,14 @@ function writeLog(message: string, color: string = 'Gray') {
   if (sysLogs.length > 100) sysLogs.shift();
 }
 
-function startAppUpdateOperation(): void {
-  if (appUpdateOperation) return;
+function startAppUpdateOperation(): boolean {
+  if (
+    appUpdateOperation
+    || planAppUpdateRequest(appUpdatePhase) === 'already-running'
+  ) {
+    return false;
+  }
+  appUpdatePhase = markAppUpdateStarted();
   appUpdateOperation = (async () => {
     try {
       setAppUpdateDownloadStatus({
@@ -233,6 +289,7 @@ function startAppUpdateOperation(): void {
       );
       const updateInfo = await updateManager.checkForUpdatesAsync();
       if (!updateInfo) {
+        appUpdatePhase = markAppUpdateRetryable();
         setAppUpdateDownloadStatus({
           state: 'no-update',
           progress: null,
@@ -279,9 +336,14 @@ function startAppUpdateOperation(): void {
         version,
         message: '下载完成，正在重启安装'
       });
+      appUpdatePhase = markAppUpdateApplying();
       updateManager.waitExitThenApplyUpdate(updateInfo, false, true);
-      app.quit();
+      // Velopack owns the one final restart.  Keep the phase latched after
+      // this point so duplicate HTTP requests cannot start another updater.
+      appUpdatePhase = markAppUpdateExitRequested();
+      requestApplicationQuit();
     } catch (error: unknown) {
+      appUpdatePhase = markAppUpdateRetryable();
       const message = error instanceof Error
         ? error.message
         : String(error);
@@ -295,8 +357,13 @@ function startAppUpdateOperation(): void {
       writeLog(`[更新] ${message}`, 'Red');
     }
   })().finally(() => {
-    appUpdateOperation = null;
+    // Once Velopack owns the final restart, keep both gates closed until this
+    // old process has actually exited. Failed/no-update attempts are retryable.
+    if (appUpdatePhase !== 'exit-requested') {
+      appUpdateOperation = null;
+    }
   });
+  return true;
 }
 
 process.on('uncaughtException', (err) => {
@@ -310,22 +377,97 @@ process.on('unhandledRejection', (reason) => {
 
 let overlayWindow: BrowserWindow | null = null;
 let adminWindow: BrowserWindow | null = null;
+let overlayAlwaysOnTop = DEFAULT_OVERLAY_ALWAYS_ON_TOP;
+
+function getOverlayAlwaysOnTop(): boolean {
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    try {
+      overlayAlwaysOnTop = overlayWindow.isAlwaysOnTop();
+    } catch {
+      // Keep the last known preference if Electron cannot query the window.
+    }
+  }
+  return overlayAlwaysOnTop;
+}
+
+function syncOverlayAlwaysOnTop(): boolean {
+  const preferredState = normalizeOverlayAlwaysOnTop(overlayAlwaysOnTop);
+  overlayAlwaysOnTop = preferredState;
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    try {
+      overlayWindow.setAlwaysOnTop(preferredState);
+      overlayAlwaysOnTop = overlayWindow.isAlwaysOnTop();
+    } catch {
+      // Keep the preference stable if the native window is being torn down.
+    }
+  }
+  return overlayAlwaysOnTop;
+}
+
+function setAdminWindowTopmost(enabled: boolean): void {
+  if (!adminWindow || adminWindow.isDestroyed()) return;
+  try {
+    adminWindow.setAlwaysOnTop(enabled);
+  } catch {
+    // Ignore teardown races while the control panel is closing.
+  }
+}
+
+function setOverlayAlwaysOnTop(value: unknown): boolean {
+  const previousState = getOverlayAlwaysOnTop();
+  const requestedState = normalizeOverlayAlwaysOnTop(value);
+  let actualState = requestedState;
+
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    try {
+      overlayWindow.setAlwaysOnTop(requestedState);
+      actualState = overlayWindow.isAlwaysOnTop();
+    } catch {
+      actualState = previousState;
+    }
+  }
+
+  overlayAlwaysOnTop = actualState;
+  if (!appConfig.widgetStyle || typeof appConfig.widgetStyle !== 'object' || Array.isArray(appConfig.widgetStyle)) {
+    appConfig.widgetStyle = {};
+  }
+  appConfig.widgetStyle.alwaysOnTop = actualState;
+  saveConfig();
+  return actualState;
+}
 
 function presentAdminWindow() {
   if (!adminWindow || adminWindow.isDestroyed()) return;
-  if (overlayWindow && !overlayWindow.isDestroyed()) {
-    overlayWindow.setAlwaysOnTop(false);
-  }
+  syncOverlayAlwaysOnTop();
   if (adminWindow.isMinimized()) adminWindow.restore();
+  // Keep the control panel usable while it has focus without changing the
+  // user's persisted pin preference for the request overlay.
+  setAdminWindowTopmost(true);
   adminWindow.show();
   adminWindow.moveTop();
   adminWindow.focus();
 }
 
-function restoreOverlayAlwaysOnTop() {
-  if (overlayWindow && !overlayWindow.isDestroyed()) {
-    overlayWindow.setAlwaysOnTop(true);
+function focusExistingWindow(): void {
+  if (adminWindow && !adminWindow.isDestroyed()) {
+    presentAdminWindow();
+    return;
   }
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    if (overlayWindow.isMinimized()) overlayWindow.restore();
+    overlayWindow.show();
+    syncOverlayAlwaysOnTop();
+    overlayWindow.moveTop();
+    overlayWindow.focus();
+    return;
+  }
+  if (app.isReady()) createOverlayWindow();
+}
+
+if (hasSingleInstanceLock && !allowMultipleInstances) {
+  app.on('second-instance', () => {
+    focusExistingWindow();
+  });
 }
 
 function getDevUrl(): string | undefined {
@@ -377,7 +519,7 @@ function createOverlayWindow() {
     width, height, minWidth: MIN_OVERLAY_SIZE.width, minHeight: MIN_OVERLAY_SIZE.height,
     show: false,
     frame: false, transparent: true, hasShadow: false,
-    backgroundColor: '#00000000', alwaysOnTop: true,
+    backgroundColor: '#00000000', alwaysOnTop: overlayAlwaysOnTop,
     resizable: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
@@ -386,12 +528,13 @@ function createOverlayWindow() {
       sandbox: true
     }
   });
+  syncOverlayAlwaysOnTop();
   const initialWindow = overlayWindow;
   initialWindow.once('ready-to-show', () => {
     if (!initialWindow.isDestroyed()) initialWindow.show();
   });
   loadWindow(overlayWindow, 'mode=electron');
-  overlayWindow.on('closed', () => { overlayWindow = null; app.quit(); });
+  overlayWindow.on('closed', () => { overlayWindow = null; requestApplicationQuit(); });
 }
 
 function createAdminWindow(initialTab?: unknown) {
@@ -417,11 +560,17 @@ function createAdminWindow(initialTab?: unknown) {
     presentAdminWindow();
   });
   loadWindow(adminWindow, `admin=true${tab ? `&tab=${tab}` : ''}`);
-  adminWindow.on('minimize', restoreOverlayAlwaysOnTop);
+  adminWindow.on('focus', () => setAdminWindowTopmost(true));
+  adminWindow.on('blur', () => setAdminWindowTopmost(false));
+  adminWindow.on('minimize', () => {
+    setAdminWindowTopmost(false);
+    syncOverlayAlwaysOnTop();
+  });
   adminWindow.on('restore', presentAdminWindow);
   adminWindow.on('closed', () => {
+    setAdminWindowTopmost(false);
     adminWindow = null;
-    restoreOverlayAlwaysOnTop();
+    syncOverlayAlwaysOnTop();
   });
 }
 
@@ -461,6 +610,19 @@ ipcMain.on('get-internal-api-origin', event => {
   event.returnValue = getInternalApiOrigin();
 });
 
+ipcMain.on('get-overlay-always-on-top', event => {
+  event.returnValue = getOverlayAlwaysOnTop();
+});
+
+ipcMain.on('set-overlay-always-on-top', (event, value) => {
+  const senderWindow = BrowserWindow.fromWebContents(event.sender);
+  if (senderWindow !== overlayWindow) {
+    event.returnValue = getOverlayAlwaysOnTop();
+    return;
+  }
+  event.returnValue = setOverlayAlwaysOnTop(value);
+});
+
 ipcMain.on('open-admin', (_event, tab) => createAdminWindow(tab));
 ipcMain.handle('open-external', async (_event, value) => {
   let target: URL;
@@ -476,7 +638,7 @@ ipcMain.handle('open-external', async (_event, value) => {
 });
 ipcMain.on('close-window', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
-  if (win) { if (win === overlayWindow) app.quit(); else win.close(); }
+  if (win) { if (win === overlayWindow) requestApplicationQuit(); else win.close(); }
 });
 ipcMain.on('minimize-window', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
@@ -492,10 +654,11 @@ ipcMain.on('overlay-resize', (event, w, h) => {
 
     const resizedBounds = win.getBounds();
     if (!appConfig.widgetStyle || typeof appConfig.widgetStyle !== 'object') {
-      appConfig.widgetStyle = { theme: null, pos: { x: 50, y: 50 }, size: { w: resizedBounds.width, h: resizedBounds.height }, timestamp: Date.now() };
+      appConfig.widgetStyle = { theme: null, pos: { x: 50, y: 50 }, size: { w: resizedBounds.width, h: resizedBounds.height }, timestamp: Date.now(), alwaysOnTop: overlayAlwaysOnTop };
     } else {
       appConfig.widgetStyle.size = { w: resizedBounds.width, h: resizedBounds.height };
       appConfig.widgetStyle.timestamp = Date.now();
+      appConfig.widgetStyle.alwaysOnTop = overlayAlwaysOnTop;
     }
     saveConfig();
   }
@@ -538,6 +701,12 @@ function loadConfig() {
     if (fs.existsSync(CONFIG_PATH)) {
       const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
       appConfig = { ...appConfig, ...saved };
+
+      if (!appConfig.widgetStyle || typeof appConfig.widgetStyle !== 'object' || Array.isArray(appConfig.widgetStyle)) {
+        appConfig.widgetStyle = {};
+      }
+      overlayAlwaysOnTop = normalizeOverlayAlwaysOnTop(appConfig.widgetStyle.alwaysOnTop);
+      appConfig.widgetStyle.alwaysOnTop = overlayAlwaysOnTop;
 
       if (!appConfig.sysConfig) {
         appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, GiftRequestRequirements: createEmptyGiftRequestRequirements(), IdleWaitNext: true, ShowPlayerCurrentTrack: true, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], ExternalHttpEnabled: false, ExternalWebSocketEnabled: false, ExternalApiPort: DEFAULT_EXTERNAL_API_PORT, InternalApiPort: ENV_INTERNAL_API_PORT };
@@ -649,6 +818,9 @@ let playerControlNotice: PlayerControlNotice | null = null;
 let registeredNextGuardKey = '';
 let registeredNextGuardSongIdentity = '';
 let queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+let deferredQqInsertIdentity = '';
+let qqDeferredInsertRetryAttempted = false;
+let qqDeferredInsertRetryInFlight = false;
 const cancelledNativeNextSongs = new Map<string, any>();
 let nextGuardOperationTail: Promise<void> = Promise.resolve();
 let managedPlayerActionSequence = 0;
@@ -675,6 +847,15 @@ function getSelectedPlayerKey(): PlayerKey {
 
 function getSelectedPlayerLabel(): string {
   return PLAYER_LABELS[getSelectedPlayerKey()];
+}
+
+function shouldDeferQqQueueHeadForMissingAnchor(
+  playbackAnchorReady = activePlayerSnapshot?.playbackAnchorReady === true
+): boolean {
+  return shouldDeferQqQueueHeadUntilAnchor({
+    playerKey: getSelectedPlayerKey(),
+    playbackAnchorReady: playbackAnchorReady === true
+  });
 }
 
 const playerManager = new PlayerManager({
@@ -706,6 +887,7 @@ const playerManager = new PlayerManager({
       playerControlNotice = null;
     }
     if (!state.connected) {
+      clearDeferredQqInsert();
       registeredNextGuardKey = '';
       registeredNextGuardSongIdentity = '';
       queueHeadNeedsGuardOnlyAfterCurrentChange = false;
@@ -715,7 +897,17 @@ const playerManager = new PlayerManager({
   },
   onTrackChanged: async (track, observation) => {
     if (!track) {
-      await syncTrackChangeLogic('', '播放停止', null, '无');
+      await syncTrackChangeLogic(
+        '',
+        '播放停止',
+        null,
+        '无',
+        '',
+        '',
+        null,
+        'legacy',
+        observation.playbackAnchorReady === true
+      );
       return;
     }
     await syncTrackChangeLogic(
@@ -731,15 +923,19 @@ const playerManager = new PlayerManager({
       track.artist || '',
       observation.coverUrl || '',
       observation.nextTrack || null,
-      observation.nextObservation
+      observation.nextObservation,
+      observation.playbackAnchorReady === true
     );
   },
-  onTrackUpdated: (track, observation) => {
+  onTrackUpdated: async (track, observation) => {
     updatePlayerCurrentTrack(
       String(track.id || `${track.title}|${track.artist}`),
       track.title,
       track.artist || '',
       observation.coverUrl || ''
+    );
+    await retryDeferredQqInsertAfterObservation(
+      observation.playbackAnchorReady === true
     );
     const managedAction = activeManagedPlayerAction;
     if (managedAction && tracksRepresentSameSong(managedAction.target, track)) {
@@ -1398,7 +1594,96 @@ function updatePlayerCurrentTrack(trackId: string, songName: string, artistName:
   }
 }
 
-async function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string, currArtist: string = '', currCoverUrl: string = '', observedNextTrack: any = null, nextObservation: NextObservation = 'legacy'): Promise<void> {
+type QqDeferredObservationResult =
+  | 'none'
+  | 'takeover-success'
+  | 'takeover-failed';
+
+async function takeOverDeferredQqHeadNow(
+  songInfo: any
+): Promise<QqDeferredObservationResult> {
+  const deferredIdentity = deferredQqInsertIdentity;
+  if (
+    !deferredIdentity
+    || getQueueSongIdentity(songInfo) !== deferredIdentity
+  ) {
+    clearDeferredQqInsert();
+    return 'none';
+  }
+
+  // Mark the one-shot transition before entering the managed playback
+  // transaction. playSongNow clears deferred state at its entry point, so
+  // the failure path below explicitly restores it while the queue head is
+  // still the same request.
+  qqDeferredInsertRetryAttempted = true;
+  qqDeferredInsertRetryInFlight = true;
+  writeLog(
+    `[队首守卫] QQ 音乐首次播放已建立锚点，立即接管待播队首: ${songInfo.SongName}`,
+    'Yellow'
+  );
+
+  const playbackConfirmed = await playSongNow(songInfo, 'play-now');
+  qqDeferredInsertRetryInFlight = false;
+  if (playbackConfirmed) {
+    clearDeferredQqInsert();
+    writeLog(
+      `✅ QQ 音乐已通过精确选歌接管待播队首: ${songInfo.SongName}`,
+      'Green'
+    );
+    setGlobalStatus(`[播放] ${songInfo.SongName}`);
+    return 'takeover-success';
+  }
+
+  if (getQueueSongIdentity(targetQueue[0]) === deferredIdentity) {
+    // Keep the request at the head, but never issue another automatic
+    // takeover for this anchor/session. A reconnect, player switch, or queue
+    // mutation clears/replaces this identity through the existing lifecycle.
+    deferredQqInsertIdentity = deferredIdentity;
+    qqDeferredInsertRetryAttempted = true;
+    qqDeferredInsertRetryInFlight = false;
+    writeLog(
+      `[队首守卫] QQ 音乐首次播放后接管失败，已保留队首且不再重复尝试: ${songInfo.SongName}`,
+      'Yellow'
+    );
+    setGlobalStatus('QQ 音乐首次播放后接管失败，请检查播放器');
+  } else {
+    clearDeferredQqInsert();
+  }
+  return 'takeover-failed';
+}
+
+async function retryDeferredQqInsertAfterObservation(
+  playbackAnchorReady: boolean
+): Promise<QqDeferredObservationResult> {
+  const queueHead = targetQueue[0];
+  if (!queueHead) return 'none';
+
+  const deferredOptions = {
+    playerKey: getSelectedPlayerKey(),
+    playbackAnchorReady: playbackAnchorReady === true,
+    deferredIdentity: deferredQqInsertIdentity,
+    queueHeadIdentity: getQueueSongIdentity(queueHead),
+    retryAttempted: qqDeferredInsertRetryAttempted,
+    retryInFlight: qqDeferredInsertRetryInFlight
+  };
+  const deferredAction = planQqAnchorObservation(deferredOptions);
+  if (deferredAction === 'clear') {
+    clearDeferredQqInsert();
+    return 'none';
+  } else if (
+    planQqDeferredPlaybackAction(deferredOptions) === 'takeover-now'
+    && !isObservedSong(queueHead)
+  ) {
+    return await takeOverDeferredQqHeadNow(queueHead);
+  } else if (isObservedSong(queueHead)) {
+    // The deferred item is already the current track; consume it through
+    // the normal observation path instead of inserting it after itself.
+    clearDeferredQqInsert();
+  }
+  return 'none';
+}
+
+async function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string, currArtist: string = '', currCoverUrl: string = '', observedNextTrack: any = null, nextObservation: NextObservation = 'legacy', playbackAnchorReady = false): Promise<void> {
   playerPausedAfterRequests = false;
   updatePlayerCurrentTrack(currId, currName, currArtist, currCoverUrl);
   writeLog(
@@ -1406,6 +1691,19 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
     + `下一首预告: ${nextName}${nextId ? ` (${nextId})` : ''}`,
     'Magenta'
   );
+
+  // QQ Music cannot insert relative to a playlist cursor until its first
+  // real current track is observed. The same entry point is also used by
+  // same-song snapshot updates when only playbackAnchorReady changes.
+  const deferredObservationResult =
+    await retryDeferredQqInsertAfterObservation(playbackAnchorReady);
+  if (deferredObservationResult === 'takeover-success') {
+    // The verified PlaySelected transaction owns this observation.  Do not
+    // let the manual/native track that established the anchor fall through to
+    // the normal no-current-song fallback, which would issue PlaySelected
+    // again.
+    return;
+  }
 
   const managedAction = activeManagedPlayerAction;
   if (managedAction && Date.now() > managedAction.expiresAt) {
@@ -1469,13 +1767,19 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
       } else if (targetQueue.length > 0) {
         if (checkSkipForce && targetQueue[0]?.Id === currentPlayingSong?.Id) {
           writeLog(`[状态同步] 退回操作触发: 放行原生曲目，点播曲延后: ${targetQueue[0]?.SongName}`, 'DarkGray');
-          await guardNextSong(targetQueue[0]);
+          await guardNextSong(targetQueue[0], playbackAnchorReady);
           currentPlayingSong = null;
           stateChanged = true;
         } else {
           writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0]?.SongName}`, 'Magenta');
           const queuedSong = targetQueue[0];
-          if (await playSongNow(queuedSong)) {
+          const deferForMissingAnchor = shouldDeferQqQueueHeadForMissingAnchor(
+            playbackAnchorReady
+          );
+          const queuedPlaybackConfirmed = deferForMissingAnchor
+            ? await guardNextSong(queuedSong, playbackAnchorReady)
+            : await playSongNow(queuedSong);
+          if (queuedPlaybackConfirmed && !deferForMissingAnchor) {
             stateChanged = true;
           }
         }
@@ -1505,11 +1809,38 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
         queueHeadNeedsGuardOnlyAfterCurrentChange = false;
         currentPlayingSong = targetQueue.shift();
         stateChanged = true;
+      } else if (shouldDeferQqQueueHeadForMissingAnchor(playbackAnchorReady)) {
+        // QQ cannot safely use PlaySelected before its native playback cursor
+        // exists. Keep the request local; guardNextSong records the defer and
+        // the next ready observation performs the one InsertNext retry.
+        await guardNextSong(targetQueue[0], playbackAnchorReady);
       } else {
-        writeLog(`[兜底纠正] 实际切歌与待播队首不符，立即切到: ${targetQueue[0]?.SongName}`, 'Magenta');
-        const queuedSong = targetQueue[0];
-        if (await playSongNow(queuedSong)) {
-          stateChanged = true;
+        const shouldKeepDeferredQqHead = shouldSuppressQqQueueHeadPlayNow({
+          playerKey: getSelectedPlayerKey(),
+          queueHeadIdentity: getQueueSongIdentity(targetQueue[0]),
+          deferredIdentity: deferredQqInsertIdentity,
+          playbackAnchorReady: playbackAnchorReady === true,
+          retryAttempted: qqDeferredInsertRetryAttempted,
+          retryInFlight: qqDeferredInsertRetryInFlight
+        });
+        const queueHeadAlreadyGuarded = registeredNextGuardSongIdentity
+          === getQueueSongIdentity(targetQueue[0]);
+        if (shouldKeepDeferredQqHead || queueHeadAlreadyGuarded) {
+          // Keep an already inserted/deferred request local instead of
+          // starting it immediately as a fallback.
+          setGlobalStatus(
+            shouldKeepDeferredQqHead
+              ? qqDeferredInsertRetryAttempted
+                ? 'QQ 音乐插入下一首失败，请在基础设置重连后重试'
+                : '等待 QQ 音乐首次播放后插入下一首'
+              : `下一首已就绪: ${targetQueue[0]?.SongName}`
+          );
+        } else {
+          writeLog(`[兜底纠正] 实际切歌与待播队首不符，立即切到: ${targetQueue[0]?.SongName}`, 'Magenta');
+          const queuedSong = targetQueue[0];
+          if (await playSongNow(queuedSong)) {
+            stateChanged = true;
+          }
         }
       }
     }
@@ -1539,7 +1870,7 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
         if (nextAction === 'arm-only') {
           await armNextGuardOnly(targetQueue[0]);
         } else {
-          await guardNextSong(targetQueue[0]);
+          await guardNextSong(targetQueue[0], playbackAnchorReady);
         }
       }
     }
@@ -1743,6 +2074,7 @@ function scheduleStartupBackgroundServices(win: BrowserWindow): void {
 }
 
 async function reconnectPlayerBridge(): Promise<boolean> {
+  clearDeferredQqInsert();
   updatePlayerCurrentTrack('', '');
   return await connectWithConnectorMaintenanceStatus(
     () => playerManager.reconnect()
@@ -1750,6 +2082,7 @@ async function reconnectPlayerBridge(): Promise<boolean> {
 }
 
 async function startPlayerRadar(): Promise<boolean> {
+  clearDeferredQqInsert();
   playerManager.resetObservedTrack();
   updatePlayerCurrentTrack('', '');
   return await connectWithConnectorMaintenanceStatus(
@@ -1874,6 +2207,36 @@ function getQueueSongIdentity(songInfo: any): string {
   return queueSongIdentity(songInfo, getSelectedPlayerKey());
 }
 
+function clearDeferredQqInsert(): void {
+  deferredQqInsertIdentity = '';
+  qqDeferredInsertRetryAttempted = false;
+  qqDeferredInsertRetryInFlight = false;
+}
+
+function deferQqInsert(songInfo: any): void {
+  if (getSelectedPlayerKey() !== 'qqmusic' || !songInfo) return;
+  const identity = getQueueSongIdentity(songInfo);
+  if (!identity) return;
+  if (deferredQqInsertIdentity !== identity) {
+    deferredQqInsertIdentity = identity;
+    qqDeferredInsertRetryAttempted = false;
+    qqDeferredInsertRetryInFlight = false;
+  }
+  writeLog(
+    `[队首守卫] QQ 音乐尚未播放过歌曲，已暂缓插入下一首: ${songInfo.SongName}`,
+    'Yellow'
+  );
+  setGlobalStatus('等待 QQ 音乐首次播放后插入下一首');
+}
+
+function syncDeferredQqInsertWithQueueHead(): void {
+  if (!deferredQqInsertIdentity) return;
+  const headIdentity = getQueueSongIdentity(targetQueue[0]);
+  if (headIdentity !== deferredQqInsertIdentity) {
+    clearDeferredQqInsert();
+  }
+}
+
 async function serializeNextGuardOperation<T>(
   operation: () => Promise<T>
 ): Promise<T> {
@@ -1898,10 +2261,60 @@ async function waitForManagedPlayerActionSettlement(): Promise<void> {
 }
 
 async function guardNextSong(
-  songInfo: any
+  songInfo: any,
+  playbackAnchorReadyOverride?: boolean
 ): Promise<boolean> {
   return serializeNextGuardOperation(async () => {
     if (!songInfo) return false;
+    const playbackAnchorReady = playbackAnchorReadyOverride === undefined
+      ? activePlayerSnapshot?.playbackAnchorReady === true
+      : playbackAnchorReadyOverride === true;
+    const songIdentity = getQueueSongIdentity(songInfo);
+    const deferredAction = planQqAnchorObservation({
+      playerKey: getSelectedPlayerKey(),
+      playbackAnchorReady,
+      deferredIdentity: deferredQqInsertIdentity,
+      queueHeadIdentity: songIdentity,
+      retryAttempted: qqDeferredInsertRetryAttempted,
+      retryInFlight: qqDeferredInsertRetryInFlight
+    });
+    if (deferredAction === 'clear') {
+      clearDeferredQqInsert();
+    } else if (
+      deferredAction === 'none'
+      && shouldSkipDuplicateQqAnchorInsert({
+        playerKey: getSelectedPlayerKey(),
+        songIdentity,
+        deferredIdentity: deferredQqInsertIdentity,
+        playbackAnchorReady,
+        retryAttempted: qqDeferredInsertRetryAttempted,
+        retryInFlight: qqDeferredInsertRetryInFlight
+      })
+    ) {
+      setGlobalStatus(
+        qqDeferredInsertRetryAttempted
+          ? 'QQ 音乐插入下一首失败，请在基础设置重连后重试'
+          : '等待 QQ 音乐首次播放后插入下一首'
+      );
+      return true;
+    }
+    if (
+      shouldDeferQqQueueHeadForMissingAnchor(playbackAnchorReady)
+      && deferredAction !== 'retry'
+    ) {
+      // Do not even send InsertNext to a cold QQ playlist. Older connectors
+      // may not return the structured failure, so the host must keep this
+      // request local until playbackAnchorReady is explicitly true.
+      deferQqInsert(songInfo);
+      return true;
+    }
+    if (deferredAction === 'retry') {
+      // A ready snapshot is not itself the observation-owned takeover path.
+      // Keep the deferred request local until the observation callback can
+      // run the verified PlaySelected transaction exactly once.
+      setGlobalStatus('等待 QQ 音乐首次播放后接管队首');
+      return true;
+    }
     if (queueHeadNeedsGuardOnlyAfterCurrentChange) {
       writeLog(
         `ℹ️ 正在等待立即播放目标真正开始，暂不提前插入后续队首: ${songInfo.SongName}`,
@@ -1923,6 +2336,14 @@ async function guardNextSong(
       registeredNextGuardKey = guardKey;
       registeredNextGuardSongIdentity = getQueueSongIdentity(songInfo);
       writeLog(`✅ 已登记下一首守卫: ${songInfo.SongName}`, 'DarkGray');
+      return true;
+    }
+    if (isQqPlaybackAnchorMissing({
+      playerKey: getSelectedPlayerKey(),
+      command: 'InsertNext',
+      failureCode: result?.failureCode
+    })) {
+      deferQqInsert(songInfo);
       return true;
     }
     if (registeredNextGuardKey === guardKey) {
@@ -1973,6 +2394,7 @@ async function reconcileQueueHeadAfterMutation(
   context: string
 ): Promise<void> {
   const nextHead = targetQueue[0] || null;
+  syncDeferredQqInsertWithQueueHead();
   const hadRegisteredNext = Boolean(registeredNextGuardKey)
     && registeredNextGuardSongIdentity
       === getQueueSongIdentity(previousHead);
@@ -2008,6 +2430,7 @@ async function playSongNow(
   mode: 'play-now' | 'interrupt' = 'play-now'
 ): Promise<boolean> {
   if (!songInfo) return false;
+  clearDeferredQqInsert();
   playerPausedAfterRequests = false;
   const operationState = await serializeNextGuardOperation(async () => {
     const previousCurrentPlayingSong = currentPlayingSong;
@@ -2367,7 +2790,13 @@ async function tryRequestSong(
         && !currentPlayingSong
       ) {
         const first = targetQueue[0];
-        if (first) guardRegistered = await playSongNow(first);
+        if (first) {
+          // A normal first request must not use PlaySelected while QQ has no
+          // native playback cursor: that path can consume the playlist head.
+          guardRegistered = shouldDeferQqQueueHeadForMissingAnchor()
+            ? await guardNextSong(first)
+            : await playSongNow(first);
+        }
       } else {
         guardRegistered = await guardNextSong(targetQueue[0]);
       }
@@ -3708,7 +4137,21 @@ async function startBackendServer(): Promise<void> {
           port: getExternalApiPort()
         });
         if (body.roomId !== undefined) appConfig.roomId = body.roomId;
-        if (body.widgetStyle !== undefined) appConfig.widgetStyle = body.widgetStyle;
+        if (body.widgetStyle !== undefined) {
+          const incomingWidgetStyle = body.widgetStyle && typeof body.widgetStyle === 'object' && !Array.isArray(body.widgetStyle)
+            ? body.widgetStyle
+            : {};
+          const existingWidgetStyle = appConfig.widgetStyle && typeof appConfig.widgetStyle === 'object' && !Array.isArray(appConfig.widgetStyle)
+            ? appConfig.widgetStyle
+            : {};
+          appConfig.widgetStyle = {
+            ...existingWidgetStyle,
+            ...incomingWidgetStyle,
+            // The pin button is the source of truth for the native window;
+            // renderer theme/size saves must not reset it accidentally.
+            alwaysOnTop: getOverlayAlwaysOnTop()
+          };
+        }
         if (body.sysConfig !== undefined) {
           const incomingConfig = { ...body.sysConfig };
           delete incomingConfig.FoliaTokenConfigured;
@@ -3741,6 +4184,7 @@ async function startBackendServer(): Promise<void> {
         }
 
         if (previousPlayerType !== appConfig.sysConfig.PlayerType) {
+          clearDeferredQqInsert();
           targetQueue = [];
           currentPlayingSong = null;
           playerPausedAfterRequests = false;
@@ -3989,12 +4433,41 @@ async function startBackendServer(): Promise<void> {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       try {
         const body = await readJsonRequest(req);
+        const category = String(body.category || 'bug');
         const includeDiagnostics = body.includeDiagnostics !== false;
-        const context = await buildFeedbackContext(
-          includeDiagnostics && body.includeLogs === true
-        );
+        const includeLogs = includeDiagnostics && body.includeLogs === true;
+        const technicalFeedback = isTechnicalFeedbackCategory(category);
+        const context = await buildFeedbackContext(includeLogs);
+        const recentLogs = Array.isArray(context.diagnostics?.recentLogs)
+          ? context.diagnostics.recentLogs
+          : [];
+        const evidenceCheck = checkFeedbackSubmissionEvidence({
+          category,
+          updatesRetried: body.updatesRetried === true,
+          reproductionConfirmed: body.reproductionConfirmed === true,
+          includeDiagnostics,
+          includeLogs,
+          diagnosticsLoaded: Boolean(context.diagnostics),
+          logsCapturedAfterReproduction:
+            body.reproductionConfirmed === true && recentLogs.length > 0
+        });
+        if (!evidenceCheck.allowed) {
+          res.writeHead(400);
+          res.end(JSON.stringify({
+            success: false,
+            message: evidenceCheck.message || '请先完成提交前检查'
+          }));
+          return;
+        }
+        if (technicalFeedback) {
+          context.diagnostics.feedbackPreparation = {
+            updatesRetried: true,
+            reproducedInCurrentSession: true,
+            attachedRecentLogCount: recentLogs.length
+          };
+        }
         const result = await submitFeedback({
-          category: String(body.category || 'bug'),
+          category,
           priority: String(body.priority || 'normal'),
           title: String(body.title || '').slice(0, 120),
           description: String(body.description || '').slice(0, 8000),
@@ -4117,6 +4590,13 @@ async function startBackendServer(): Promise<void> {
     }
 
     if (url.pathname === '/api/update/check') {
+      if (allowMultipleInstances) {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({
+          error: '多实例调试模式下已禁用自动更新，请使用正式安装版更新'
+        }));
+        return;
+      }
       try {
         const um = new UpdateManager('https://app.enkianss.us/update/awoo');
         const updateInfo = await um.checkForUpdatesAsync();
@@ -4131,19 +4611,31 @@ async function startBackendServer(): Promise<void> {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
         success: true,
-        status: appUpdateDownloadStatus
+        status: appUpdateDownloadStatus,
+        phase: appUpdatePhase
       }));
       return;
     }
 
     if (url.pathname === '/api/update/apply' && req.method === 'POST') {
-      const alreadyRunning = Boolean(appUpdateOperation);
-      startAppUpdateOperation();
+      if (allowMultipleInstances) {
+        res.writeHead(409, {
+          'Content-Type': 'application/json; charset=utf-8'
+        });
+        res.end(JSON.stringify({
+          success: false,
+          alreadyRunning: false,
+          message: '多实例调试模式下不能启动自动更新，请在正式安装版中操作'
+        }));
+        return;
+      }
+      const started = startAppUpdateOperation();
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
         success: true,
-        alreadyRunning,
-        status: appUpdateDownloadStatus
+        alreadyRunning: !started,
+        status: appUpdateDownloadStatus,
+        phase: appUpdatePhase
       }));
       return;
     }
@@ -4253,7 +4745,7 @@ async function startBackendServer(): Promise<void> {
 // ==========================================
 // 程序启动入口
 // ==========================================
-app.whenReady().then(() => {
+if (hasSingleInstanceLock) app.whenReady().then(() => {
   writeLog('=== 嗷呜点歌机内部日志已连接 ===', 'Cyan');
   loadConfig();
   connectorMaintenanceTimer = setInterval(
@@ -4280,11 +4772,12 @@ app.whenReady().then(() => {
       '嗷呜点歌机启动失败',
       `内部服务无法监听本机端口，控制面板不会继续运行。\n\n${message}`
     );
-    app.quit();
+    requestApplicationQuit();
   });
 });
 
 app.on('before-quit', () => {
+  applicationQuitRequested = true;
   if (giftLibrarySaveTimer) {
     clearTimeout(giftLibrarySaveTimer);
     giftLibrarySaveTimer = null;
@@ -4302,4 +4795,6 @@ app.on('before-quit', () => {
   void stopExternalApiServer();
 });
 
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') requestApplicationQuit();
+});

@@ -43,7 +43,7 @@ interface PlayerManagerOptions {
   onTrackUpdated: (
     track: PlayerTrack,
     observation: PlayerTrackObservation
-  ) => void;
+  ) => Promise<void>;
 }
 
 export class PlayerManager {
@@ -438,6 +438,7 @@ export class PlayerManager {
         track: snapshot.connected ? snapshot.current || null : null,
         nextTrack,
         nextObservation,
+        playbackAnchorReady: snapshot.playbackAnchorReady === true,
         coverUrl: snapshot.current?.coverUrl || '',
         nextDescription: snapshot.next?.title
           ? `${snapshot.next.title}${snapshot.next.artist ? ` - ${snapshot.next.artist}` : ''}`
@@ -490,7 +491,7 @@ export class PlayerManager {
           this.lastObservedTrackKey = observedKey;
           this.lastObservedTrack = track;
         } else {
-          this.options.onTrackUpdated(track, observation);
+          await this.options.onTrackUpdated(track, observation);
           this.lastObservedTrackKey = observedKey;
           this.lastObservedTrack = track;
         }

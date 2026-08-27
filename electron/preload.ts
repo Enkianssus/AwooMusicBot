@@ -7,8 +7,28 @@ try {
   // 旧版主进程或非 Electron 预览环境没有这个 IPC 时，renderer 会使用当前 origin。
 }
 
+function getOverlayAlwaysOnTop(): boolean {
+  try {
+    const value = ipcRenderer.sendSync('get-overlay-always-on-top');
+    return typeof value === 'boolean' ? value : true;
+  } catch {
+    return true;
+  }
+}
+
+function setOverlayAlwaysOnTop(enabled: boolean): boolean {
+  try {
+    const value = ipcRenderer.sendSync('set-overlay-always-on-top', enabled);
+    return typeof value === 'boolean' ? value : getOverlayAlwaysOnTop();
+  } catch {
+    return getOverlayAlwaysOnTop();
+  }
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   internalApiOrigin,
+  getOverlayAlwaysOnTop,
+  setOverlayAlwaysOnTop,
   openAdmin: (tab?: string) => ipcRenderer.send('open-admin', tab),
   openExternal: (url: string) => ipcRenderer.invoke('open-external', url),
   claimWelcomeHint: (legacyHintWasShown: boolean) =>

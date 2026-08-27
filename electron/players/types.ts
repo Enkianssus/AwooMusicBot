@@ -51,6 +51,7 @@ export interface PlayerTrackObservation {
   track: PlayerTrack | null;
   nextTrack?: PlayerTrack | null;
   nextObservation: NextObservation;
+  playbackAnchorReady?: boolean;
   coverUrl?: string;
   nextDescription: string;
 }

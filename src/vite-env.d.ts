@@ -3,6 +3,8 @@
 interface Window {
   electronAPI?: {
     internalApiOrigin: string;
+    getOverlayAlwaysOnTop?: () => boolean;
+    setOverlayAlwaysOnTop?: (enabled: boolean) => boolean;
     openAdmin: (tab?: string) => void;
     openExternal: (url: string) => Promise<void>;
     claimWelcomeHint: (legacyHintWasShown: boolean) => Promise<boolean>;

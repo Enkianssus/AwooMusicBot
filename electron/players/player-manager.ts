@@ -11,6 +11,10 @@ import {
   type ConnectorUpdateStatus,
   type NativeConnectorId
 } from '../connector-updater';
+import {
+  inspectPlayerProcess,
+  type PlayerProcessInfo
+} from '../player-process-inspector';
 import { FoliaPlayerBackend } from './folia-player';
 import { KugouPlayerBackend } from './kugou-player';
 import { NeteasePlayerBackend } from './netease-player';
@@ -144,6 +148,16 @@ export class PlayerManager {
     connectorId: NativeConnectorId
   ): Promise<boolean> {
     return this.bridge.isConnectorInstalled(connectorId);
+  }
+
+  /**
+   * Probe the actual desktop player independently of the connector process.
+   * This is intentionally separate from connectionState: a connector can
+   * fail before it has returned any snapshot, while the player is still
+   * running and may have a newer file version.
+   */
+  async inspectSelectedPlayerProcess(): Promise<PlayerProcessInfo> {
+    return await inspectPlayerProcess(this.selectedKey);
   }
 
   async updateConnector(

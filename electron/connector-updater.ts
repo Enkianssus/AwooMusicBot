@@ -53,6 +53,9 @@ export interface ConnectorUpdateStatus {
   manualUpdateAvailable: boolean;
   updateKind: ConnectorUpdateKind;
   supportedPlayerVersion: string | null;
+  /** Raw catalog metadata used by the one-shot player-branch repair policy. */
+  playerVersionPolicy?: string | null;
+  testedPlayerVersion?: string | null;
   updating: boolean;
   checkedAt: string;
   error: string | null;
@@ -665,6 +668,8 @@ export class ConnectorUpdater {
         entry?.testedPlayerVersion
         || entry?.playerVersionPolicy
         || null,
+      playerVersionPolicy: entry?.playerVersionPolicy || null,
+      testedPlayerVersion: entry?.testedPlayerVersion || null,
       updating: this.updates.has(connectorId),
       checkedAt,
       error

@@ -30,7 +30,10 @@ import {
   shouldRequestAppQuit,
   type AppUpdatePhase
 } from './app-update-policy';
-import { shouldAutoUpgradeConnectorAfterFailure } from './connector-recovery-policy';
+import {
+  CONNECTOR_AUTO_REPAIR_MESSAGES,
+  planConnectorAutoRepair
+} from './connector-auto-repair-policy';
 import {
   isLoopbackRemoteAddress,
   normalizeLocalSongKeyword,
@@ -97,6 +100,16 @@ import {
   DEFAULT_OVERLAY_ALWAYS_ON_TOP,
   normalizeOverlayAlwaysOnTop
 } from './overlay-window-policy';
+import {
+  fetchBiliDanmuInfoWithFallback
+} from './bili-wbi';
+import {
+  BILI_ROOM_CONNECTION_MESSAGES,
+  createBiliRoomConnectionState,
+  reduceBiliRoomConnectionState,
+  type BiliRoomConnectionEvent,
+  type BiliRoomConnectionState
+} from './bili-room-connection-policy';
 import {
   isSuccessfulPlayerResult,
   PLAYER_LABELS,
@@ -211,8 +224,28 @@ interface SysLog {
 const sysLogs: SysLog[] = [];
 let currentStatusMessage: string = '点歌就绪';
 let connectorMaintenanceStatus = '';
+let connectorMaintenanceStatusOwner = 0;
+let connectorMaintenanceStatusSequence = 0;
 let statusClearTimer: NodeJS.Timeout | null = null;
 let isPlayerConnected: boolean = false;
+let playerConnectionRecoverySuppressed = 0;
+let playerConnectionRecoverySuppressionEpoch = 0;
+
+async function withPlayerConnectionRecoverySuppressed<T>(
+  operation: () => Promise<T>
+): Promise<T> {
+  playerConnectionRecoverySuppressed++;
+  playerConnectionRecoverySuppressionEpoch++;
+  try {
+    return await operation();
+  } finally {
+    playerConnectionRecoverySuppressed = Math.max(
+      0,
+      playerConnectionRecoverySuppressed - 1
+    );
+    playerConnectionRecoverySuppressionEpoch++;
+  }
+}
 
 type AppUpdateDownloadState =
   | 'idle'
@@ -256,6 +289,19 @@ function setGlobalStatus(msg: string) {
   statusClearTimer = setTimeout(() => {
     currentStatusMessage = '点歌就绪';
   }, 4000);
+}
+
+function claimConnectorMaintenanceStatus(message: string): number {
+  const owner = ++connectorMaintenanceStatusSequence;
+  connectorMaintenanceStatusOwner = owner;
+  connectorMaintenanceStatus = message;
+  return owner;
+}
+
+function releaseConnectorMaintenanceStatus(owner: number): void {
+  if (!owner || connectorMaintenanceStatusOwner !== owner) return;
+  connectorMaintenanceStatusOwner = 0;
+  connectorMaintenanceStatus = '';
 }
 
 function writeLog(message: string, color: string = 'Gray') {
@@ -673,6 +719,7 @@ const WELCOME_HINT_SENTINEL_PATH = path.join(
 
 let appConfig: any = {
   roomId: 0,
+  roomConnectionEnabled: false,
   myRoomId: 0,
   biliCookie: '',
   biliUid: 0,
@@ -696,11 +743,29 @@ let appConfig: any = {
   }
 };
 
+let biliRoomState: BiliRoomConnectionState = createBiliRoomConnectionState();
+
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_PATH)) {
       const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
       appConfig = { ...appConfig, ...saved };
+
+      // Older configs had no explicit connection switch. Preserve their
+      // previous behaviour only when a room was already configured; a user
+      // who has explicitly disconnected in a newer config stays disconnected
+      // across restarts.
+      const hasRoomConnectionEnabled = Boolean(
+        saved
+        && Object.prototype.hasOwnProperty.call(
+          saved,
+          'roomConnectionEnabled'
+        )
+      );
+      appConfig.roomConnectionEnabled = hasRoomConnectionEnabled
+        ? saved.roomConnectionEnabled === true
+        : Number(appConfig.roomId) > 0;
+      biliRoomState = createBiliRoomConnectionState(appConfig.roomId);
 
       if (!appConfig.widgetStyle || typeof appConfig.widgetStyle !== 'object' || Array.isArray(appConfig.widgetStyle)) {
         appConfig.widgetStyle = {};
@@ -750,6 +815,7 @@ function loadConfig() {
       biliCookie = appConfig.biliCookie || '';
       biliUid = appConfig.biliUid || 0;
       writeLog(`✅ 已加载本地配置，当前缓存的直播间为: ${appConfig.roomId}`, 'Green');
+      if (!hasRoomConnectionEnabled) saveConfig();
     }
   } catch { writeLog('加载配置失败', 'Red'); }
 }
@@ -865,6 +931,7 @@ const playerManager = new PlayerManager({
   log: writeLog,
   setStatus: setGlobalStatus,
   onStateChanged: state => {
+    const wasConnected = isPlayerConnected;
     isPlayerConnected = state.connected;
     playerConnecting = state.connecting;
     activePlayerSnapshot = state.snapshot;
@@ -893,6 +960,27 @@ const playerManager = new PlayerManager({
       queueHeadNeedsGuardOnlyAfterCurrentChange = false;
       activeManagedPlayerAction = null;
       cancelledNativeNextSongs.clear();
+    }
+    if (
+      wasConnected
+      && !state.connected
+      && !state.connecting
+      && !applicationQuitRequested
+      && playerConnectionRecoverySuppressed === 0
+    ) {
+      // A connector can exit after a successful initial probe. Defer the
+      // recovery until the state callback unwinds; the one-shot coordinator
+      // below then prevents a 350ms poll/event burst from starting parallel
+      // upgrades or reconnect loops.
+      const suppressionEpoch = playerConnectionRecoverySuppressionEpoch;
+      queueMicrotask(() => {
+        if (
+          applicationQuitRequested
+          || playerConnectionRecoverySuppressed > 0
+          || suppressionEpoch !== playerConnectionRecoverySuppressionEpoch
+        ) return;
+        void recoverPlayerConnectionAfterFailure();
+      });
     }
   },
   onTrackChanged: async (track, observation) => {
@@ -1097,6 +1185,97 @@ async function addReject(user: any, reason: string) {
 // ==========================================
 let currentBiliWs: any = null;
 let biliPingTimer: NodeJS.Timeout | null = null;
+let biliReconnectTimer: NodeJS.Timeout | null = null;
+let biliConnectionTimer: NodeJS.Timeout | null = null;
+let biliRoomSession = 0;
+let biliConnectionAttempt: {
+  session: number;
+  resolve: (connected: boolean) => void;
+} | null = null;
+
+function dispatchBiliRoomConnectionEvent(
+  event: BiliRoomConnectionEvent
+): void {
+  biliRoomState = reduceBiliRoomConnectionState(biliRoomState, event);
+}
+
+function getBiliRoomConnectionInfo() {
+  return {
+    requestedRoomId: biliRoomState.requestedRoomId,
+    realRoomId: biliRoomState.realRoomId,
+    status: biliRoomState.status,
+    message: biliRoomState.message,
+    enabled: appConfig.roomConnectionEnabled === true
+  };
+}
+
+function clearBiliConnectionTimers(): void {
+  if (biliReconnectTimer) {
+    clearTimeout(biliReconnectTimer);
+    biliReconnectTimer = null;
+  }
+  if (biliConnectionTimer) {
+    clearTimeout(biliConnectionTimer);
+    biliConnectionTimer = null;
+  }
+}
+
+function clearBiliPingTimer(): void {
+  if (biliPingTimer) {
+    clearInterval(biliPingTimer);
+    biliPingTimer = null;
+  }
+}
+
+function closeCurrentBiliWebSocket(): void {
+  const ws = currentBiliWs;
+  currentBiliWs = null;
+  if (!ws) return;
+  try {
+    if (typeof ws.terminate === 'function') ws.terminate();
+    else ws.close();
+  } catch {}
+}
+
+function finishBiliConnectionAttempt(
+  session: number,
+  connected: boolean
+): void {
+  if (!biliConnectionAttempt || biliConnectionAttempt.session !== session) {
+    return;
+  }
+  const resolve = biliConnectionAttempt.resolve;
+  biliConnectionAttempt = null;
+  resolve(connected);
+}
+
+/**
+ * Stop the current socket and invalidate every delayed callback belonging to
+ * it. The room identifiers stay visible in the status card; a new connect
+ * request will clear the resolved ID before resolving the next room.
+ */
+function invalidateBiliRoomTransport(): number {
+  const previousSession = biliRoomSession;
+  const session = ++biliRoomSession;
+  finishBiliConnectionAttempt(previousSession, false);
+  clearBiliConnectionTimers();
+  clearBiliPingTimer();
+  closeCurrentBiliWebSocket();
+  dispatchBiliRoomConnectionEvent({
+    type: 'disconnect-requested',
+    session,
+    requestedRoomId: Number(appConfig.roomId) || 0
+  });
+  return session;
+}
+
+function disconnectFromLiveRoom(): void {
+  appConfig.roomConnectionEnabled = false;
+  invalidateBiliRoomTransport();
+  saveConfig();
+  setGlobalStatus(BILI_ROOM_CONNECTION_MESSAGES.disconnected);
+  writeLog('[Bilibili] 已断开直播间连接，已停止自动重连', 'DarkGray');
+}
 
 function logoutBiliAccount() {
   qrLoginAttemptId++;
@@ -1105,23 +1284,15 @@ function logoutBiliAccount() {
   qrCodeBase64 = '';
   qrLoginStatus = '已退出登录，可重新扫码绑定账号';
 
-  if (currentBiliWs) {
-    const ws = currentBiliWs;
-    currentBiliWs = null;
-    try { ws.close(); } catch {}
-  }
-  if (biliPingTimer) {
-    clearInterval(biliPingTimer);
-    biliPingTimer = null;
-  }
+  invalidateBiliRoomTransport();
 
   biliCookie = '';
   biliUid = 0;
   currentUserInfo = createEmptyBiliUserInfo();
   saveConfig();
   writeLog('[Bilibili] 已退出登录并清除本地账号凭据', 'Green');
-  if (appConfig.roomId) {
-    void connectToLiveRoom(appConfig.roomId).then(connected => {
+  if (appConfig.roomConnectionEnabled === true && appConfig.roomId) {
+    void connectToLiveRoom(appConfig.roomId, { enable: false }).then(connected => {
       writeLog(
         connected
           ? '[Bilibili] 已自动切换为游客弹幕连接'
@@ -1167,56 +1338,137 @@ function getBiliDanmuEndpoints(danmuData: any): BiliDanmuEndpoint[] {
   return endpoints;
 }
 
-async function connectToLiveRoom(shortRoomId: number): Promise<boolean> {
-  try {
-    const headers: any = { "User-Agent": "Mozilla/5.0", "Referer": `https://live.bilibili.com/${shortRoomId}` };
-    if (biliCookie) headers["Cookie"] = biliCookie;
+interface ConnectToLiveRoomOptions {
+  enable?: boolean;
+}
 
-    const initRes = await fetchWithTimeout(`https://api.live.bilibili.com/room/v1/Room/room_init?id=${shortRoomId}`, { headers });
-    const initData: any = await initRes.json();
-    if (initData.code !== 0) {
-      writeLog(`[Bilibili] 房间初始化失败，code=${initData.code}`, 'Yellow');
-      return false;
-    }
+function isBiliRoomSessionCurrent(session: number): boolean {
+  return session === biliRoomSession
+    && appConfig.roomConnectionEnabled === true;
+}
 
-    const realRoomId = initData.data?.room_id || shortRoomId;
-    const danmuRes = await fetchWithTimeout(`https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=${realRoomId}&type=0`, { headers });
-    let danmuData: any = await danmuRes.json();
+function failBiliRoomConnection(session: number, message: string): void {
+  if (session !== biliRoomSession) return;
+  clearBiliConnectionTimers();
+  clearBiliPingTimer();
+  finishBiliConnectionAttempt(session, false);
+  dispatchBiliRoomConnectionEvent({
+    type: 'connection-failed',
+    session,
+    message: message.trim() || BILI_ROOM_CONNECTION_MESSAGES.failed
+  });
+}
 
-    if (JSON.stringify(danmuData).includes("-352") || danmuData.code !== 0) {
-      writeLog(`[Bilibili] 新版弹幕接口不可用，code=${danmuData.code}，尝试兼容接口`, 'Yellow');
-      const fallbackRes = await fetchWithTimeout(`https://api.live.bilibili.com/room/v1/Danmu/getConf?room_id=${realRoomId}&platform=pc&player=web`, { headers });
-      danmuData = await fallbackRes.json();
-    }
-
-    const token = danmuData.data?.token || "";
-    if (danmuData.code !== 0 || !token) {
-      writeLog(`[Bilibili] 无法获取弹幕鉴权信息，code=${danmuData.code}`, 'Red');
-      return false;
-    }
-
-    const endpoints = getBiliDanmuEndpoints(danmuData);
-    if (endpoints.length === 0) {
-      writeLog('[Bilibili] 接口未返回可用的弹幕节点', 'Red');
-      return false;
-    }
-
-    let finalBuvid = "999E9060-EA3F-0F79-7BDC-A14879D11DCB95434infoc";
-    const b3Match = biliCookie.match(/buvid3=([^;]+)/);
-    if (b3Match) finalBuvid = b3Match[1];
-
-    appConfig.roomId = shortRoomId;
-    saveConfig();
-
-    startBiliWebSocket(
-      { uid: biliUid || 0, roomid: realRoomId, protover: 3, buvid: finalBuvid, support_ack: true, type: 2, key: token },
-      endpoints
-    );
-    return true;
-  } catch (err: any) {
-    writeLog(`[Bilibili] 连接直播间失败：${err?.message || err}`, 'Red');
+async function connectToLiveRoom(
+  shortRoomId: number,
+  options: ConnectToLiveRoomOptions = {}
+): Promise<boolean> {
+  const normalizedRoomId = Number(shortRoomId);
+  if (!Number.isSafeInteger(normalizedRoomId) || normalizedRoomId <= 0) {
+    setGlobalStatus('请输入正确的房间号');
     return false;
   }
+
+  if (options.enable === true) appConfig.roomConnectionEnabled = true;
+  if (appConfig.roomConnectionEnabled !== true) return false;
+
+  invalidateBiliRoomTransport();
+  const session = ++biliRoomSession;
+  appConfig.roomId = normalizedRoomId;
+  dispatchBiliRoomConnectionEvent({
+    type: 'connect-requested',
+    session,
+    requestedRoomId: normalizedRoomId
+  });
+  saveConfig();
+
+  const connection = new Promise<boolean>(resolve => {
+    biliConnectionAttempt = { session, resolve };
+  });
+
+  void (async () => {
+    try {
+      const headers: Record<string, string> = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": `https://live.bilibili.com/${normalizedRoomId}`,
+        "Accept": "application/json, text/plain, */*"
+      };
+      if (biliCookie) headers["Cookie"] = biliCookie;
+
+      const initRes = await fetchWithTimeout(
+        `https://api.live.bilibili.com/room/v1/Room/room_init?id=${normalizedRoomId}`,
+        { headers }
+      );
+      const initData: any = await initRes.json();
+      if (!isBiliRoomSessionCurrent(session)) return;
+      if (initData.code !== 0) {
+        writeLog(`[Bilibili] 房间初始化失败，code=${initData.code}`, 'Yellow');
+        failBiliRoomConnection(session, '连接失败：房间号无效或不可用');
+        return;
+      }
+
+      const realRoomId = Number(initData.data?.room_id) || normalizedRoomId;
+      dispatchBiliRoomConnectionEvent({
+        type: 'room-resolved',
+        session,
+        realRoomId
+      });
+      const danmuData = await fetchBiliDanmuInfoWithFallback(
+        fetchWithTimeout,
+        realRoomId,
+        {
+          headers,
+          onWbiFailure: message => writeLog(
+            `[Bilibili] WBI 弹幕鉴权不可用（${message}），尝试兼容接口`,
+            'Yellow'
+          )
+        }
+      ) as any;
+      if (!isBiliRoomSessionCurrent(session)) return;
+
+      const token = danmuData.data?.token || "";
+      if (danmuData.code !== 0 || !token) {
+        writeLog(`[Bilibili] 无法获取弹幕鉴权信息，code=${danmuData.code}`, 'Red');
+        failBiliRoomConnection(session, '连接失败：无法取得弹幕鉴权');
+        return;
+      }
+
+      const endpoints = getBiliDanmuEndpoints(danmuData);
+      if (endpoints.length === 0) {
+        writeLog('[Bilibili] 接口未返回可用的弹幕节点', 'Red');
+        failBiliRoomConnection(session, '连接失败：没有可用的弹幕节点');
+        return;
+      }
+
+      let finalBuvid = "999E9060-EA3F-0F79-7BDC-A14879D11DCB95434infoc";
+      const b3Match = biliCookie.match(/buvid3=([^;]+)/);
+      if (b3Match) finalBuvid = b3Match[1];
+
+      startBiliWebSocket(
+        {
+          uid: biliUid || 0,
+          roomid: realRoomId,
+          protover: 3,
+          buvid: finalBuvid,
+          support_ack: true,
+          type: 2,
+          key: token
+        },
+        endpoints,
+        0,
+        session,
+        0,
+        realRoomId
+      );
+    } catch (err: any) {
+      if (!isBiliRoomSessionCurrent(session)) return;
+      const message = err?.message || String(err);
+      writeLog(`[Bilibili] 连接直播间失败：${message}`, 'Red');
+      failBiliRoomConnection(session, `连接失败：${message}`);
+    }
+  })();
+
+  return await connection;
 }
 
 function readBiliAuthReply(buffer: Buffer): { code: number, message?: string } | null {
@@ -1240,63 +1492,152 @@ function readBiliAuthReply(buffer: Buffer): { code: number, message?: string } |
   return null;
 }
 
-function startBiliWebSocket(authObj: any, endpoints: BiliDanmuEndpoint[], endpointIndex: number = 0) {
-  if (currentBiliWs) {
-    const previousWs = currentBiliWs;
-    currentBiliWs = null;
-    try { previousWs.close(); } catch {}
-  }
-  if (biliPingTimer) {
-    clearInterval(biliPingTimer);
-    biliPingTimer = null;
-  }
+function startBiliWebSocket(
+  authObj: any,
+  endpoints: BiliDanmuEndpoint[],
+  endpointIndex = 0,
+  session = biliRoomSession,
+  endpointAttempt = 0,
+  realRoomId = Number(authObj?.roomid) || 0
+): void {
+  if (!isBiliRoomSessionCurrent(session) || endpoints.length === 0) return;
+
+  clearBiliConnectionTimers();
+  clearBiliPingTimer();
+  closeCurrentBiliWebSocket();
+  dispatchBiliRoomConnectionEvent({
+    type: 'socket-reconnecting',
+    session,
+    message: BILI_ROOM_CONNECTION_MESSAGES.connecting
+  });
 
   const WebSocketClient = getWebSocketClient();
-  if (!WebSocketClient || endpoints.length === 0) return;
+  if (!WebSocketClient) {
+    failBiliRoomConnection(session, '连接失败：系统不支持 WebSocket');
+    return;
+  }
 
   const isNodeWs = typeof WebSocketClient.prototype?.on === 'function';
-  const wsOptions = isNodeWs ? { headers: { "User-Agent": "Mozilla/5.0" } } : undefined;
+  const wsOptions = isNodeWs
+    ? { headers: { "User-Agent": "Mozilla/5.0" } }
+    : undefined;
   const normalizedIndex = endpointIndex % endpoints.length;
   const endpoint = endpoints[normalizedIndex];
 
   writeLog(`[Bilibili] 正在连接弹幕节点 ${endpoint.host}:${endpoint.port}`, 'Gray');
-  const ws = new WebSocketClient(endpoint.url, wsOptions);
+  let ws: any;
+  try {
+    ws = new WebSocketClient(endpoint.url, wsOptions);
+  } catch (error: any) {
+    writeLog(
+      `[Bilibili] 节点 ${endpoint.host} 创建失败：${error?.message || error}`,
+      'Yellow'
+    );
+    dispatchBiliRoomConnectionEvent({
+      type: 'socket-reconnecting',
+      session,
+      message: BILI_ROOM_CONNECTION_MESSAGES.connecting
+    });
+    if (endpointAttempt + 1 < endpoints.length) {
+      biliReconnectTimer = setTimeout(() => {
+        biliReconnectTimer = null;
+        startBiliWebSocket(
+          authObj,
+          endpoints,
+          normalizedIndex + 1,
+          session,
+          endpointAttempt + 1,
+          realRoomId
+        );
+      }, 1500);
+    } else {
+      failBiliRoomConnection(session, BILI_ROOM_CONNECTION_MESSAGES.failed);
+    }
+    return;
+  }
+
   currentBiliWs = ws;
   let authenticated = false;
   let reconnectScheduled = false;
 
   const scheduleReconnect = (reason: string) => {
-    if (reconnectScheduled || currentBiliWs !== ws) return;
+    if (
+      reconnectScheduled
+      || currentBiliWs !== ws
+      || !isBiliRoomSessionCurrent(session)
+    ) return;
     reconnectScheduled = true;
-    clearTimeout(connectionTimer);
-    if (biliPingTimer) {
-      clearInterval(biliPingTimer);
-      biliPingTimer = null;
+    if (biliConnectionTimer) {
+      clearTimeout(biliConnectionTimer);
+      biliConnectionTimer = null;
     }
-    writeLog(`[Bilibili] 节点 ${endpoint.host} ${reason}，切换下一个节点`, 'Yellow');
-    setTimeout(() => {
-      if (currentBiliWs === ws) startBiliWebSocket(authObj, endpoints, normalizedIndex + 1);
-    }, 1500);
-  };
-
-  const connectionTimer = setTimeout(() => {
-    scheduleReconnect(authenticated ? '连接中断' : '连接或鉴权超时');
+    clearBiliPingTimer();
+    currentBiliWs = null;
     try {
       if (typeof ws.terminate === 'function') ws.terminate();
       else ws.close();
     } catch {}
-  }, 10000);
+    const nextAttempt = endpointAttempt + 1;
+    const hasNextEndpoint = nextAttempt < endpoints.length;
+    writeLog(
+      `[Bilibili] 节点 ${endpoint.host} ${reason}，`
+        + (hasNextEndpoint ? '切换下一个节点' : '本轮节点均不可用'),
+      'Yellow'
+    );
+    dispatchBiliRoomConnectionEvent({
+      type: 'socket-reconnecting',
+      session,
+      message: BILI_ROOM_CONNECTION_MESSAGES.connecting
+    });
+    biliReconnectTimer = setTimeout(() => {
+      biliReconnectTimer = null;
+      if (!isBiliRoomSessionCurrent(session)) return;
+      if (hasNextEndpoint) {
+        startBiliWebSocket(
+          authObj,
+          endpoints,
+          normalizedIndex + 1,
+          session,
+          nextAttempt,
+          realRoomId
+        );
+        return;
+      }
+
+      // Only op=8/code=0 can complete the initial promise. If every node
+      // failed before authentication, expose an error but keep a slow,
+      // session-guarded retry while the user remains connected.
+      failBiliRoomConnection(session, BILI_ROOM_CONNECTION_MESSAGES.failed);
+      if (!isBiliRoomSessionCurrent(session)) return;
+      biliReconnectTimer = setTimeout(() => {
+        biliReconnectTimer = null;
+        if (isBiliRoomSessionCurrent(session)) {
+          startBiliWebSocket(authObj, endpoints, 0, session, 0, realRoomId);
+        }
+      }, 5000);
+    }, hasNextEndpoint ? 1500 : 1500);
+  };
+
+  biliConnectionTimer = setTimeout(() => {
+    if (authenticated) scheduleReconnect('连接中断');
+    else scheduleReconnect('连接或鉴权超时');
+  }, 10_000);
 
   const onOpen = () => {
-    if (currentBiliWs !== ws) return;
+    if (currentBiliWs !== ws || !isBiliRoomSessionCurrent(session)) return;
     const authPayload = Buffer.from(JSON.stringify(authObj), 'utf-8');
     const packet = Buffer.alloc(16 + authPayload.length);
-    packet.writeInt32BE(packet.length, 0); packet.writeInt16BE(16, 4); packet.writeInt16BE(1, 6); packet.writeInt32BE(7, 8); packet.writeInt32BE(1, 12);
-    authPayload.copy(packet, 16); ws.send(packet);
+    packet.writeInt32BE(packet.length, 0);
+    packet.writeInt16BE(16, 4);
+    packet.writeInt16BE(1, 6);
+    packet.writeInt32BE(7, 8);
+    packet.writeInt32BE(1, 12);
+    authPayload.copy(packet, 16);
+    ws.send(packet);
   };
 
   const onMessage = async (data: any) => {
-    if (currentBiliWs !== ws) return;
+    if (currentBiliWs !== ws || !isBiliRoomSessionCurrent(session)) return;
     let buffer: Buffer;
     if (Buffer.isBuffer(data)) buffer = data;
     else if (data instanceof ArrayBuffer) buffer = Buffer.from(data);
@@ -1308,20 +1649,35 @@ function startBiliWebSocket(authObj: any, endpoints: BiliDanmuEndpoint[], endpoi
       if (authReply) {
         if (authReply.code !== 0) {
           scheduleReconnect(`鉴权失败 code=${authReply.code}`);
-          try { ws.close(); } catch {}
           return;
         }
 
         authenticated = true;
-        clearTimeout(connectionTimer);
+        if (biliConnectionTimer) {
+          clearTimeout(biliConnectionTimer);
+          biliConnectionTimer = null;
+        }
+        dispatchBiliRoomConnectionEvent({
+          type: 'websocket-authenticated',
+          session,
+          realRoomId
+        });
+        finishBiliConnectionAttempt(session, true);
         writeLog(`✅ [Bilibili] 弹幕节点已鉴权：${endpoint.host}`, 'Green');
         biliPingTimer = setInterval(() => {
           if (currentBiliWs === ws && ws.readyState === 1) {
             const hb = Buffer.alloc(31);
-            hb.writeInt32BE(hb.length, 0); hb.writeInt16BE(16, 4); hb.writeInt16BE(1, 6); hb.writeInt32BE(2, 8); hb.writeInt32BE(1, 12);
-            Buffer.from("[object Object]", "utf-8").copy(hb, 16); ws.send(hb);
+            hb.writeInt32BE(hb.length, 0);
+            hb.writeInt16BE(16, 4);
+            hb.writeInt16BE(1, 6);
+            hb.writeInt32BE(2, 8);
+            hb.writeInt32BE(1, 12);
+            Buffer.from("[object Object]", "utf-8").copy(hb, 16);
+            ws.send(hb);
           }
         }, 30000);
+        setGlobalStatus('弹幕已连接');
+        writeLog('✅ [Bilibili] 直播间已连接，弹幕监控启动！', 'Green');
       }
     }
     parseBiliPacket(buffer);
@@ -1334,8 +1690,17 @@ function startBiliWebSocket(authObj: any, endpoints: BiliDanmuEndpoint[], endpoi
     scheduleReconnect('连接错误');
   };
 
-  if (typeof ws.on === 'function') { ws.on('open', onOpen); ws.on('message', onMessage); ws.on('close', onClose); ws.on('error', onError); }
-  else { ws.onopen = onOpen; ws.onmessage = (e: any) => onMessage(e.data); ws.onclose = onClose; ws.onerror = onError; }
+  if (typeof ws.on === 'function') {
+    ws.on('open', onOpen);
+    ws.on('message', onMessage);
+    ws.on('close', onClose);
+    ws.on('error', onError);
+  } else {
+    ws.onopen = onOpen;
+    ws.onmessage = (e: any) => onMessage(e.data);
+    ws.onclose = onClose;
+    ws.onerror = onError;
+  }
 }
 
 function parseBiliPacket(buffer: Buffer) {
@@ -1891,6 +2256,9 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
 const CONNECTOR_MAINTENANCE_INTERVAL_MS = 30 * 60 * 1000;
 let connectorMaintenanceTimer: NodeJS.Timeout | null = null;
 let connectorMaintenanceRunning = false;
+let connectorAutoRepairInFlight: Promise<boolean> | null = null;
+let connectorAutoRepairAttemptKey = '';
+let connectorConnectionRecoveryInFlight: Promise<boolean> | null = null;
 let startupBackgroundServicesStarted = false;
 const STARTUP_BACKGROUND_FALLBACK_MS = 2_000;
 
@@ -1898,68 +2266,211 @@ function getSelectedNativeConnector(): NativeConnectorId {
   return getSelectedPlayerKey();
 }
 
-async function connectWithConnectorMaintenanceStatus(
-  connect: () => Promise<boolean>
+function getConnectorAutoRepairAttemptKey(
+  connectorId: NativeConnectorId,
+  processId: number | null,
+  version: string | null
+): string {
+  return [
+    connectorId,
+    processId || 'unknown-process',
+    version?.trim() || 'unknown-version'
+  ].join('|');
+}
+
+async function runConnectorAutoRepair(
+  connectorId: NativeConnectorId
 ): Promise<boolean> {
-  const connectorId = getSelectedNativeConnector();
-  let ownedStatus = '';
-  if (
-    connectorId
-    && !await playerManager.isConnectorInstalled(connectorId)
-  ) {
-    ownedStatus =
-      `正在更新${PLAYER_LABELS[connectorId]}播放器连接器`;
-    connectorMaintenanceStatus = ownedStatus;
-    writeLog(`[连接器] ${ownedStatus}`, 'Cyan');
+  if (connectorAutoRepairInFlight) {
+    return await connectorAutoRepairInFlight;
   }
 
-  try {
-    const connected = await connect();
-    if (connected) {
-      return true;
+  const operation = (async (): Promise<boolean> => {
+    if (connectorId === 'folia') {
+      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      return false;
     }
 
-    const connectorProbeResponded = Boolean(
-      playerManager.connectionState.snapshot
-    );
-
-    const statuses = await playerManager.getConnectorStatuses(true);
-    const status = statuses.find(item => item.id === connectorId);
-    if (status && shouldAutoUpgradeConnectorAfterFailure({
-      connectorProbeResponded,
-      installed: status.installed,
-      compatible: status.compatible,
-      updateAvailable: status.autoUpdateAvailable,
-      updating: status.updating
-    })) {
-      const recoveryStatus =
-        `正在升级${PLAYER_LABELS[connectorId]}连接器并重试连接`;
-      connectorMaintenanceStatus = recoveryStatus;
+    let processInfo;
+    try {
+      processInfo = await playerManager.inspectSelectedPlayerProcess();
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeLog(`[连接器兼容恢复] 播放器进程探测失败：${message}`, 'Yellow');
+      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      return false;
+    }
+    if (!processInfo.querySucceeded) {
       writeLog(
-        `[连接器兼容恢复] 当前连接失败，尝试从 `
-        + `${status.currentVersion} 升级到 ${status.latestVersion}`,
+        `[连接器兼容恢复] 无法确认${PLAYER_LABELS[connectorId]}播放器进程，`
+        + '暂不自动更换连接器。',
+        'Yellow'
+      );
+      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      return false;
+    }
+
+    if (!processInfo.running) {
+      connectorAutoRepairAttemptKey = '';
+      writeLog(
+        `[连接器兼容恢复] 未发现${PLAYER_LABELS[connectorId]}播放器，`
+        + '不会自动升级连接器。',
+        'DarkGray'
+      );
+      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.playerNotRunning);
+      return false;
+    }
+
+    const attemptKey = getConnectorAutoRepairAttemptKey(
+      connectorId,
+      processInfo.processId,
+      processInfo.version
+    );
+    const attempted = connectorAutoRepairAttemptKey === attemptKey;
+    if (!attempted) {
+      // Mark the process session before fetching the catalog. Any subsequent
+      // failure/event burst for this same player can therefore not re-enter
+      // the upgrade path.
+      connectorAutoRepairAttemptKey = attemptKey;
+    }
+
+    let statuses;
+    try {
+      statuses = await playerManager.getConnectorStatuses(true);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeLog(`[连接器兼容恢复] 刷新连接器清单失败：${message}`, 'Yellow');
+      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      return false;
+    }
+    const status = statuses.find(item => item.id === connectorId);
+    const plan = planConnectorAutoRepair({
+      connectorId,
+      playerRunning: processInfo.running,
+      playerVersion: processInfo.version,
+      connectorInstalled: status?.installed === true,
+      connectorCurrentVersion: status?.currentVersion,
+      connectorLatestVersion: status?.latestVersion,
+      connectorSupportedPlayerVersion: status?.supportedPlayerVersion,
+      connectorPlayerVersionPolicy: status?.playerVersionPolicy,
+      connectorTestedPlayerVersion: status?.testedPlayerVersion,
+      connectorCompatible: status?.compatible === true,
+      connectorUpdateAvailable: status?.updateAvailable === true,
+      connectorAutoUpdateAvailable: status?.autoUpdateAvailable === true,
+      connectorManualUpdateAvailable: status?.manualUpdateAvailable === true,
+      connectorUpdateKind: status?.updateKind,
+      connectorUpdating: status?.updating === true,
+      catalogError: status?.error || (!status ? '未找到连接器状态' : null),
+      attempted
+    });
+
+    if (plan.action !== 'upgrade') {
+      if (plan.action === 'missing-connector') {
+        writeLog(
+          `[连接器兼容恢复] ${PLAYER_LABELS[connectorId]} ${processInfo.version}`
+          + ' 没有匹配当前播放器版本的可用连接器。',
+          'Yellow'
+        );
+      } else if (plan.action === 'failed') {
+        writeLog(
+          `[连接器兼容恢复] ${PLAYER_LABELS[connectorId]} 自动修复未执行：`
+          + `${plan.reason}。`,
+          'DarkGray'
+        );
+      }
+      setGlobalStatus(plan.message);
+      return false;
+    }
+
+    const statusOwner = claimConnectorMaintenanceStatus(plan.message);
+    try {
+      writeLog(
+        `[连接器兼容恢复] ${PLAYER_LABELS[connectorId]} ${processInfo.version}`
+        + ` 匹配清单，尝试从 ${status?.currentVersion || '未安装'}`
+        + ` 升级到 ${status?.latestVersion || '未知'}。`,
         'Cyan'
       );
-      const result = await playerManager.updateConnector(connectorId);
+      const result = await withPlayerConnectionRecoverySuppressed(
+        () => playerManager.updateConnector(
+          connectorId,
+          plan.allowPlayerVersionChange
+        )
+      );
       writeLog(
         `[连接器兼容恢复] ${result.message}`,
         result.success ? 'Green' : 'Yellow'
       );
-      return result.success && result.reconnected === true;
+      const reconnected = result.success && result.reconnected === true;
+      if (reconnected) {
+        connectorAutoRepairAttemptKey = '';
+        setGlobalStatus(result.message);
+        return true;
+      }
+      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      return false;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeLog(`[连接器兼容恢复] 自动修复失败：${message}`, 'Yellow');
+      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      return false;
+    } finally {
+      releaseConnectorMaintenanceStatus(statusOwner);
     }
-    if (connectorProbeResponded && status?.updateAvailable) {
-      writeLog(
-        `[连接器兼容恢复] ${status.name}连接器响应正常，`
-        + '当前只是播放器尚未连接；保留现有版本并继续等待。',
-        'DarkGray'
-      );
+  })();
+  const tracked = operation.finally(() => {
+    if (connectorAutoRepairInFlight === tracked) {
+      connectorAutoRepairInFlight = null;
     }
-    return false;
-  } finally {
-    if (connectorMaintenanceStatus === ownedStatus) {
-      connectorMaintenanceStatus = '';
-    }
+  });
+  connectorAutoRepairInFlight = tracked;
+  return await tracked;
+}
+
+async function connectWithConnectorMaintenanceStatus(
+  connect: () => Promise<boolean>
+): Promise<boolean> {
+  if (connectorConnectionRecoveryInFlight) {
+    return await connectorConnectionRecoveryInFlight;
   }
+
+  const operation = (async (): Promise<boolean> => {
+    const connectorId = getSelectedNativeConnector();
+    let statusOwner = 0;
+    if (
+      connectorId
+      && !await playerManager.isConnectorInstalled(connectorId)
+    ) {
+      const ownedStatus =
+        `正在更新${PLAYER_LABELS[connectorId]}播放器连接器`;
+      statusOwner = claimConnectorMaintenanceStatus(ownedStatus);
+      writeLog(`[连接器] ${ownedStatus}`, 'Cyan');
+    }
+
+    try {
+      const connected = await withPlayerConnectionRecoverySuppressed(connect);
+      if (connected) {
+        connectorAutoRepairAttemptKey = '';
+        return true;
+      }
+      return await runConnectorAutoRepair(connectorId);
+    } finally {
+      releaseConnectorMaintenanceStatus(statusOwner);
+    }
+  })();
+  const tracked = operation.finally(() => {
+    if (connectorConnectionRecoveryInFlight === tracked) {
+      connectorConnectionRecoveryInFlight = null;
+    }
+  });
+  connectorConnectionRecoveryInFlight = tracked;
+  return await tracked;
+}
+
+async function recoverPlayerConnectionAfterFailure(): Promise<void> {
+  if (applicationQuitRequested || connectorConnectionRecoveryInFlight) return;
+  await connectWithConnectorMaintenanceStatus(
+    () => playerManager.reconnect()
+  );
 }
 
 async function maintainPlayerConnectors(
@@ -2011,23 +2522,20 @@ async function maintainPlayerConnectors(
       const ownedStatus = selected && !status.installed
         ? `正在更新${status.name}播放器连接器`
         : '';
-      if (ownedStatus) {
-        connectorMaintenanceStatus = ownedStatus;
-      }
+      const statusOwner = ownedStatus
+        ? claimConnectorMaintenanceStatus(ownedStatus)
+        : 0;
 
       try {
-        const result = await playerManager.updateConnector(status.id);
+        const result = await withPlayerConnectionRecoverySuppressed(
+          () => playerManager.updateConnector(status.id)
+        );
         writeLog(
           `[连接器热更新] ${result.message}`,
           result.success ? 'Green' : 'Yellow'
         );
       } finally {
-        if (
-          ownedStatus
-          && connectorMaintenanceStatus === ownedStatus
-        ) {
-          connectorMaintenanceStatus = '';
-        }
+        releaseConnectorMaintenanceStatus(statusOwner);
       }
     }
   } catch (error: unknown) {
@@ -2053,7 +2561,9 @@ function startStartupBackgroundServices(): void {
   void startPlayerBridge();
   void restartExternalApiServer();
   if (biliCookie) updateCurrentUserInfo();
-  if (appConfig.roomId) connectToLiveRoom(appConfig.roomId);
+  if (appConfig.roomConnectionEnabled === true && appConfig.roomId) {
+    void connectToLiveRoom(appConfig.roomId, { enable: false });
+  }
 }
 
 function scheduleStartupBackgroundServices(win: BrowserWindow): void {
@@ -3134,7 +3644,9 @@ async function startBiliQrLogin() {
           qrLoginStatus = `登录成功：${currentUserInfo.uname || `UID ${biliUid}`}`;
           isQrLoggingIn = false;
           writeLog(`[Bilibili] 扫码登录成功：${currentUserInfo.uname} (${biliUid})`, 'Green');
-          if (appConfig.roomId) void connectToLiveRoom(appConfig.roomId);
+          if (appConfig.roomConnectionEnabled === true && appConfig.roomId) {
+            void connectToLiveRoom(appConfig.roomId, { enable: false });
+          }
         }
       } catch (err: any) {
         writeLog(`[Bilibili] 扫码状态轮询异常: ${err?.message || err}`, 'Yellow');
@@ -3823,7 +4335,7 @@ async function startBackendServer(): Promise<void> {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Vary', 'Origin');
       }
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
         'Content-Type, X-Awoo-File-Name, X-Awoo-Internal-Token'
@@ -3930,7 +4442,7 @@ async function startBackendServer(): Promise<void> {
       const displayCurrent = currentPlayingSong || (showPlayerCurrentTrack ? playerCurrentTrack : null);
       const requestedSongArtwork = appConfig.sysConfig?.RequestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar';
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ current: displayCurrent, currentIsRequested: !!currentPlayingSong, playerPausedAfterRequests, requestedSongArtwork, queue: targetQueue, status: connectorMaintenanceStatus || currentStatusMessage, accepting: isAccepting, playing: isPlaying, uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isPlayerConnected, playerConnected: isPlayerConnected, playerConnecting, commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand } }));
+      res.end(JSON.stringify({ current: displayCurrent, currentIsRequested: !!currentPlayingSong, playerPausedAfterRequests, requestedSongArtwork, queue: targetQueue, status: connectorMaintenanceStatus || currentStatusMessage, accepting: isAccepting, playing: isPlaying, uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isPlayerConnected, playerConnected: isPlayerConnected, playerConnecting, roomConnection: getBiliRoomConnectionInfo(), commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand } }));
       return;
     }
 
@@ -4137,6 +4649,11 @@ async function startBackendServer(): Promise<void> {
           port: getExternalApiPort()
         });
         if (body.roomId !== undefined) appConfig.roomId = body.roomId;
+        if (body.roomConnectionEnabled === false) {
+          disconnectFromLiveRoom();
+        } else if (body.roomConnectionEnabled === true) {
+          appConfig.roomConnectionEnabled = true;
+        }
         if (body.widgetStyle !== undefined) {
           const incomingWidgetStyle = body.widgetStyle && typeof body.widgetStyle === 'object' && !Array.isArray(body.widgetStyle)
             ? body.widgetStyle
@@ -4218,6 +4735,12 @@ async function startBackendServer(): Promise<void> {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
         roomId: appConfig.roomId,
+        requestedRoomId: biliRoomState.requestedRoomId,
+        realRoomId: biliRoomState.realRoomId,
+        roomConnectionStatus: biliRoomState.status,
+        roomConnectionMessage: biliRoomState.message,
+        roomConnectionEnabled: appConfig.roomConnectionEnabled === true,
+        roomConnection: getBiliRoomConnectionInfo(),
         myRoomId: appConfig.myRoomId || 0,
         biliLogin: isBiliLoginReady(),
         guestMode: !isBiliLoginReady(),
@@ -4315,11 +4838,43 @@ async function startBackendServer(): Promise<void> {
 
     if (url.pathname === '/api/room' && req.method === 'POST') {
       const doc = await readJsonRequest(req);
-      if (doc.roomId) {
-        const success = await connectToLiveRoom(doc.roomId);
-        res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success })); return;
+      const requestedRoomId = Number(doc.roomId);
+      if (Number.isSafeInteger(requestedRoomId) && requestedRoomId > 0) {
+        appConfig.roomConnectionEnabled = true;
+        // The request is accepted as soon as the new session is created. The
+        // UI polls /api/config and only shows connected after WebSocket op=8
+        // returns code=0; HTTP token acquisition alone is never success.
+        void connectToLiveRoom(requestedRoomId, { enable: true });
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({
+          success: true,
+          ...getBiliRoomConnectionInfo(),
+          roomConnection: getBiliRoomConnectionInfo()
+        }));
+        return;
       }
-      res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: false })); return;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({
+        success: false,
+        ...getBiliRoomConnectionInfo(),
+        roomConnection: getBiliRoomConnectionInfo(),
+        message: '请输入正确的房间号'
+      }));
+      return;
+    }
+
+    if (
+      (url.pathname === '/api/room/disconnect' && req.method === 'POST')
+      || (url.pathname === '/api/room' && req.method === 'DELETE')
+    ) {
+      disconnectFromLiveRoom();
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({
+        success: true,
+        ...getBiliRoomConnectionInfo(),
+        roomConnection: getBiliRoomConnectionInfo()
+      }));
+      return;
     }
 
     if (url.pathname === '/api/state/toggle' && req.method === 'POST') { isAccepting = !isAccepting; res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
@@ -4522,9 +5077,8 @@ async function startBackendServer(): Promise<void> {
         }
 
         setGlobalStatus(`正在更新${PLAYER_LABELS[connectorId]}连接器...`);
-        const result = await playerManager.updateConnector(
-          connectorId,
-          true
+        const result = await withPlayerConnectionRecoverySuppressed(
+          () => playerManager.updateConnector(connectorId, true)
         );
         setGlobalStatus(
           result.success
@@ -4565,7 +5119,9 @@ async function startBackendServer(): Promise<void> {
           return;
         }
 
-        const result = await playerManager.reinstallConnector(connectorId);
+        const result = await withPlayerConnectionRecoverySuppressed(
+          () => playerManager.reinstallConnector(connectorId)
+        );
         setGlobalStatus(
           result.success
             ? `✅ ${result.message}`
@@ -4787,7 +5343,12 @@ app.on('before-quit', () => {
     clearInterval(connectorMaintenanceTimer);
     connectorMaintenanceTimer = null;
   }
-  void playerManager.stop();
+  // Stop sockets and delayed reconnects without changing the persisted
+  // connection preference; an enabled room may reconnect on the next launch.
+  invalidateBiliRoomTransport();
+  void withPlayerConnectionRecoverySuppressed(
+    () => playerManager.stop()
+  );
   const internalServer = internalApiServer;
   internalApiServer = null;
   actualInternalApiPort = null;

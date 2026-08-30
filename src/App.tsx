@@ -1345,8 +1345,6 @@ const AdminWidget: React.FC = () => {
     const [autoScroll, setAutoScroll] = useState<boolean>(true);
     const logContainerRef = useRef<HTMLDivElement>(null);
 
-    const [hasBiliLoopIssue, setHasBiliLoopIssue] = useState<boolean>(false);
-
     const [superUserInput, setSuperUserInput] = useState<string>('');
     const [debugInput, setDebugInput] = useState<string>('');
     const [giftLearningNow, setGiftLearningNow] = useState(Date.now());
@@ -1950,7 +1948,8 @@ const AdminWidget: React.FC = () => {
                 });
 
                 setRoomIdInput(prev => {
-                    if (prev === '' && json.roomId !== 0 && json.roomId !== json.uid) return json.roomId.toString();
+                    const requestedRoomId = Number(json.requestedRoomId || json.roomId || 0);
+                    if (prev === '' && requestedRoomId !== 0 && requestedRoomId !== json.uid) return requestedRoomId.toString();
                     return prev;
                 });
 
@@ -2033,19 +2032,6 @@ const AdminWidget: React.FC = () => {
         return () => clearInterval(timer);
     }, [activeTab]);
 
-    // 实时分析 B站弹幕连接是否出现频繁重连。
-    useEffect(() => {
-        if (sysLogs.length === 0) return;
-
-        const connectEvents = sysLogs.filter(log =>
-            log.Message.includes('直播间已连接') ||
-            log.Message.includes('弹幕监控启动')
-        );
-        // 如果日志中多次出现该日志，且相互间隔排布，说明正在遭遇频繁断线重连问题
-        setHasBiliLoopIssue(connectEvents.length >= 2);
-
-    }, [sysLogs]);
-
     // ⭐ 新增: 处理日志自适应滚动和手动阅读判定
     const handleLogScroll = () => {
         const el = logContainerRef.current;
@@ -2069,15 +2055,45 @@ const AdminWidget: React.FC = () => {
     }, [sysLogs, activeTab, autoScroll]);
 
     const handleConnectRoom = async () => {
-        const rid = parseInt(roomIdInput);
-        if (!rid) return showAdminToast("❌ 请输入正确的房间号");
+        const rid = Number(roomIdInput.trim());
+        if (!Number.isSafeInteger(rid) || rid <= 0) return showAdminToast("❌ 请输入正确的房间号");
         try {
             const res = await fetch(internalApiUrl('/api/room'), {
                 method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ roomId: rid })
             });
             const json = await res.json();
-            if(json.success) showAdminToast("✅ 连接请求成功！请查看运行日志确认。");
-            else showAdminToast("❌ 连接失败，请检查房间号或网络连接。");
+            if (json.roomConnection) {
+                setConfig((previous: any) => previous ? ({
+                    ...previous,
+                    requestedRoomId: json.requestedRoomId,
+                    realRoomId: json.realRoomId,
+                    roomConnectionStatus: json.status,
+                    roomConnectionMessage: json.message,
+                    roomConnection: json.roomConnection
+                }) : previous);
+            }
+            if (json.success) showAdminToast("⏳ 已开始连接，请等待弹幕连接确认。");
+            else showAdminToast(`❌ ${json.message || "连接失败，请检查房间号或网络连接。"}`);
+        } catch { showAdminToast("❌ 请求后端失败"); }
+    };
+
+    const handleDisconnectRoom = async () => {
+        try {
+            const res = await fetch(internalApiUrl('/api/room/disconnect'), {
+                method: 'POST', headers: {'Content-Type':'application/json'}
+            });
+            const json = await res.json();
+            if (json.roomConnection) {
+                setConfig((previous: any) => previous ? ({
+                    ...previous,
+                    requestedRoomId: json.requestedRoomId,
+                    realRoomId: json.realRoomId,
+                    roomConnectionStatus: json.status,
+                    roomConnectionMessage: json.message,
+                    roomConnection: json.roomConnection
+                }) : previous);
+            }
+            showAdminToast(json.success ? "✅ 已断开直播间连接" : `❌ ${json.message || "断开连接失败"}`);
         } catch { showAdminToast("❌ 请求后端失败"); }
     };
 
@@ -2896,6 +2912,41 @@ const AdminWidget: React.FC = () => {
     );
     const modObsUrl = `http://127.0.0.1:${externalApiPort}/overlay/`;
     const currentStatusSong = config?.current as SongInfo | null | undefined;
+    const roomConnection = config?.roomConnection || {
+        requestedRoomId: Number(config?.requestedRoomId || config?.roomId || 0),
+        realRoomId: Number(config?.realRoomId || 0),
+        status: config?.roomConnectionStatus || 'disconnected',
+        message: config?.roomConnectionMessage || '已断开连接',
+        enabled: config?.roomConnectionEnabled === true
+    };
+    const roomConnectionStatusMeta: Record<string, {
+        label: string;
+        className: string;
+        icon: string;
+    }> = {
+        connecting: {
+            label: '正在连接',
+            className: 'text-amber-300 border-amber-400/30 bg-amber-500/10',
+            icon: '⏳'
+        },
+        connected: {
+            label: '弹幕已连接',
+            className: 'text-green-300 border-green-500/30 bg-green-500/10',
+            icon: '●'
+        },
+        error: {
+            label: '连接失败',
+            className: 'text-red-300 border-red-500/30 bg-red-500/10',
+            icon: '⚠️'
+        },
+        disconnected: {
+            label: '已断开连接',
+            className: 'text-gray-300 border-white/15 bg-white/5',
+            icon: '○'
+        }
+    };
+    const roomStatusMeta = roomConnectionStatusMeta[roomConnection.status]
+        || roomConnectionStatusMeta.disconnected;
     const currentControlTheme: Theme = {
         ...defaultTheme,
         ...(config?.widgetStyle?.theme || {})
@@ -3118,40 +3169,6 @@ const AdminWidget: React.FC = () => {
                     ) : (
                         <div className="max-w-3xl mx-auto">
 
-                            {/* ⭐ 新增: 全局联动智能异常自诊断提示栏 (在所有Tab的最上方持续警醒显示) */}
-                            {hasBiliLoopIssue && (
-                                <div className="mb-6 space-y-3 animate-fadeIn">
-                                    {hasBiliLoopIssue && (
-                                        <div className="bg-amber-500/15 border border-amber-500/30 p-4 rounded-xl flex items-start gap-3 text-amber-200 shadow-lg">
-                                            <span className="text-xl shrink-0 mt-0.5">🌐</span>
-                                            <div className="text-xs space-y-1.5 flex-1">
-                                                <div className="font-bold text-amber-400 text-sm">检测到 B站弹幕监控连接不断断线重连</div>
-                                                <p className="leading-relaxed text-gray-300">
-                                                    诊断发现日志中正在密集、频繁地重复刷新“<span className="text-amber-300">直播间已连接，弹幕监控启动！</span>”。这代表弹幕服务器连接在建立成功后瞬间遭遇断裂阻碍。
-                                                </p>
-                                                <div className="pt-1 flex flex-col gap-1 text-gray-200 bg-black/20 p-2.5 rounded-lg border border-white/5">
-                                                    <div className="font-bold text-white flex items-center gap-1">🛠️ 请依序排查以下3项：</div>
-                                                    <ul className="list-decimal pl-4 space-y-1 text-gray-300 mt-1">
-                                                        <li>
-                                                            <strong className="text-white">美国/海外 IP 应该可以使用：</strong>
-                                                            v1.1.1 已加入海外网络兼容处理，正常情况下使用美国或其他海外 IP 也能连接弹幕。若仍反复断线，请先重新连接；仍无法恢复时，再尝试规则/PAC 分流、让 B站直播域名直连，或临时关闭代理、切换国内节点。
-                                                        </li>
-                                                        <li>
-                                                            <strong className="text-white">重新建立连接：</strong>
-                                                            游客模式本身可以接收弹幕，不要求扫码。请先在「运行状态」重新连接直播间；如果你原本使用了登录账号，也可以前往 <button className="text-cyan-400 font-bold underline hover:text-cyan-300 focus:outline-none" onClick={() => setActiveTab('login')}>扫码登录</button> 页刷新可选的账号凭据。
-                                                        </li>
-                                                        <li>
-                                                            <strong className="text-white">核对房间号：</strong>
-                                                            请务必输入正确的**直播间数字房间号**，而绝非主播的个人 UID。
-                                                        </li>
-                                                    </ul>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-
                             {playerControlNotice && (
                                 <div className={`mb-6 animate-fadeIn rounded-xl border p-4 shadow-lg ${playerAccessBlocked ? 'border-red-400/35 bg-red-500/10 text-red-100' : 'border-orange-400/35 bg-orange-500/10 text-orange-100'}`}>
                                     <div className="flex items-start gap-3">
@@ -3224,19 +3241,36 @@ const AdminWidget: React.FC = () => {
                                         </div>
 
                                         <div ref={roomSetupRef} className="bg-white/5 p-5 rounded-xl border border-white/10 shadow-inner mb-5 scroll-mt-4">
-                                            <div className="text-sm text-gray-400 mb-3 flex justify-between">
-                                                <span>当前监控直播间</span>
-                                                <span className="text-blue-400 text-xs">发弹幕 "test" 或 "测试" 验证连接</span>
+                                            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                                                <div>
+                                                    <div className="text-sm text-gray-200 font-bold">B站直播间连接</div>
+                                                    <div className="text-[11px] text-gray-500 mt-1">只有弹幕通道真正连通后，才会显示“弹幕已连接”</div>
+                                                </div>
+                                                <span className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border ${roomStatusMeta.className}`}>
+                                                    <span>{roomStatusMeta.icon}</span>
+                                                    {roomStatusMeta.label}
+                                                </span>
                                             </div>
-                                            <div className="flex gap-3">
+                                            <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2.5 mb-4">
+                                                <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs">
+                                                    <span className="text-gray-400">房间号 <strong className="text-white ml-1">{roomConnection.requestedRoomId || '未设置'}</strong></span>
+                                                    <span className="text-gray-400">真实 ID <strong className="text-cyan-300 ml-1">{roomConnection.realRoomId || '等待解析'}</strong></span>
+                                                </div>
+                                                <div className={`text-[11px] mt-1.5 ${roomConnection.status === 'error' ? 'text-red-300' : roomConnection.status === 'connected' ? 'text-green-300' : 'text-gray-500'}`}>
+                                                    {roomConnection.message || roomStatusMeta.label}
+                                                </div>
+                                            </div>
+                                            <div className="text-[11px] text-blue-300/80 mb-3">发弹幕 “test” 或 “测试” 可验证弹幕是否正常到达。</div>
+                                            <div className="flex flex-wrap gap-3">
                                                 <input
                                                     type="text"
                                                     value={roomIdInput}
                                                     onChange={e => setRoomIdInput(e.target.value)}
-                                                    className="flex-1 bg-black/30 border border-white/10 rounded-lg p-3 text-md text-white focus:border-blue-500 outline-none"
-                                                    placeholder="输入直播间的真实房间ID (非UID)..."
+                                                    className="flex-1 min-w-[220px] bg-black/30 border border-white/10 rounded-lg p-3 text-md text-white focus:border-blue-500 outline-none"
+                                                    placeholder="输入直播间数字房间号（不是 UID）"
                                                 />
-                                                <button onClick={handleConnectRoom} className="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white text-md rounded-lg font-bold shadow-lg transition-colors">连接 / 切换</button>
+                                                <button onClick={handleConnectRoom} className="px-5 py-3 bg-blue-600 hover:bg-blue-500 text-white text-md rounded-lg font-bold shadow-lg transition-colors">连接 / 切换房间</button>
+                                                <button onClick={handleDisconnectRoom} className="px-5 py-3 bg-white/10 hover:bg-red-500/20 text-gray-300 hover:text-red-200 border border-white/10 hover:border-red-400/30 text-md rounded-lg font-bold transition-colors">断开连接</button>
                                             </div>
                                         </div>
 

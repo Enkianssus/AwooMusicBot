@@ -19,6 +19,10 @@ import {
     isTechnicalFeedbackCategory
 } from './feedback-submission-policy';
 import { internalApiUrl } from './internal-api';
+import { AwooMark, UiIcon, type UiIconName } from './ui-icons';
+import { useColorMode, type ColorMode } from './ui-appearance';
+import './admin-ui.css';
+import './overlay-polish.css';
 
 // ==========================================
 // 0. 环境检测
@@ -491,12 +495,15 @@ const hexToRgba = (hex: string, alpha: number): string => {
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 };
 
-const mapConsoleColor = (color: string): string => {
-    const map: Record<string, string> = {
-        'Cyan': '#22d3ee', 'Yellow': '#facc15', 'Green': '#4ade80',
-        'Red': '#f87171', 'DarkGray': '#9ca3af', 'Magenta': '#c084fc'
+const mapConsoleColor = (color: string, mode: ColorMode): string => {
+    const map: Record<string, string> = mode === 'dark' ? {
+        Cyan: '#65d5ff', Yellow: '#f3cb70', Green: '#6ab9ff',
+        Red: '#ff929f', DarkGray: '#97acc5', Magenta: '#c7adff'
+    } : {
+        Cyan: '#007dad', Yellow: '#9c6700', Green: '#1477c6',
+        Red: '#c43d59', DarkGray: '#667d96', Magenta: '#8452b7'
     };
-    return map[color] || '#e5e7eb';
+    return map[color] || (mode === 'dark' ? '#d9e8f8' : '#36516c');
 };
 
 const getGuardStyle = (level?: number) => {
@@ -522,18 +529,19 @@ interface OverlayWidgetProps {
 }
 
 const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
+    const { colorMode, toggleColorMode } = useColorMode();
     const [data, setData] = useState<{ current: SongInfo | null; currentIsRequested: boolean; playerPausedAfterRequests: boolean; requestedSongArtwork: RequestedSongArtwork; queue: SongInfo[]; status: string }>({ current: null, currentIsRequested: false, playerPausedAfterRequests: false, requestedSongArtwork: 'bili_avatar', queue: [], status: '' });
     const [isConnected, setIsConnected] = useState<boolean>(true);
     const [isCdpConnected, setIsCdpConnected] = useState<boolean>(true);
     const [accepting, setAccepting] = useState<boolean>(true);
     const [playing, setPlaying] = useState<boolean>(true);
+    const [autoplayPauseConfirmed, setAutoplayPauseConfirmed] = useState<boolean>(true);
 
     const [rejects, setRejects] = useState<any[]>([]);
     const [, setPrevQueue] = useState<SongInfo[]>([]);
     const [newItemsIds, setNewItemsIds] = useState<Set<string>>(new Set());
 
     const [dragInfo, setDragInfo] = useState<DragInfo | null>(null);
-    const [titleBarActionsOpen, setTitleBarActionsOpen] = useState<boolean>(false);
     const [alwaysOnTop, setAlwaysOnTop] = useState<boolean>(() => {
         if (!isElectron) return true;
         try {
@@ -552,6 +560,17 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             return saved ? { ...defaultTheme, ...JSON.parse(saved) } : defaultTheme;
         } catch { return defaultTheme; }
     });
+
+    // Resolve the legacy default palette at render time, retaining saved custom colors.
+    // Switching day/night mode never rewrites the user's overlay configuration.
+    const displayTheme: Theme = {
+        ...theme,
+        titleColor: theme.titleColor === defaultTheme.titleColor ? (colorMode === 'dark' ? '#e5f2ff' : '#244766') : theme.titleColor,
+        textColor: theme.textColor === defaultTheme.textColor ? (colorMode === 'dark' ? '#e5f2ff' : '#244766') : theme.textColor,
+        subTextColor: theme.subTextColor === defaultTheme.subTextColor ? (colorMode === 'dark' ? '#9db0c9' : '#677f99') : theme.subTextColor,
+        bgColor: theme.bgColor === defaultTheme.bgColor ? (colorMode === 'dark' ? '#111d30' : '#f5faff') : theme.bgColor,
+        titleBarBgColor: theme.titleBarBgColor === defaultTheme.titleBarBgColor ? (colorMode === 'dark' ? '#0c1423' : '#e8f5ff') : theme.titleBarBgColor,
+    };
 
     const [toasts, setToasts] = useState<ToastInfo[]>([]);
     const lastToastTimeRef = useRef<number>(0);
@@ -718,6 +737,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 setData({ current: json.current || null, currentIsRequested: json.currentIsRequested === true, playerPausedAfterRequests: json.playerPausedAfterRequests === true, requestedSongArtwork: json.requestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar', queue: safeQueue, status: json.status || '' });
                 setAccepting(json.accepting ?? true);
                 setPlaying(json.playing ?? true);
+                setAutoplayPauseConfirmed(json.autoplayPauseConfirmed !== false);
                 setIsConnected(true);
 
                 if (typeof json.cdpConnected === 'boolean') {
@@ -850,9 +870,20 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         e?.stopPropagation?.();
         triggerActionLock();
         try {
-            await fetch(internalApiUrl('/api/state/toggle_play'), { method: 'POST' });
-            setPlaying(!playing);
-        } catch(err) { console.error(err); }
+            const response = await fetch(internalApiUrl('/api/state/toggle_play'), { method: 'POST' });
+            const result = await response.json();
+            if (typeof result.playing === 'boolean') setPlaying(result.playing);
+            setAutoplayPauseConfirmed(result.autoplayPauseConfirmed !== false);
+            if (!response.ok || !result.success) {
+                triggerToast(`⚠️ ${result.message || '自动播放变更未确认，请检查连接器状态'}`);
+                return;
+            }
+            if (result.message) triggerToast(result.message);
+        } catch(err) {
+            console.error(err);
+            setAutoplayPauseConfirmed(false);
+            triggerToast('⚠️ 自动播放变更未确认，请检查连接器状态');
+        }
     };
 
     const handleWindowClose = () => {
@@ -980,13 +1011,13 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     }
 
     const getStatusColor = (status: string | undefined) => {
-        if (!status) return theme.subTextColor;
+        if (!status) return displayTheme.subTextColor;
         if (status.includes('❌') || status.includes('🔴')) return '#f87171';
-        if (status.includes('✅') || status.includes('🟢')) return '#4ade80';
+        if (status.includes('✅') || status.includes('🟢')) return colorMode === 'dark' ? '#6ab9ff' : '#1477c6';
         if (status.includes('⚠️') || status.includes('拦截')) return '#facc15';
         if (status.includes('⬆️') || status.includes('⏭️') || status.includes('🔙') || status.includes('🔄') || status.includes('▶️') || status.includes('⚡')) return '#c084fc';
         if (status.includes('test') || status.includes('测试')) return '#22d3ee';
-        return theme.subTextColor;
+        return displayTheme.subTextColor;
     };
 
     const getStatusAnimation = (status: string | undefined) => {
@@ -995,13 +1026,10 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         return '';
     };
 
-    // 后端暂时不可用时不要把控制入口藏在悬停动画里，确保用户仍能打开设置自救。
-    const titleBarActionsVisible = titleBarActionsOpen || !isConnected;
-
     return (
-        <div className={isElectron
-            ? "w-full h-screen p-5 flex flex-col font-sans select-none group box-border overflow-hidden bg-transparent pointer-events-none no-drag"
-            : "react-widget-root absolute p-4 flex flex-col font-sans select-none z-[50] group cursor-grab active:cursor-grabbing"
+        <div data-color-mode={colorMode} data-pinned={alwaysOnTop} className={isElectron
+            ? "awoo-overlay w-full h-screen p-5 flex flex-col font-sans select-none group box-border overflow-hidden bg-transparent pointer-events-none no-drag"
+            : "awoo-overlay react-widget-root absolute p-4 flex flex-col font-sans select-none z-[50] group cursor-grab active:cursor-grabbing"
         }>
             <div className="fixed top-14 left-1/2 z-[9999] flex w-[calc(100%-2rem)] max-w-[430px] -translate-x-1/2 flex-col gap-2 pointer-events-none">
                 {toasts.map(t => (
@@ -1022,13 +1050,13 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                         willChange: 'transform',
                         width: '260px',
                         background: dragInfo.actionType === 'delete' ? 'rgba(239, 68, 68, 0.95)' :
-                            dragInfo.actionType === 'play' ? 'rgba(34, 197, 94, 0.95)' :
+                            dragInfo.actionType === 'play' ? 'rgba(22, 140, 230, 0.95)' :
                                 dragInfo.actionType === 'push' ? 'rgba(59, 130, 246, 0.95)' : 'rgba(20,20,20,0.7)',
                         border: dragInfo.actionType === 'delete' ? '2px solid #ef4444' :
-                            dragInfo.actionType === 'play' ? '2px solid #22c55e' :
+                            dragInfo.actionType === 'play' ? '2px solid #43cfff' :
                                 dragInfo.actionType === 'push' ? '2px solid #3b82f6' : '1px solid rgba(255,255,255,0.08)',
                         boxShadow: dragInfo.actionType === 'delete' ? '0 10px 30px rgba(239,68,68,0.6)' :
-                            dragInfo.actionType === 'play' ? '0 10px 30px rgba(34,197,94,0.6)' :
+                            dragInfo.actionType === 'play' ? '0 10px 30px rgba(22,140,230,0.3)' :
                                 dragInfo.actionType === 'push' ? '0 10px 30px rgba(59,130,246,0.6)' : '0 20px 50px rgba(0,0,0,0.6)',
                         backdropFilter: 'blur(16px)'
                     }}
@@ -1063,7 +1091,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                 onMouseDown={!isElectron ? handleDragStart : undefined}
                 className={`glass-panel-base w-full ${isElectron ? 'flex-1 rounded-[20px] pointer-events-auto' : 'h-full rounded-[20px]'} flex flex-col overflow-hidden relative`}
                 style={{
-                    backgroundColor: hexToRgba(theme.bgColor, theme.bgOpacity),
+                    backgroundColor: hexToRgba(displayTheme.bgColor, displayTheme.bgOpacity),
                     ...(isElectron ? { WebkitAppRegion: 'drag' } : {})
                 } as React.CSSProperties}
             >
@@ -1085,81 +1113,36 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                     />
                 )}
 
-                {!theme.showTitleBar && isElectron && (
-                    <div className="no-drag absolute top-3 right-3 flex gap-2 z-50 drop-shadow-md opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-                        <button
-                            onMouseDown={e => e.stopPropagation()}
-                            onClick={handleAlwaysOnTopToggle}
-                            aria-pressed={alwaysOnTop}
-                            aria-label={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'}
-                            className={`transition-colors cursor-pointer text-lg ${alwaysOnTop ? 'text-cyan-300 hover:text-cyan-100' : 'text-white/40 hover:text-white'}`}
-                            title={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'}
-                        >{alwaysOnTop ? '📌' : '📍'}</button>
-                        <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="text-white/50 hover:text-white transition-colors cursor-pointer text-lg" title="控制面板">⚙️</button>
-                        <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="flex items-center justify-center w-6 h-6 rounded-full transition-colors text-white/50 hover:text-white hover:bg-white/20 text-md font-bold" title="最小化">—</button>
-                        <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="flex items-center justify-center w-6 h-6 rounded-full transition-colors text-white/50 hover:text-red-400 hover:bg-red-500/20 text-md" title="关闭点歌机">✖</button>
-                    </div>
+                {(displayTheme.showTitleBar || isElectron) && (
+                    <header className={`overlay-header ${displayTheme.showTitleBar ? '' : 'is-minimal'}`} style={{ backgroundColor: displayTheme.syncTitleBarWithBg ? 'transparent' : hexToRgba(displayTheme.titleBarBgColor, displayTheme.titleBarOpacity ?? 0.2) }}>
+                        <div className="overlay-title-row">
+                            {displayTheme.showTitleBar && <div className="overlay-brand"><AwooMark /><h1 style={{ color: displayTheme.titleColor }}>嗷呜<span>点歌机</span></h1></div>}
+                            {isElectron && <div className="overlay-window-controls no-drag" aria-label="窗口操作">
+                                <button onClick={handleAlwaysOnTopToggle} aria-pressed={alwaysOnTop} aria-label={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'} title={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'}><UiIcon name="pin" /></button>
+                                <button onClick={toggleColorMode} aria-label={`切换到${colorMode === 'dark' ? '浅色' : '深色'}模式`} title={colorMode === 'dark' ? '切换到浅色模式' : '切换到深色模式'}><UiIcon name={colorMode === 'dark' ? 'moon' : 'sun'} /></button>
+                                <button onClick={onToggleAdmin} aria-label="控制面板" title="控制面板"><UiIcon name="settings" /></button>
+                                <button onClick={handleWindowMinimize} aria-label="最小化" title="最小化"><UiIcon name="minimize" /></button>
+                                <button onClick={handleWindowClose} className="overlay-close" aria-label="关闭点歌机" title="关闭点歌机"><UiIcon name="close" /></button>
+                            </div>}
+                        </div>
+                        {displayTheme.showTitleBar && <div className="overlay-status-row">
+                            <button className="overlay-autoplay no-drag" data-active={playing} onClick={togglePlaying} disabled={actionLock || !isElectron} aria-pressed={playing} aria-label={playing ? '暂停自动播放' : '开启自动播放'} title={playing ? '暂停自动播放' : '开启自动播放'}><UiIcon name={playing ? 'pause' : 'play'} /><span>{playing ? '自动播放中' : autoplayPauseConfirmed ? '自动播放暂停' : '暂停待确认'}</span></button>
+                            <span className={`overlay-status-message ${getStatusAnimation(data.status)}`} style={{ color: !isConnected ? displayTheme.subTextColor : getStatusColor(data.status) }} title={data.status || '点歌就绪'}>{!isConnected ? '等待连接服务' : (data.status || '点歌就绪')}</span>
+                        </div>}
+                    </header>
                 )}
 
-                {theme.showTitleBar && (
-                    <div className={`px-5 py-3 flex justify-between items-center z-10 transition-colors ${theme.syncTitleBarWithBg ? '' : 'border-b border-white/10'}`} style={{ backgroundColor: theme.syncTitleBarWithBg ? 'transparent' : hexToRgba(theme.titleBarBgColor || '#000000', theme.titleBarOpacity !== undefined ? theme.titleBarOpacity : 0.2) }}>
-                        <div className="flex items-center gap-2.5 shrink-0 pr-2">
-                            <button
-                                onMouseDown={e => { if(isElectron) e.stopPropagation(); }}
-                                onClick={togglePlaying}
-                                disabled={actionLock}
-                                className={`flex items-center justify-center w-5 h-5 rounded-full transition-colors ${isElectron ? 'pointer-events-auto cursor-pointer no-drag' : 'pointer-events-none'} ${playing ? (isElectron ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-green-500/20 text-green-400') : (isElectron ? 'bg-red-500/20 text-red-400 hover:bg-red-500/40' : 'bg-red-500/20 text-red-400')} ${actionLock ? 'opacity-50 pointer-events-none' : ''}`}
-                                title={isElectron ? (playing ? '点击暂停自动播放' : '点击开启自动播放') : undefined}
-                            >
-                                <span className="text-[10px] leading-none">{playing ? '🟢' : '🔴'}</span>
-                            </button>
-                            <h1 className="font-bold text-[15px] tracking-wide pointer-events-none whitespace-nowrap shrink-0" style={{ color: theme.titleColor }}>嗷呜点歌机</h1>
-                        </div>
-
-                        <div className="flex items-center relative h-6 flex-1 justify-end min-w-0">
-                            <div
-                                className={`absolute right-0 text-xs font-medium max-w-[150px] truncate pointer-events-none transition-all duration-150 ${isElectron && titleBarActionsVisible ? '-translate-x-[118px] opacity-50' : ''} ${getStatusAnimation(data.status)}`}
-                                style={{ color: !isConnected ? theme.subTextColor : getStatusColor(data.status) }}
-                            >
-                                {!isConnected ? '等待后端...' : (data.status || '点歌就绪')}
-                            </div>
-
-                            {isElectron && (
-                                <div
-                                    onMouseEnter={() => setTitleBarActionsOpen(true)}
-                                    onMouseLeave={() => setTitleBarActionsOpen(false)}
-                                    className={`no-drag absolute right-0 top-1/2 -translate-y-1/2 h-8 overflow-hidden z-20 transition-[width] duration-150 ease-out ${titleBarActionsVisible ? 'w-[116px]' : 'w-8'}`}
-                                >
-                                    <div className={`ml-auto flex h-full w-[112px] items-center justify-end gap-2 transition-all duration-150 ${titleBarActionsVisible ? 'translate-x-0 opacity-100' : 'translate-x-2 opacity-0 pointer-events-none'}`}>
-                                        <button
-                                            onMouseDown={e => e.stopPropagation()}
-                                            onClick={handleAlwaysOnTopToggle}
-                                            aria-pressed={alwaysOnTop}
-                                            aria-label={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'}
-                                            className={`no-drag transition-colors cursor-pointer text-sm ${alwaysOnTop ? 'text-cyan-300 hover:text-cyan-100' : 'text-white/40 hover:text-white'}`}
-                                            title={alwaysOnTop ? '取消窗口置顶' : '保持窗口置顶'}
-                                        >{alwaysOnTop ? '📌' : '📍'}</button>
-                                        <button onMouseDown={e => e.stopPropagation()} onClick={onToggleAdmin} className="no-drag text-white/60 hover:text-white transition-colors cursor-pointer text-sm" title="控制面板">⚙️</button>
-                                        <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowMinimize} className="no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-white hover:bg-white/20 text-xs font-bold" title="最小化">−</button>
-                                        <button onMouseDown={e => e.stopPropagation()} onClick={handleWindowClose} className="no-drag flex items-center justify-center w-5 h-5 rounded-full transition-colors text-white/60 hover:text-red-400 hover:bg-red-500/20 text-xs" title="关闭本窗口">✖</button>
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                )}
-
-                <div className="flex-1 flex flex-col p-4 overflow-hidden z-10 gap-4 custom-scrollbar relative">
+                <div className="overlay-content flex-1 flex flex-col p-4 overflow-hidden z-10 gap-4 custom-scrollbar relative">
                     {data.current ? (
                         <div
-                            className={`${isElectron && data.currentIsRequested ? 'no-drag cursor-move' : ''} current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 transition-all duration-300 ${data.currentIsRequested ? 'ring-1 ring-green-400/30 shadow-[0_0_24px_rgba(74,222,128,0.18)]' : 'opacity-75 border-sky-300/20 bg-sky-950/20 shadow-[0_0_22px_rgba(125,211,252,0.12)]'} ${dragInfo?.type === 'current' ? 'opacity-30' : ''} ${actionLock ? 'pointer-events-none' : ''}`}
+                            className={`${isElectron && data.currentIsRequested ? 'no-drag cursor-move' : ''} current-zone glass-card rounded-xl p-4 flex items-center gap-4 relative overflow-hidden shrink-0 transition-all duration-300 ${data.currentIsRequested ? 'ring-1 ring-sky-400/30 shadow-[0_0_24px_rgba(56,169,255,0.18)]' : 'opacity-75 border-sky-300/20 bg-sky-950/20 shadow-[0_0_22px_rgba(125,211,252,0.12)]'} ${dragInfo?.type === 'current' ? 'opacity-30' : ''} ${actionLock ? 'pointer-events-none' : ''}`}
                             style={{ touchAction: 'none' }}
                             onPointerDown={isElectron && data.currentIsRequested && !actionLock ? (e) => handlePointerDown(e, 'current', -1, data.current as SongInfo) : undefined}
                         >
-                            <div className={`absolute inset-0 pointer-events-none ${data.currentIsRequested ? 'bg-gradient-to-r from-green-500/10 via-transparent to-cyan-500/5' : 'bg-gradient-to-r from-sky-400/10 via-sky-950/5 to-transparent'}`}></div>
+                            <div className={`absolute inset-0 pointer-events-none ${data.currentIsRequested ? 'bg-gradient-to-r from-sky-500/10 via-transparent to-cyan-500/5' : 'bg-gradient-to-r from-sky-400/10 via-sky-950/5 to-transparent'}`}></div>
                             <div className="absolute right-[-10px] top-[-10px] opacity-5 text-7xl select-none pointer-events-none">{data.currentIsRequested ? '✨' : '🎵'}</div>
                             {data.currentIsRequested ? (
-                                <div className={`w-12 h-12 ${data.requestedSongArtwork === 'song_cover' ? 'rounded-lg' : 'rounded-full'} overflow-hidden border-[3px] ${playing ? (data.requestedSongArtwork === 'song_cover' ? 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.25)]' : getGuardStyle(data.current.GuardLevel).border || 'border-green-400/60 shadow-[0_0_15px_rgba(74,222,128,0.2)]') : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} bg-slate-800 flex items-center justify-center shrink-0 relative pointer-events-none`}>
+                                <div className={`w-12 h-12 ${data.requestedSongArtwork === 'song_cover' ? 'rounded-lg' : 'rounded-full'} overflow-hidden border-[3px] ${playing ? (data.requestedSongArtwork === 'song_cover' ? 'border-sky-400/60 shadow-[0_0_15px_rgba(56,169,255,0.25)]' : getGuardStyle(data.current.GuardLevel).border || 'border-sky-400/60 shadow-[0_0_15px_rgba(56,169,255,0.2)]') : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} bg-slate-800 flex items-center justify-center shrink-0 relative pointer-events-none`}>
                                     <SongArtworkImage song={data.current} source={data.requestedSongArtwork === 'song_cover' ? 'cover' : 'avatar'} className={!playing ? 'grayscale opacity-80' : ''} />
                                 </div>
                             ) : (
@@ -1169,20 +1152,20 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             )}
                             <div className="flex flex-col min-w-0 pointer-events-none">
                                 {!playing ? (
-                                    <div className="text-yellow-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-yellow-400 rounded-full"></span> 自动播放已暂停</div>
+                                    <div className="text-yellow-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-yellow-400 rounded-full"></span> {autoplayPauseConfirmed ? '自动播放已暂停' : 'QQ 兜底取消待确认'}</div>
                                 ) : data.currentIsRequested ? (
-                                    <div className="text-green-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse shadow-[0_0_8px_rgba(74,222,128,0.9)]"></span> 点歌播放中</div>
+                                    <div className="text-sky-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-sky-400 rounded-full animate-pulse shadow-[0_0_8px_rgba(56,169,255,0.9)]"></span> 点歌播放中</div>
                                 ) : data.playerPausedAfterRequests ? (
                                     <div className="text-amber-400/80 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-amber-400/80 rounded-full"></span> 点歌播完 · 播放器已暂停</div>
                                 ) : (
                                     <div className="text-sky-300 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-sky-300 rounded-full animate-pulse shadow-[0_0_8px_rgba(125,211,252,0.9)]"></span> 主播歌单正在播放</div>
                                 )}
-                                <div className="text-[15px] font-bold truncate drop-shadow-md" style={{ color: theme.textColor }}>{data.current.SongName}</div>
-                                <div className="text-xs truncate mt-0.5" style={{ color: theme.subTextColor }}>{data.current.ArtistName}</div>
+                                <div className="text-[15px] font-bold truncate drop-shadow-md" style={{ color: displayTheme.textColor }}>{data.current.SongName}</div>
+                                <div className="text-xs truncate mt-0.5" style={{ color: displayTheme.subTextColor }}>{data.current.ArtistName}</div>
                                 {data.currentIsRequested && (
-                                    <div className="text-[11px] mt-1 flex items-center gap-1.5" style={{ color: theme.subTextColor }}>
+                                    <div className="text-[11px] mt-1 flex items-center gap-1.5" style={{ color: displayTheme.subTextColor }}>
                                         <>
-                                            <span className="truncate">由 <span style={{ color: theme.titleColor, opacity: 0.9 }}>{data.current.OrderedBy}</span> 点播</span>
+                                            <span className="truncate">由 <span style={{ color: displayTheme.titleColor, opacity: 0.9 }}>{data.current.OrderedBy}</span> 点播</span>
                                             {getGuardStyle(data.current.GuardLevel).label && <span className={`text-[9px] px-1 rounded-sm font-bold tracking-wider leading-none py-0.5 shadow-sm ${getGuardStyle(data.current.GuardLevel).tag}`}>{getGuardStyle(data.current.GuardLevel).label}</span>}
                                         </>
                                     </div>
@@ -1190,44 +1173,34 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             </div>
                         </div>
                     ) : (
-                        <div className="current-zone glass-card rounded-xl p-4 flex flex-col items-center justify-center border-dashed border-white/20 shrink-0 min-h-[110px] relative overflow-hidden">
+                        <div className="overlay-empty current-zone glass-card rounded-xl p-4 flex flex-col items-center justify-center border-dashed border-white/20 shrink-0 min-h-[110px] relative overflow-hidden">
                             {!playing ? (
                                 <>
                                     <div className="absolute inset-0 bg-yellow-500/10 animate-[pulse_3s_infinite] pointer-events-none"></div>
-                                    <div className="text-4xl mb-2 opacity-90 drop-shadow-[0_0_15px_rgba(250,204,21,0.6)] pointer-events-none z-10 animate-bounce">⏸️</div>
-                                    <div className="text-sm font-bold tracking-wide pointer-events-none z-10 text-yellow-400 drop-shadow-md">自动播放已暂停</div>
-                                    <div className="text-[10px] mt-1 font-medium pointer-events-none z-10 opacity-70" style={{ color: theme.subTextColor }}>队列歌曲将被保留并跳过</div>
+                                    <div className="text-4xl mb-2 opacity-90 drop-shadow-[0_0_15px_rgba(250,204,21,0.6)] pointer-events-none z-10 animate-bounce"><UiIcon name="pause" /></div>
+                                    <div className="text-sm font-bold tracking-wide pointer-events-none z-10 text-yellow-400 drop-shadow-md">{autoplayPauseConfirmed ? '自动播放已暂停' : 'QQ 兜底取消待确认'}</div>
+                                    <div className="text-[10px] mt-1 font-medium pointer-events-none z-10 opacity-70" style={{ color: displayTheme.subTextColor }}>待播队列保留，自动播放已暂停</div>
                                 </>
                             ) : !isCdpConnected ? (
                                 <>
                                     <div className="absolute inset-0 bg-red-500/10 animate-[pulse_3s_infinite] pointer-events-none"></div>
-                                    <div className="text-3xl mb-2 opacity-90 drop-shadow-[0_0_15px_rgba(239,68,68,0.6)] pointer-events-none z-10 animate-bounce">🔌</div>
+                                    <div className="text-3xl mb-2 opacity-90 drop-shadow-[0_0_15px_rgba(239,68,68,0.6)] pointer-events-none z-10 animate-bounce"><UiIcon name="music" /></div>
                                     <div className="text-sm font-bold tracking-wide pointer-events-none z-10 text-red-400 drop-shadow-md">播放器未连接</div>
-                                    <div className="text-[10px] mt-1 font-medium pointer-events-none z-10 opacity-70" style={{ color: theme.subTextColor }}>请在控制面板检查注入状态</div>
+                                    <div className="text-[10px] mt-1 font-medium pointer-events-none z-10 opacity-70" style={{ color: displayTheme.subTextColor }}>打开控制面板，连接你的音乐播放器</div>
                                 </>
                             ) : (
                                 <>
-                                    <div className="text-3xl mb-2 opacity-60 drop-shadow-lg pointer-events-none">🎧</div>
-                                    <div className="text-sm font-medium tracking-wide pointer-events-none" style={{ color: theme.subTextColor }}>当前没有播放任务</div>
+                                    <div className="text-3xl mb-2 opacity-60 drop-shadow-lg pointer-events-none"><UiIcon name="headphones" /></div>
+                                    <div className="text-sm font-medium tracking-wide pointer-events-none" style={{ color: displayTheme.subTextColor }}>当前没有播放任务</div>
                                 </>
                             )}
                         </div>
                     )}
 
                     <div className="queue-zone flex-1 overflow-y-auto custom-scrollbar pr-1 flex flex-col gap-2.5 pb-4">
-                        <div className="flex items-center gap-2 mb-0.5 px-1 shrink-0">
-                            <button
-                                onMouseDown={e => { if(isElectron) e.stopPropagation(); }}
-                                onClick={toggleAccepting}
-                                disabled={actionLock}
-                                className={`flex items-center justify-center w-5 h-5 rounded-full transition-colors ${isElectron ? 'no-drag pointer-events-auto cursor-pointer' : 'pointer-events-none'} ${accepting ? (isElectron ? 'bg-green-500/20 text-green-400 hover:bg-green-500/40' : 'bg-green-500/20 text-green-400') : (isElectron ? 'bg-red-500/20 text-red-400 hover:bg-red-500/40' : 'bg-red-500/20 text-red-400')} ${actionLock ? 'opacity-50 pointer-events-none' : ''}`}
-                                title={isElectron ? (accepting ? '点击暂停接单' : '点击开启接单') : undefined}
-                            >
-                                <span className="text-[10px] leading-none">{accepting ? '🟢' : '🔴'}</span>
-                            </button>
-                            <div className="text-[10px] font-bold uppercase tracking-widest pointer-events-none" style={{ color: theme.subTextColor }}>
-                                待播队列 ({data.queue?.length || 0})
-                            </div>
+                        <div className="overlay-queue-heading">
+                            <UiIcon name="queue" /><span style={{ color: displayTheme.subTextColor }}>待播队列</span><b>{data.queue?.length || 0}</b>
+                            <button onClick={toggleAccepting} disabled={actionLock || !isElectron} className="overlay-intake no-drag" data-active={accepting} aria-pressed={accepting} aria-label={accepting ? '暂停接收点歌' : '开启接收点歌'} title={accepting ? '暂停接收点歌' : '开启接收点歌'}><i />{accepting ? '接单中' : '已停单'}</button>
                         </div>
 
                         {!accepting && (
@@ -1252,8 +1225,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                         ))}
 
                         {(!data.queue || data.queue.length === 0) && (
-                            <div className="flex-1 flex flex-col items-center justify-center text-xs italic pointer-events-none" style={{ color: theme.subTextColor }}>
-                                <span className="mb-2 text-xl opacity-60">👻</span>
+                            <div className="flex-1 flex flex-col items-center justify-center text-xs italic pointer-events-none" style={{ color: displayTheme.subTextColor }}>
+                                <span className="overlay-queue-empty-icon"><UiIcon name="music" /></span>
                                 发送「点歌 歌名」来点歌吧
                             </div>
                         )}
@@ -1268,29 +1241,29 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                                     key={uniqueKey}
                                     style={{ touchAction: 'none' }}
                                     onPointerDown={isElectron && !actionLock ? (e) => handlePointerDown(e, 'queue', index, song) : undefined}
-                                    className={`${isElectron ? 'no-drag cursor-move' : ''} queue-item glass-card rounded-lg flex items-center gap-3 transition-all hover:bg-white/10 relative group/item ${isNew ? 'animate-slide-in' : ''} ${dragInfo?.type === 'queue' && dragInfo.index === index ? 'opacity-30' : ''} ${theme.compactQueue ? 'p-1.5' : 'p-2.5'} ${actionLock ? 'pointer-events-none' : ''}`}
+                                    className={`${isElectron ? 'no-drag cursor-move' : ''} queue-item glass-card rounded-lg flex items-center gap-3 transition-all hover:bg-white/10 relative group/item ${isNew ? 'animate-slide-in' : ''} ${dragInfo?.type === 'queue' && dragInfo.index === index ? 'opacity-30' : ''} ${displayTheme.compactQueue ? 'p-1.5' : 'p-2.5'} ${actionLock ? 'pointer-events-none' : ''}`}
                                 >
-                                    {theme.compactQueue ? (
+                                    {displayTheme.compactQueue ? (
                                         <div className="flex items-center w-full min-w-0 pointer-events-none pr-14">
-                                            <div className="text-[10px] font-bold w-4 text-center shrink-0 mr-1" style={{ color: theme.subTextColor }}>{index + 1}</div>
-                                            <div className="text-[12px] font-bold truncate text-white max-w-[55%] shrink-0 pr-1">{song.SongName}</div>
-                                            <div className="text-[10px] truncate flex items-center gap-1 opacity-80 min-w-0" style={{ color: theme.subTextColor }}>
+                                            <div className="text-[10px] font-bold w-4 text-center shrink-0 mr-1" style={{ color: displayTheme.subTextColor }}>{index + 1}</div>
+                                            <div className="text-[12px] font-bold truncate max-w-[55%] shrink-0 pr-1" style={{ color: displayTheme.textColor }}>{song.SongName}</div>
+                                            <div className="text-[10px] truncate flex items-center gap-1 opacity-80 min-w-0" style={{ color: displayTheme.subTextColor }}>
                                                 <span className="truncate">- {song.OrderedBy}</span>
                                                 {itemGuardStyle.label && <span className={`text-[8px] px-1 rounded-sm font-bold tracking-wider leading-none shrink-0 ${itemGuardStyle.tag}`}>{itemGuardStyle.label}</span>}
                                             </div>
                                         </div>
                                     ) : (
                                         <>
-                                            <div className="text-[11px] font-bold w-4 text-center shrink-0 pointer-events-none" style={{ color: theme.subTextColor }}>{index + 1}</div>
-                                            <div className={`w-8 h-8 ${data.requestedSongArtwork === 'song_cover' ? 'rounded-md' : 'rounded-full'} overflow-hidden shrink-0 bg-black/30 border-2 ${data.requestedSongArtwork === 'song_cover' ? 'border-green-400/30' : (itemGuardStyle.label ? itemGuardStyle.border : 'border-white/10')} flex items-center justify-center pointer-events-none`}>
+                                            <div className="text-[11px] font-bold w-4 text-center shrink-0 pointer-events-none" style={{ color: displayTheme.subTextColor }}>{index + 1}</div>
+                                            <div className={`w-8 h-8 ${data.requestedSongArtwork === 'song_cover' ? 'rounded-md' : 'rounded-full'} overflow-hidden shrink-0 bg-black/30 border-2 ${data.requestedSongArtwork === 'song_cover' ? 'border-sky-400/30' : (itemGuardStyle.label ? itemGuardStyle.border : 'border-white/10')} flex items-center justify-center pointer-events-none`}>
                                                 <SongArtworkImage song={song} source={data.requestedSongArtwork === 'song_cover' ? 'cover' : 'avatar'} />
                                             </div>
                                             <div className="flex flex-col min-w-0 flex-1 pointer-events-none">
-                                                <div className="text-[13px] font-bold truncate drop-shadow-sm pr-16" style={{ color: theme.textColor }}>{song.SongName}</div>
-                                                <div className="text-[11px] truncate flex items-center gap-1.5 mt-0.5" style={{ color: theme.subTextColor }}>
+                                                <div className="text-[13px] font-bold truncate drop-shadow-sm pr-16" style={{ color: displayTheme.textColor }}>{song.SongName}</div>
+                                                <div className="text-[11px] truncate flex items-center gap-1.5 mt-0.5" style={{ color: displayTheme.subTextColor }}>
                                                     <span>{song.ArtistName}</span>
                                                     <span className="w-0.5 h-0.5 bg-white/30 rounded-full"></span>
-                                                    <span className="truncate flex items-center gap-1" style={{ color: theme.titleColor, opacity: 0.8 }}>
+                                                    <span className="truncate flex items-center gap-1" style={{ color: displayTheme.titleColor, opacity: 0.8 }}>
                                                         {song.OrderedBy}
                                                         {itemGuardStyle.label && <span className={`text-[8px] px-1 py-0.5 rounded-[2px] font-bold tracking-wider leading-none shadow-sm ${itemGuardStyle.tag}`}>{itemGuardStyle.label}</span>}
                                                     </span>
@@ -1300,10 +1273,10 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                                     )}
 
                                     {isElectron && (
-                                        <div className="absolute right-2 top-1/2 transform -translate-y-1/2 flex items-center gap-1 opacity-0 group-hover/item:opacity-100 transition-opacity bg-black/60 p-1 rounded-md backdrop-blur-md border border-white/10 z-20">
-                                            <button onPointerDown={e => { e.stopPropagation(); handleQueueAction('top', { index }); }} className="p-1 hover:bg-white/20 rounded text-xs transition-colors" title="置顶/优先播放">⬆️</button>
-                                            <button onPointerDown={e => { e.stopPropagation(); handleQueueAction('play_now', { index }); }} className="p-1 hover:bg-white/20 rounded text-xs transition-colors" title="无视顺序，强行立即切歌播放">▶️</button>
-                                            <button onPointerDown={e => { e.stopPropagation(); handleQueueAction('delete', { index }); }} className="p-1 hover:bg-red-500/40 rounded text-xs transition-colors text-red-400" title="移出点歌队列">🗑️</button>
+                                        <div className="overlay-queue-actions no-drag">
+                                            <button onPointerDown={e => e.stopPropagation()} onClick={() => handleQueueAction('top', { index })} disabled={actionLock} aria-label="置顶/优先播放" title="置顶/优先播放"><UiIcon name="top" /></button>
+                                            <button onPointerDown={e => e.stopPropagation()} onClick={() => handleQueueAction('play_now', { index })} disabled={actionLock} aria-label="立即切歌播放" title="立即切歌播放"><UiIcon name="play" /></button>
+                                            <button onPointerDown={e => e.stopPropagation()} onClick={() => handleQueueAction('delete', { index })} disabled={actionLock} className="overlay-delete" aria-label="移出点歌队列" title="移出点歌队列"><UiIcon name="trash" /></button>
                                         </div>
                                     )}
                                 </div>
@@ -1322,13 +1295,20 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 // ==========================================
 
 const AdminWidget: React.FC = () => {
+    const { colorMode, toggleColorMode } = useColorMode();
+    useEffect(() => { electronAPI?.setWindowColorMode?.(colorMode); }, [colorMode]);
     const [config, setConfig] = useState<any>(null);
     const [activeTab, setActiveTab] = useState<string>(() => (
         new URLSearchParams(window.location.search).get('tab') === 'appearance'
             ? 'appearance'
-            : 'settings'
+            : 'status'
     ));
     const [supportMenuOpen, setSupportMenuOpen] = useState(false);
+    const mainContentRef = useRef<HTMLElement>(null);
+
+    useEffect(() => {
+        mainContentRef.current?.scrollTo({ top: 0 });
+    }, [activeTab]);
 
     const [updateInfo, setUpdateInfo] = useState<UpdateInfo>({ checking: false, info: null });
     const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
@@ -1354,6 +1334,10 @@ const AdminWidget: React.FC = () => {
         Partial<Record<NativeConnectorId, ConnectorStatus>>
     >({});
     const [connectorChecking, setConnectorChecking] = useState(false);
+    const connectorCheckInFlightRef = useRef(false);
+    const [connectorChecks, setConnectorChecks] = useState<Partial<Record<NativeConnectorId, boolean>>>({});
+    const connectorRowChecksRef = useRef(new Set<NativeConnectorId>());
+    const [connectorCheckErrors, setConnectorCheckErrors] = useState<Partial<Record<NativeConnectorId, string>>>({});
     const [connectorUpdating, setConnectorUpdating] = useState<
         NativeConnectorId | null
     >(null);
@@ -1667,26 +1651,52 @@ const AdminWidget: React.FC = () => {
         }
     }, [showAdminToast]);
 
-    const loadConnectorStatuses = useCallback(async (forceRefresh = false) => {
-        setConnectorChecking(true);
-        setConnectorStatusError('');
+    const loadConnectorStatuses = useCallback(async (forceRefresh = false, connectorId?: NativeConnectorId) => {
+        if (connectorCheckInFlightRef.current
+            || (connectorId ? connectorRowChecksRef.current.has(connectorId) : connectorRowChecksRef.current.size > 0)) return;
+        if (connectorId) {
+            connectorRowChecksRef.current.add(connectorId);
+            setConnectorChecks(previous => ({ ...previous, [connectorId]: true }));
+            setConnectorCheckErrors(previous => ({ ...previous, [connectorId]: '' }));
+        } else {
+            connectorCheckInFlightRef.current = true;
+            setConnectorChecking(true);
+            setConnectorStatusError('');
+        }
         try {
-            const suffix = forceRefresh ? '?refresh=1' : '';
+            const params = new URLSearchParams();
+            if (forceRefresh) params.set('refresh', '1');
+            if (connectorId) params.set('connectorId', connectorId);
+            const suffix = params.size > 0 ? `?${params}` : '';
             const response = await fetch(
                 `${internalApiUrl('/api/connectors/status')}${suffix}`
             );
             const result = await response.json();
-            if (!result.success) {
+            if (!response.ok || !result.success) {
                 throw new Error(result.message || '连接器更新服务不可用');
             }
             const nextStatuses: Partial<
                 Record<NativeConnectorId, ConnectorStatus>
             > = {};
             for (const status of result.connectors || []) {
+                if (connectorId && status.id !== connectorId) continue;
                 nextStatuses[status.id as NativeConnectorId] = status;
             }
-            setConnectorStatuses(nextStatuses);
-            if (forceRefresh) {
+            if (connectorId && !nextStatuses[connectorId]) {
+                throw new Error('更新服务未返回该连接器的版本信息');
+            }
+            setConnectorStatuses(previous => connectorId ? { ...previous, ...nextStatuses } : nextStatuses);
+            if (!connectorId) setConnectorCheckErrors({});
+            if (connectorId) {
+                const status = nextStatuses[connectorId]!;
+                const error = status.error || (!status.compatible ? `需要本体 v${status.minimumCoreVersion}` : '');
+                setConnectorCheckErrors(previous => ({ ...previous, [connectorId]: error }));
+                showAdminToast(error
+                    ? `❌ ${status.name}：${error}`
+                    : status.updateAvailable
+                        ? `${status.name}有可用版本 v${status.latestVersion}`
+                        : `✅ ${status.name}连接器已是最新`);
+            } else if (forceRefresh) {
                 const statuses = (result.connectors || []) as ConnectorStatus[];
                 const count = statuses.filter(
                     (status: ConnectorStatus) => status.updateAvailable
@@ -1706,12 +1716,22 @@ const AdminWidget: React.FC = () => {
             const message = error instanceof Error
                 ? error.message
                 : '检查连接器更新失败';
-            setConnectorStatusError(message);
+            if (connectorId) {
+                setConnectorCheckErrors(previous => ({ ...previous, [connectorId]: message }));
+            } else {
+                setConnectorStatusError(message);
+            }
             if (forceRefresh) {
                 showAdminToast(`❌ ${message}`);
             }
         } finally {
-            setConnectorChecking(false);
+            if (connectorId) {
+                connectorRowChecksRef.current.delete(connectorId);
+                setConnectorChecks(previous => ({ ...previous, [connectorId]: false }));
+            } else {
+                connectorCheckInFlightRef.current = false;
+                setConnectorChecking(false);
+            }
         }
     }, [showAdminToast]);
 
@@ -2666,9 +2686,21 @@ const AdminWidget: React.FC = () => {
 
     const togglePlaying = async () => {
         try {
-            await fetch(internalApiUrl('/api/state/toggle_play'), { method: 'POST' });
-            setConfig((prev: any) => ({...prev, playing: !prev.playing}));
-        } catch(err) { console.error(err); }
+            const response = await fetch(internalApiUrl('/api/state/toggle_play'), { method: 'POST' });
+            const result = await response.json();
+            setConfig((prev: any) => ({
+                ...prev,
+                playing: typeof result.playing === 'boolean' ? result.playing : prev.playing,
+                autoplayPauseConfirmed: result.autoplayPauseConfirmed !== false
+            }));
+            showAdminToast(!response.ok || !result.success
+                ? `⚠️ ${result.message || '自动播放变更未确认，请检查连接器状态'}`
+                : result.message || '自动播放状态已更新');
+        } catch(err) {
+            console.error(err);
+            setConfig((prev: any) => ({ ...prev, autoplayPauseConfirmed: false }));
+            showAdminToast('⚠️ 自动播放变更未确认，请检查连接器状态');
+        }
     };
 
     const handleDebugInsert = async () => {
@@ -3025,8 +3057,22 @@ const AdminWidget: React.FC = () => {
             .map(gift => gift.giftId ? `id:${gift.giftId}` : `name:${gift.giftName}`)
     );
 
+    const pages: Record<string, string> = {
+        status: '运行状态',
+        appearance: '外观设置',
+        settings: '基础设置',
+        login: '扫码登录',
+        update: '版本升级',
+        faq: '常见问题',
+        feedback: '问题反馈',
+        logs: '运行日志',
+        debug: '调试测试',
+    };
+    const currentPage = pages[activeTab] || pages.status;
+    const selectedPlayerName = playerOptions.find(player => player.type === config?.config?.PlayerType)?.name || '音乐播放器';
+
     return (
-        <div className="admin-widget-root animate-fade-in text-gray-200 flex flex-col font-sans select-none w-full h-screen overflow-hidden" style={{ backgroundColor: '#0d1117' }}>
+        <div data-color-mode={colorMode} className="admin-widget-root animate-fade-in flex flex-col font-sans select-none w-full h-screen overflow-hidden">
 
             {adminToast && (
                 <div className="fixed top-8 left-1/2 transform -translate-x-1/2 z-[99999] bg-blue-600 text-white px-6 py-3 rounded-full shadow-2xl font-bold animate-slide-in flex items-center gap-2">
@@ -3101,41 +3147,33 @@ const AdminWidget: React.FC = () => {
                 </button>
             )}
 
-            <div className="px-4 py-2 border-b border-white/10 flex justify-between items-center bg-white/5" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
-                <div className="font-bold text-white text-sm flex items-center gap-2">⚙️ 控制面板</div>
+            <div className="studio-titlebar" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
+                <span className="studio-titlebar-name"><AwooMark /> 嗷呜点歌机</span>
+                <span className="studio-titlebar-divider" />
+                <span>控制台</span>
             </div>
 
-            <div className="flex-1 flex overflow-hidden relative">
-                <div className="w-40 border-r border-white/5 bg-white/[0.02] flex flex-col p-2 gap-1 overflow-y-auto custom-scrollbar shrink-0 z-10">
-                    <button
-                        onClick={() => void openSkinMarketplace()}
-                        className="mb-2 rounded-xl border border-violet-400/35 bg-gradient-to-br from-violet-500/25 via-cyan-500/15 to-blue-500/20 p-3 text-left shadow-lg shadow-violet-950/20 transition hover:border-cyan-300/50 hover:brightness-110"
-                    >
-                        <span className="flex items-center gap-2 text-sm font-bold text-white">
-                            <span>🧩</span>
-                            <span>嗷呜皮肤站</span>
-                            <span className="ml-auto text-[10px] text-cyan-200">↗</span>
-                        </span>
-                        <span className="mt-1 block pl-6 text-[10px] leading-relaxed text-cyan-100/70">浏览并一键安装 UI</span>
-                    </button>
+            <div className="studio-body flex-1 flex overflow-hidden relative">
+                <nav aria-label="主导航" className="studio-sidebar custom-scrollbar">
+                    <div className="studio-brand"><span className="studio-brand-mark"><AwooMark /></span><strong>嗷呜点歌机</strong></div>
                     {[
-                        { id: 'status', icon: '🏠', label: '运行状态' },
-                        { id: 'appearance', icon: '🎨', label: '外观设置' },
-                        { id: 'settings', icon: '⚙️', label: '基础设置' },
-                        { id: 'login', icon: '📱', label: '扫码登录' },
-                        { id: 'update', icon: '🚀', label: '版本升级' }
+                        { id: 'status', label: '运行状态' },
+                        { id: 'appearance', label: '外观设置' },
+                        { id: 'settings', label: '基础设置' },
+                        { id: 'login', label: '扫码登录' },
+                        { id: 'update', label: '版本升级' }
                     ].map(t => (
-                        <button key={t.id} onClick={() => { setActiveTab(t.id); setSupportMenuOpen(false); }} className={`flex items-center gap-2.5 p-2.5 rounded-lg text-sm transition-colors text-left ${activeTab === t.id ? 'bg-blue-600 text-white font-bold' : 'hover:bg-white/10 text-gray-400'}`}>
-                            <span>{t.icon}</span> <span className="truncate">{t.label}</span>
+                        <button key={t.id} title={t.label} aria-current={activeTab === t.id ? 'page' : undefined} onClick={() => { setActiveTab(t.id); setSupportMenuOpen(false); }} className={`studio-nav-item ${activeTab === t.id ? 'is-active' : ''}`}>
+                            <UiIcon name={t.id as UiIconName} /> <span>{t.label}</span><span className="studio-nav-indicator" />
                         </button>
                     ))}
                     <details
                         open={supportMenuOpen}
                         onToggle={event => setSupportMenuOpen(event.currentTarget.open)}
-                        className="group mt-1 rounded-lg border border-white/[0.06] bg-black/10"
+                        className="studio-support group"
                     >
                         <summary className={`flex cursor-pointer list-none items-center gap-2 rounded-lg px-2.5 py-2 text-xs transition-colors [&::-webkit-details-marker]:hidden ${['faq', 'feedback', 'logs', 'debug'].includes(activeTab) ? 'text-cyan-200' : 'text-gray-500 hover:bg-white/5 hover:text-gray-300'}`}>
-                            <span>🛠️</span>
+                            <UiIcon name="faq" />
                             <span className="font-bold">帮助与调试</span>
                             {feedbackUnreadCount > 0 && (
                                 <span className="ml-auto h-2 w-2 shrink-0 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]" title={`${feedbackUnreadCount} 条反馈有新回复`}></span>
@@ -3149,8 +3187,8 @@ const AdminWidget: React.FC = () => {
                                 { id: 'logs', icon: '📝', label: '运行日志' },
                                 { id: 'debug', icon: '🐞', label: '调试测试' }
                             ].map(t => (
-                                <button key={t.id} onClick={() => setActiveTab(t.id)} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors ${activeTab === t.id ? 'bg-blue-600/90 font-bold text-white' : 'text-gray-500 hover:bg-white/5 hover:text-gray-300'}`}>
-                                    <span>{t.icon}</span> <span className="truncate">{t.label}</span>
+                                <button key={t.id} title={t.label} aria-current={activeTab === t.id ? 'page' : undefined} onClick={() => setActiveTab(t.id)} className={`studio-nav-item studio-nav-subitem ${activeTab === t.id ? 'is-active' : ''}`}>
+                                    <UiIcon name={t.id as UiIconName} /> <span className="truncate">{t.label}</span>
                                     {t.id === 'feedback' && feedbackUnreadCount > 0 && (
                                         <span className="ml-auto h-2 w-2 shrink-0 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]" title={`${feedbackUnreadCount} 条新回复`}></span>
                                     )}
@@ -3158,16 +3196,29 @@ const AdminWidget: React.FC = () => {
                             ))}
                         </div>
                     </details>
-                    <button onClick={restartOnboarding} className="mt-2 flex items-center gap-2.5 rounded-lg border border-cyan-400/15 bg-cyan-500/[0.06] p-2.5 text-left text-xs text-cyan-300 hover:bg-cyan-500/10">
-                        <span>✨</span> <span className="truncate">新手引导</span>
+                    <button onClick={restartOnboarding} title="新手引导" className="studio-nav-item studio-guide">
+                        <UiIcon name="guide" /> <span>新手引导</span>
                     </button>
-                </div>
+                    <div className="studio-sidebar-footer">
+                        <button className="studio-theme-toggle" onClick={toggleColorMode} aria-label={`切换到${colorMode === 'dark' ? '浅色' : '深色'}模式`} title={colorMode === 'dark' ? '切换到浅色模式' : '切换到深色模式'}>
+                            <UiIcon name={colorMode === 'dark' ? 'moon' : 'sun'} /><span>{colorMode === 'dark' ? '深色模式' : '浅色模式'}</span><span className="studio-theme-switch" aria-hidden="true" />
+                        </button>
+                        <button onClick={() => void openSkinMarketplace()} className="studio-skin-link" title="浏览嗷呜皮肤站">
+                            <span className="studio-skin-icon"><UiIcon name="appearance" /></span>
+                            <span><strong>嗷呜皮肤站</strong></span><UiIcon name="external" />
+                        </button>
+                    </div>
+                </nav>
 
-                <div className="flex-1 p-6 overflow-y-auto custom-scrollbar select-text relative">
+                <main ref={mainContentRef} className="studio-main flex-1 overflow-y-auto custom-scrollbar select-text relative">
+                    <header className="studio-page-header">
+                        <h1>{currentPage}</h1>
+                        <div className="studio-session"><span className={`studio-tiny-dot ${roomConnection.status === 'connected' ? 'is-live' : ''}`} /><span>{roomConnection.status === 'connected' ? '直播间已连接' : '等待连接直播间'}</span></div>
+                    </header>
                     {!config ? (
-                        <div className="h-full flex items-center justify-center text-white/50">正在连接后端服务...</div>
+                        <div className="studio-loading"><span className="studio-loading-ring" /><strong>正在连接点歌机</strong></div>
                     ) : (
-                        <div className="max-w-3xl mx-auto">
+                        <div className={`studio-page-content studio-page-${activeTab}`}>
 
                             {playerControlNotice && (
                                 <div className={`mb-6 animate-fadeIn rounded-xl border p-4 shadow-lg ${playerAccessBlocked ? 'border-red-400/35 bg-red-500/10 text-red-100' : 'border-orange-400/35 bg-orange-500/10 text-orange-100'}`}>
@@ -3219,63 +3270,28 @@ const AdminWidget: React.FC = () => {
                             {activeTab === 'status' && (
                                 <div className="space-y-5 animate-slide-in-right flex flex-col h-full pb-6">
                                     <div>
-                                        <h2 className="text-2xl font-bold text-white mb-2">运行状态</h2>
-                                        <p className="text-sm text-gray-500 mb-5">查看直播间、播放器、当前歌曲和点歌开关；界面与 OBS 捕捉请前往「外观设置」。</p>
-
-                                        <div className={`p-4 rounded-xl border mb-5 flex items-center gap-4 ${playerAccessBlocked ? 'bg-red-500/10 border-red-400/30' : playerControlNotice ? 'bg-orange-500/10 border-orange-400/30' : currentStatusSong && !config.currentIsRequested ? 'bg-sky-500/10 border-sky-400/25' : 'bg-white/5 border-white/10'}`}>
-                                            <div className={`w-12 h-12 shrink-0 rounded-xl overflow-hidden grid place-items-center ${currentStatusSong && !config.currentIsRequested ? 'bg-sky-400/15 text-sky-200' : 'bg-white/5 text-gray-400'}`}>
+                                        <div className={`studio-now-playing ${playerControlNotice ? 'has-notice' : ''}`}>
+                                            <div className="studio-album">
                                                 {currentStatusSong?.CoverUrl ? (
-                                                    <img src={currentStatusSong.CoverUrl} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
-                                                ) : '♫'}
+                                                    <SongArtworkImage song={currentStatusSong} source="cover" />
+                                                ) : <div className="studio-record"><span /><UiIcon name="music" /></div>}
                                             </div>
-                                            <div className="min-w-0 flex-1">
-                                                <div className={`text-[11px] font-bold mb-1 ${playerAccessBlocked ? 'text-red-300' : playerControlNotice ? 'text-orange-300' : currentStatusSong && !config.currentIsRequested ? 'text-sky-300' : 'text-green-400'}`}>
-                                                    {currentStatusSong ? (config.currentIsRequested ? '点歌播放中' : '播放器当前歌曲 · 主播歌单') : '播放器当前歌曲'}
-                                                </div>
-                                                <div className="font-bold text-white truncate">{currentStatusSong?.SongName || '暂未读取到歌曲'}</div>
-                                                <div className="text-xs text-gray-400 truncate mt-0.5">{currentStatusSong?.ArtistName || '连接播放器后会在这里实时显示'}</div>
+                                            <div className="studio-track-info min-w-0 flex-1">
+                                                <div className="studio-eyebrow studio-track-eyebrow">当前歌曲 <span>· {selectedPlayerName}</span></div>
+                                                <div className="studio-track-name">{currentStatusSong?.SongName || '暂无播放歌曲'}</div>
+                                                {currentStatusSong && <>
+                                                    <div className="studio-track-artist">{currentStatusSong.ArtistName || '未知歌手'}</div>
+                                                    <div className="studio-track-caption">{config.currentIsRequested ? '点歌播放中' : '主播歌单'}</div>
+                                                </>}
                                             </div>
-                                            <span className={`text-xs px-2.5 py-1 rounded-full border ${playerAccessBlocked ? 'text-red-300 border-red-400/30 bg-red-500/10' : playerControlNotice ? 'text-orange-300 border-orange-400/30 bg-orange-500/10' : config.playerConnected ? 'text-green-300 border-green-500/25 bg-green-500/10' : 'text-red-300 border-red-500/25 bg-red-500/10'}`}>
+                                            <span className={`studio-player-badge text-xs px-2.5 py-1 rounded-full border ${playerAccessBlocked ? 'text-red-300 border-red-400/30 bg-red-500/10' : playerControlNotice ? 'text-orange-300 border-orange-400/30 bg-orange-500/10' : config.playerConnected ? 'text-green-300 border-green-500/25 bg-green-500/10' : 'text-gray-400 border-white/10 bg-white/5'}`}>
                                                 {playerAccessBlocked ? '已连接 · 权限被阻止' : playerControlNotice ? '已连接 · 版本不兼容' : config.playerConnected ? '播放器已连接' : '播放器未连接'}
                                             </span>
+                                            <div className="studio-waveform" aria-hidden="true">{[12, 21, 14, 32, 24, 42, 29, 18, 36, 22, 46, 27, 16, 33, 23, 14].map((height, index) => <i key={index} style={{ height }} />)}</div>
                                         </div>
 
-                                        <div ref={roomSetupRef} className="bg-white/5 p-5 rounded-xl border border-white/10 shadow-inner mb-5 scroll-mt-4">
-                                            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-                                                <div>
-                                                    <div className="text-sm text-gray-200 font-bold">B站直播间连接</div>
-                                                    <div className="text-[11px] text-gray-500 mt-1">只有弹幕通道真正连通后，才会显示“弹幕已连接”</div>
-                                                </div>
-                                                <span className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border ${roomStatusMeta.className}`}>
-                                                    <span>{roomStatusMeta.icon}</span>
-                                                    {roomStatusMeta.label}
-                                                </span>
-                                            </div>
-                                            <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2.5 mb-4">
-                                                <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs">
-                                                    <span className="text-gray-400">房间号 <strong className="text-white ml-1">{roomConnection.requestedRoomId || '未设置'}</strong></span>
-                                                    <span className="text-gray-400">真实 ID <strong className="text-cyan-300 ml-1">{roomConnection.realRoomId || '等待解析'}</strong></span>
-                                                </div>
-                                                <div className={`text-[11px] mt-1.5 ${roomConnection.status === 'error' ? 'text-red-300' : roomConnection.status === 'connected' ? 'text-green-300' : 'text-gray-500'}`}>
-                                                    {roomConnection.message || roomStatusMeta.label}
-                                                </div>
-                                            </div>
-                                            <div className="text-[11px] text-blue-300/80 mb-3">发弹幕 “test” 或 “测试” 可验证弹幕是否正常到达。</div>
-                                            <div className="flex flex-wrap gap-3">
-                                                <input
-                                                    type="text"
-                                                    value={roomIdInput}
-                                                    onChange={e => setRoomIdInput(e.target.value)}
-                                                    className="flex-1 min-w-[220px] bg-black/30 border border-white/10 rounded-lg p-3 text-md text-white focus:border-blue-500 outline-none"
-                                                    placeholder="输入直播间数字房间号（不是 UID）"
-                                                />
-                                                <button onClick={handleConnectRoom} className="px-5 py-3 bg-blue-600 hover:bg-blue-500 text-white text-md rounded-lg font-bold shadow-lg transition-colors">连接 / 切换房间</button>
-                                                <button onClick={handleDisconnectRoom} className="px-5 py-3 bg-white/10 hover:bg-red-500/20 text-gray-300 hover:text-red-200 border border-white/10 hover:border-red-400/30 text-md rounded-lg font-bold transition-colors">断开连接</button>
-                                            </div>
-                                        </div>
-
-                                        <div className="grid grid-cols-2 gap-4 mb-5">
-                                            <div className="bg-white/5 p-5 rounded-xl border border-white/10 flex justify-between items-center">
+                                        <div className="studio-control-grid grid grid-cols-2 gap-4 mb-5">
+                                            <div className="studio-control-card bg-white/5 p-5 rounded-xl border border-white/10 flex justify-between items-center">
                                                 <div>
                                                     <div className="text-sm text-gray-400 mb-2">点歌功能状态</div>
                                                     <div className="text-2xl font-bold flex items-center gap-3 mt-1">
@@ -3287,11 +3303,11 @@ const AdminWidget: React.FC = () => {
                                                 </button>
                                             </div>
 
-                                            <div className="bg-white/5 p-5 rounded-xl border border-white/10 flex justify-between items-center">
+                                            <div className="studio-control-card bg-white/5 p-5 rounded-xl border border-white/10 flex justify-between items-center">
                                                 <div>
                                                     <div className="text-sm text-gray-400 mb-2">自动播放状态</div>
                                                     <div className="text-2xl font-bold flex items-center gap-3 mt-1">
-                                                        {config.playing ? <><span className="w-3 h-3 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.8)]"></span> <span className="text-blue-400">播放中</span></> : <><span className="w-3 h-3 rounded-full bg-gray-500 shadow-[0_0_8px_rgba(107,114,128,0.8)]"></span> <span className="text-gray-400">已暂停</span></>}
+                                                        {config.playing ? <><span className="w-3 h-3 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.8)]"></span> <span className="text-blue-400">播放中</span></> : <><span className="w-3 h-3 rounded-full bg-gray-500 shadow-[0_0_8px_rgba(107,114,128,0.8)]"></span> <span className="text-gray-400">{config.autoplayPauseConfirmed === false ? '暂停待确认' : '已暂停'}</span></>}
                                                     </div>
                                                 </div>
                                                 <button onClick={togglePlaying} className={`px-5 py-2.5 rounded-lg text-sm font-bold shadow-lg transition-colors border ${config.playing ? 'bg-gray-600/40 text-gray-400 border-gray-500/30 hover:bg-gray-600/60' : 'bg-blue-600/20 text-blue-500 border-blue-500/30 hover:bg-blue-600/40'}`}>
@@ -3299,7 +3315,45 @@ const AdminWidget: React.FC = () => {
                                                 </button>
                                             </div>
                                         </div>
+                                        <div ref={roomSetupRef} className="studio-room-card bg-white/5 p-5 rounded-xl border border-white/10 shadow-inner mb-5 scroll-mt-4">
+                                            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                                                <div>
+                                                    <div className="studio-section-label"><UiIcon name="radio" /> B站直播间连接</div>
+                                                    <div className="text-[11px] text-gray-500 mt-1">连接直播间后接收点歌弹幕</div>
+                                                </div>
+                                                <span className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border ${roomStatusMeta.className}`}>
+                                                    <span>{roomStatusMeta.icon}</span>
+                                                    {roomStatusMeta.label}
+                                                </span>
+                                            </div>
+                                            <div className="flex flex-wrap gap-3">
+                                                <input
+                                                    aria-label="直播间房间号"
+                                                    type="text"
+                                                    value={roomIdInput}
+                                                    onChange={e => setRoomIdInput(e.target.value)}
+                                                    className="flex-1 min-w-[220px] bg-black/30 border border-white/10 rounded-lg p-3 text-md text-white focus:border-blue-500 outline-none"
+                                                    placeholder="输入直播间数字房间号（不是 UID）"
+                                                />
+                                                <button onClick={handleConnectRoom} className="studio-primary px-5 py-3 bg-blue-600 hover:bg-blue-500 text-white text-md rounded-lg font-bold shadow-lg transition-colors">连接 / 切换房间 <UiIcon name="arrow" /></button>
+                                                <button onClick={handleDisconnectRoom} className="px-5 py-3 bg-white/10 hover:bg-red-500/20 text-gray-300 hover:text-red-200 border border-white/10 hover:border-red-400/30 text-md rounded-lg font-bold transition-colors">断开连接</button>
+                                            </div>
+                                            <details className="studio-room-details" open={roomConnection.status === 'error'}>
+                                                <summary>连接详情<span>房间 {roomConnection.requestedRoomId || '未设置'}</span></summary>
+                                                <div className="mt-3 rounded-lg border border-white/10 bg-black/20 px-3 py-2.5">
+                                                    <div className="text-xs text-gray-400">真实 ID <strong className="text-cyan-300 ml-1">{roomConnection.realRoomId || '等待解析'}</strong></div>
+                                                    <div className={`text-[11px] mt-1.5 ${roomConnection.status === 'error' ? 'text-red-300' : roomConnection.status === 'connected' ? 'text-green-300' : 'text-gray-500'}`}>
+                                                        {roomConnection.message || roomStatusMeta.label}
+                                                    </div>
+                                                    <div className="text-[11px] text-gray-400 mt-2">发弹幕 “test” 或 “测试” 可验证弹幕是否正常到达。</div>
+                                                </div>
+                                            </details>
+                                        </div>
 
+                                        <div className="studio-shortcuts">
+                                            <button onClick={() => setActiveTab('appearance')}><UiIcon name="monitor" /><span><strong>悬浮窗与 OBS 设置</strong><small>窗口样式与浏览器捕捉</small></span><UiIcon name="arrow" /></button>
+                                            <button onClick={() => setActiveTab('settings')}><UiIcon name="settings" /><span><strong>调整点歌规则</strong><small>播放器、冷却与观众权限</small></span><UiIcon name="arrow" /></button>
+                                        </div>
                                     </div>
                                 </div>
                             )}
@@ -3308,8 +3362,7 @@ const AdminWidget: React.FC = () => {
                                 <div className="space-y-5 animate-slide-in-right pb-6">
                                     <div className="flex flex-wrap items-center justify-between gap-3">
                                         <div>
-                                            <h2 className="text-2xl font-bold text-white mb-2">外观设置</h2>
-                                            <p className="text-sm text-gray-500">分别设置面向观众的直播画面，以及主播自己操作的点歌机悬浮窗。</p>
+                                            <p className="text-sm text-gray-500">直播画面与主播控制窗口，可分别定制。</p>
                                         </div>
                                         <button onClick={() => void openSkinMarketplace()} className="shrink-0 rounded-xl border border-violet-400/40 bg-gradient-to-r from-violet-600 to-cyan-600 px-4 py-2.5 text-sm font-bold text-white shadow-lg shadow-violet-950/30 transition hover:brightness-110">
                                             🧩 浏览嗷呜皮肤站 ↗
@@ -3321,7 +3374,7 @@ const AdminWidget: React.FC = () => {
                                             <div className="flex flex-wrap items-start justify-between gap-3">
                                                 <div>
                                                     <div className="mb-2 flex flex-wrap items-center gap-2">
-                                                        <span className="text-xl">📺</span>
+                                                        <UiIcon name="monitor" />
                                                         <h3 className="text-lg font-bold text-cyan-100">面向观众 · Mod UI</h3>
                                                         <span className="rounded-full border border-cyan-400/25 bg-cyan-500/15 px-2 py-1 text-[10px] font-bold text-cyan-300">OBS / 直播姬推荐</span>
                                                     </div>
@@ -3504,11 +3557,12 @@ const AdminWidget: React.FC = () => {
                                     <section className="rounded-2xl border border-blue-400/20 bg-gradient-to-br from-blue-500/[0.07] to-white/[0.025] overflow-hidden">
                                         <div className="p-5 border-b border-white/10">
                                             <div className="flex flex-wrap items-center gap-2">
-                                                <span className="text-xl">🧑‍💻</span>
+                                                <UiIcon name="appearance" />
                                                 <h3 className="text-lg font-bold text-white">主播控制 UI</h3>
                                                 <span className="rounded-full border border-blue-400/20 bg-blue-500/10 px-2 py-1 text-[10px] text-blue-300">主播自己使用</span>
                                             </div>
                                             <p className="mt-2 text-xs leading-relaxed text-gray-400">设置点歌机悬浮窗的点歌图片、标题栏、文字与背景。这里只影响主播操作窗口，不会改变 OBS 的 Mod UI。</p>
+                                            <p className="mt-1 text-xs text-gray-500">默认配色跟随浅色／深色模式切换；手动设置的颜色优先。</p>
                                         </div>
 
                                         <div className="p-5 space-y-5">
@@ -3609,7 +3663,6 @@ const AdminWidget: React.FC = () => {
                             {activeTab === 'logs' && (
                                 <div className="space-y-4 animate-slide-in-right flex flex-col h-[70vh]">
                                     <div className="flex justify-between items-center pr-2">
-                                        <h2 className="text-2xl font-bold text-white mb-2">后端实时日志 (Log)</h2>
                                         {/* ⭐ 新增: 精致的滚动模式控制开关，让用户在阅读日志时可手动锁定 */}
                                         <div className="flex items-center gap-3 bg-black/40 px-3 py-1.5 rounded-lg border border-white/5">
                                             <label className="text-xs text-gray-400 flex items-center gap-1.5 cursor-pointer select-none">
@@ -3654,7 +3707,7 @@ const AdminWidget: React.FC = () => {
                                                 sysLogs.map((log, i) => (
                                                     <div key={i} className="flex gap-4 leading-relaxed">
                                                         <span className="text-gray-600 shrink-0">[{log.Time}]</span>
-                                                        <span style={{color: mapConsoleColor(log.Color)}} className="break-all whitespace-pre-wrap">{log.Message}</span>
+                                                        <span style={{color: mapConsoleColor(log.Color, colorMode)}} className="break-all whitespace-pre-wrap">{log.Message}</span>
                                                     </div>
                                                 ))
                                             )}
@@ -3682,7 +3735,6 @@ const AdminWidget: React.FC = () => {
                             {/* ⭐ 新增: 常见问题异常排查 FAQ 界面 */}
                             {activeTab === 'faq' && (
                                 <div className="space-y-6 animate-slide-in-right pb-10">
-                                    <h2 className="text-2xl font-bold text-white mb-6">❓ 常见问题与自助诊断</h2>
 
                                     <div className="rounded-xl border border-cyan-400/25 bg-cyan-500/10 p-5 shadow-inner">
                                         <div className="text-sm font-bold text-cyan-200">遇到播放器相关问题，请先更新再排查</div>
@@ -3779,10 +3831,9 @@ const AdminWidget: React.FC = () => {
 
                             {activeTab === 'debug' && (
                                 <div className="space-y-6 animate-slide-in-right flex flex-col h-full">
-                                    <h2 className="text-2xl font-bold text-white mb-2">调试与测试</h2>
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 shadow-inner">
-                                        <h3 className="text-sm font-bold text-purple-400 mb-4 uppercase tracking-wider">🛠️ 测试一：搜索并加入播放列表</h3>
+                                        <h3 className="text-sm font-bold text-purple-400 mb-4 uppercase tracking-wider"><UiIcon name="debug" /> 测试一：搜索并加入播放列表</h3>
                                         <div className="flex gap-3 mb-3">
                                             <input
                                                 type="text"
@@ -3796,7 +3847,7 @@ const AdminWidget: React.FC = () => {
                                         </div>
                                         <p className="text-xs text-gray-500 mb-8 leading-relaxed">此操作会使用当前选中播放器自己的搜索接口；Folia 使用 Stage 搜索接口，其余播放器使用各自适配器，并登记下一首守卫。</p>
 
-                                        <h3 className="text-sm font-bold text-blue-400 mb-4 uppercase tracking-wider">🛠️ 测试二：模拟切歌指令</h3>
+                                        <h3 className="text-sm font-bold text-blue-400 mb-4 uppercase tracking-wider"><UiIcon name="play" /> 测试二：模拟切歌指令</h3>
                                         <button onClick={handleDebugPlayNext} className="w-full px-6 py-4 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg font-bold transition-colors shadow-lg flex justify-center items-center gap-2">
                                             ⏭️ 立即触发播放下一首
                                         </button>
@@ -3807,7 +3858,6 @@ const AdminWidget: React.FC = () => {
 
                             {activeTab === 'settings' && (
                                 <div className="animate-slide-in-right pb-10">
-                                    <h2 className="text-2xl font-bold text-white mb-6">基础设置</h2>
 
                                     {/* 登录账号信息卡 */}
                                     {config.biliLogin && config.currentUser?.uid ? (
@@ -3843,7 +3893,7 @@ const AdminWidget: React.FC = () => {
                                         </div>
                                     ) : (
                                         <div className="bg-cyan-500/10 p-4 rounded-xl border border-cyan-500/20 mb-6 text-sm text-cyan-100 flex items-start gap-3">
-                                            <span>👤</span>
+                                            <UiIcon name="login" />
                                             <div>
                                                 <div className="font-bold">游客模式已启用</div>
                                                 <div className="text-xs text-gray-400 mt-1">无需扫码即可连接直播间和使用普通点歌。超级用户白名单与自定义权限控制需登录后才可设置。</div>
@@ -3852,16 +3902,28 @@ const AdminWidget: React.FC = () => {
                                     )}
 
                                     {/* 播放器原生控制区域 */}
-                                    <div ref={playerSetupRef} className="bg-white/5 p-6 rounded-xl border border-purple-500/40 space-y-5 mb-6 shadow-[0_0_15px_rgba(168,85,247,0.15)] relative overflow-hidden scroll-mt-4">
-                                        <div className="absolute top-0 right-0 bg-purple-600 text-white text-xs px-3 py-1 rounded-bl-lg font-bold">v1.1 独立连接器</div>
-
-                                        <div className="flex items-center justify-between gap-3 border-b border-white/10 pb-3">
+                                    <div ref={playerSetupRef} className="studio-player-settings bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6 relative overflow-hidden scroll-mt-4">
+                                        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
                                             <h3 className="text-sm font-bold text-purple-400 uppercase tracking-widest">
-                                                💻 播放器设置
+                                                <UiIcon name="music" /> 播放器设置
                                             </h3>
-                                            <span className="px-3 py-1.5 bg-green-500/10 text-green-300 text-[11px] rounded-lg font-bold border border-green-500/30">
-                                                {connectorChecking ? '⏳ 正在同步版本' : '♨️ 同播放器版本自动更新'}
-                                            </span>
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <span className="px-3 py-1.5 bg-blue-500/10 text-blue-300 text-[11px] rounded-lg font-bold border border-blue-500/30">
+                                                    同播放器版本自动更新
+                                                </span>
+                                                <button
+                                                    type="button"
+                                                    aria-label="检查连接器更新"
+                                                    aria-busy={connectorChecking}
+                                                    title="检查所有播放器连接器的最新版本"
+                                                    disabled={connectorChecking || Object.values(connectorChecks).some(Boolean) || connectorUpdating !== null}
+                                                    onClick={() => void loadConnectorStatuses(true)}
+                                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-[11px] rounded-lg font-bold border border-blue-400/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                                >
+                                                    <UiIcon name="update" className={connectorChecking ? 'animate-spin' : ''} />
+                                                    {connectorChecking ? '检查中…' : '检查全部'}
+                                                </button>
+                                            </div>
                                         </div>
 
                                         {connectorStatusError && (
@@ -3885,7 +3947,7 @@ const AdminWidget: React.FC = () => {
                                             </div>
                                         )}
 
-                                        <div className="hidden md:grid grid-cols-12 gap-4 text-[11px] text-gray-500 font-bold uppercase tracking-wider pb-2 border-b border-white/5 mt-3">
+                                        <div className="studio-player-table-head hidden md:grid grid-cols-12 gap-4 text-[11px] text-gray-500 font-bold uppercase tracking-wider pb-2 border-b border-white/5 mt-3">
                                             <div className="col-span-2">目标播放器</div>
                                             <div className="col-span-2">当前状态</div>
                                             <div className="col-span-3">连接器版本</div>
@@ -3910,9 +3972,9 @@ const AdminWidget: React.FC = () => {
                                                 );
                                                 const rowAccessBlocked = controlBlocked && playerAccessBlocked;
                                                 return (
-                                                    <div key={player.type} className={`grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border ${selected ? 'border-purple-500/50 shadow-inner' : 'border-white/10'} rounded-lg p-3 transition-colors hover:bg-white/5`}>
+                                                    <div key={player.type} data-connector-id={player.connectorId} data-selected={selected} className={`studio-player-table-row grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border ${selected ? 'border-purple-500/50 shadow-inner' : 'border-white/10'} rounded-lg p-3 transition-colors hover:bg-white/5`}>
                                                         <div className="md:col-span-2 flex items-center gap-3">
-                                                            <button onClick={() => handleSetPlayerType(player.type)} className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${selected ? 'border-purple-500' : 'border-gray-500'}`}>
+                                                            <button aria-label={`选择${player.name}`} aria-pressed={selected} onClick={() => handleSetPlayerType(player.type)} className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${selected ? 'border-purple-500' : 'border-gray-500'}`}>
                                                                 {selected && <div className="w-2.5 h-2.5 bg-purple-500 rounded-full" />}
                                                             </button>
                                                             <span className={`text-sm font-bold tracking-wide ${selected ? 'text-white' : 'text-gray-400'}`}>{player.name}</span>
@@ -3997,7 +4059,7 @@ const AdminWidget: React.FC = () => {
                                                                     </div>
                                                             ) : (
                                                                     <span className="text-[10px] text-gray-500">
-                                                                        {connectorChecking ? '正在读取版本...' : '尚未检查版本'}
+                                                                        {connectorChecking || connectorChecks[player.connectorId] ? '正在读取版本...' : '尚未检查版本'}
                                                                     </span>
                                                             )}
                                                         </div>
@@ -4006,6 +4068,17 @@ const AdminWidget: React.FC = () => {
                                                             <div className="text-[10px] text-gray-500 mt-1">{player.detail}</div>
                                                         </div>
                                                         <div className="md:col-span-3 flex flex-wrap justify-end gap-2">
+                                                            <button
+                                                                type="button"
+                                                                aria-label={`检查${player.name}连接器更新`}
+                                                                aria-busy={Boolean(connectorChecks[player.connectorId])}
+                                                                disabled={connectorChecking || connectorChecks[player.connectorId] || connectorUpdating !== null || automaticallyUpdating}
+                                                                onClick={() => void loadConnectorStatuses(true, player.connectorId)}
+                                                                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/40 text-blue-300 text-[11px] rounded-lg font-bold border border-blue-400/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                                            >
+                                                                <UiIcon name="update" className={connectorChecks[player.connectorId] ? 'animate-spin' : ''} />
+                                                                {connectorChecks[player.connectorId] ? '检查中…' : '检查更新'}
+                                                            </button>
                                                             {connectorStatus?.updateAvailable && (
                                                                 <button
                                                                     disabled={
@@ -4051,6 +4124,7 @@ const AdminWidget: React.FC = () => {
                                                             >
                                                                 {connecting ? '⏳ 连接中' : '🔄 重新连接'}
                                                             </button>
+                                                            {connectorCheckErrors[player.connectorId] && <div role="status" className="basis-full text-left text-[10px] text-red-300 break-words">检查失败：{connectorCheckErrors[player.connectorId]}</div>}
                                                         </div>
                                                     </div>
                                                 );
@@ -4092,7 +4166,7 @@ const AdminWidget: React.FC = () => {
                                     </div>
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
-                                        <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3">⏱️ 点歌冷却设置 (秒)</h3>
+                                        <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3"><UiIcon name="clock" /> 点歌冷却设置（秒）</h3>
                                         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                                             <div>
                                                 <label className="block text-xs text-gray-400 mb-2">普通用户</label>
@@ -4116,7 +4190,7 @@ const AdminWidget: React.FC = () => {
                                     <div className="bg-white/5 p-6 rounded-xl border border-pink-500/20 space-y-5 mb-6">
                                         <div className="border-b border-white/10 pb-3 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                                             <div>
-                                                <h3 className="text-sm font-bold text-pink-400 uppercase tracking-widest">🎁 礼物点歌次数</h3>
+                                                <h3 className="text-sm font-bold text-pink-400 uppercase tracking-widest"><UiIcon name="gift" /> 礼物点歌次数</h3>
                                                 <p className="text-xs text-gray-500 mt-2 leading-relaxed">
                                                     可为每档观众指定礼物。每送出 1 个匹配礼物增加 1 次点歌，连续赠送 10 个就增加 10 次；只有歌曲成功加入队列或进入播放后才扣除 1 次。
                                                 </p>
@@ -4285,7 +4359,7 @@ const AdminWidget: React.FC = () => {
                                     </div>
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
-                                        <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3">⚙️ 常规参数</h3>
+                                        <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3"><UiIcon name="settings" /> 常规参数</h3>
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                             <div>
                                                 <label className="block text-xs text-gray-400 mb-2">空闲时点歌行为</label>
@@ -4349,7 +4423,7 @@ const AdminWidget: React.FC = () => {
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-violet-500/20 space-y-5 mb-6">
                                         <div className="border-b border-white/10 pb-3">
-                                            <h3 className="text-sm font-bold text-violet-300 uppercase tracking-widest">🖥️ 内部控制服务</h3>
+                                            <h3 className="text-sm font-bold text-violet-300 uppercase tracking-widest"><UiIcon name="monitor" /> 内部控制服务</h3>
                                             <p className="text-xs text-gray-500 mt-2">控制面板和经典 OBS 页面使用的本机服务。默认端口 5555；修改后需要重启点歌机。端口被占用时会自动选择可用端口。</p>
                                         </div>
                                         <div className="flex flex-wrap items-end gap-3">
@@ -4383,7 +4457,7 @@ const AdminWidget: React.FC = () => {
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-cyan-500/20 space-y-5 mb-6">
                                         <div className="border-b border-white/10 pb-3">
-                                            <h3 className="text-sm font-bold text-cyan-400 uppercase tracking-widest">🔌 外部只读接口</h3>
+                                            <h3 className="text-sm font-bold text-cyan-400 uppercase tracking-widest"><UiIcon name="debug" /> 外部只读接口</h3>
                                             <p className="text-xs text-gray-500 mt-2">供 OBS 插件或其他工具读取当前歌曲与待播队列，仅监听本机 127.0.0.1。</p>
                                         </div>
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -4425,7 +4499,7 @@ const AdminWidget: React.FC = () => {
                                     </div>
 
                                     <div className={`bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6 relative ${!config.biliLogin ? 'opacity-50' : ''}`}>
-                                        <h3 className="text-sm font-bold text-yellow-400 uppercase tracking-widest border-b border-white/10 pb-3">👑 超级用户白名单</h3>
+                                        <h3 className="text-sm font-bold text-yellow-400 uppercase tracking-widest border-b border-white/10 pb-3"><UiIcon name="login" /> 超级用户白名单</h3>
                                         <p className="text-sm text-gray-500">在下方名单中的 B站用户名，将完全无视冷却时间和任何点歌、切歌权限限制。</p>
                                         {!config.biliLogin && <div className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3">游客模式下不可用，请先扫码登录。</div>}
 
@@ -4457,7 +4531,7 @@ const AdminWidget: React.FC = () => {
                                     </div>
 
                                     <div ref={permissionSetupRef} className={`bg-white/5 p-6 rounded-xl border border-white/10 scroll-mt-4 ${!config.biliLogin ? 'opacity-50' : ''}`}>
-                                        <h3 className="text-sm font-bold text-green-400 uppercase tracking-widest border-b border-white/10 pb-3 mb-5">🛡️ 弹幕指令权限控制</h3>
+                                        <h3 className="text-sm font-bold text-green-400 uppercase tracking-widest border-b border-white/10 pb-3 mb-5"><UiIcon name="shield" /> 弹幕指令权限控制</h3>
                                         {!config.biliLogin && <div className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3 mb-5">游客模式固定使用基础权限，以下自定义设置暂不可用。</div>}
 
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
@@ -4513,7 +4587,6 @@ const AdminWidget: React.FC = () => {
                             {activeTab === 'feedback' && (
                                 <div className="animate-slide-in-right pb-10 space-y-6">
                                     <div>
-                                        <h2 className="text-2xl font-bold text-white mb-2">问题反馈</h2>
                                         <p className="text-sm text-gray-400 leading-relaxed">
                                             在这里提交软件问题、播放器兼容性或功能建议。版本和连接器状态会在你确认后附带，登录 Cookie、二维码凭据、用户白名单和房间号不会上传。
                                         </p>
@@ -4845,7 +4918,6 @@ const AdminWidget: React.FC = () => {
 
                             {activeTab === 'login' && (
                                 <div className="space-y-6 animate-slide-in-right flex flex-col items-center pt-10">
-                                    <h2 className="text-2xl font-bold text-white mb-2 self-start w-full max-w-md">B站账号授权</h2>
                                     <div className="bg-white/5 p-8 rounded-2xl border border-white/10 flex flex-col items-center justify-center w-full max-w-md text-center shadow-xl">
 
                                         {config.biliLogin ? (
@@ -4861,7 +4933,7 @@ const AdminWidget: React.FC = () => {
                                         {qrState.base64 ? (
                                             <div className="bg-white p-3 rounded-2xl shadow-2xl mb-6"><img src={qrState.base64} alt="Bilibili Login QR" className="w-48 h-48" /></div>
                                         ) : (
-                                            <div className="w-48 h-48 bg-black/30 rounded-2xl mb-6 flex items-center justify-center text-6xl border border-white/5">📱</div>
+                                            <div className="studio-login-placeholder"><UiIcon name="login" /><span>扫码连接你的 B 站账号</span><small>打开哔哩哔哩，使用扫一扫</small></div>
                                         )}
 
                                         <h3 className="text-md text-white font-bold mb-5">{qrState.message}</h3>
@@ -4885,9 +4957,8 @@ const AdminWidget: React.FC = () => {
 
                             {activeTab === 'update' && (
                                 <div className="space-y-6 animate-slide-in-right flex flex-col items-center text-center pt-10">
-                                    <h2 className="text-2xl font-bold text-white mb-2 self-start w-full max-w-md">自动更新管理</h2>
                                     <div className="bg-white/5 p-8 rounded-2xl border border-white/10 flex flex-col items-center justify-center w-full max-w-md shadow-xl">
-                                        <div className="text-6xl mb-5">🚀</div>
+                                        <div className="studio-feature-icon"><UiIcon name="update" /></div>
 
                                         <div className="text-sm text-green-400 font-bold mb-8 bg-green-500/10 px-4 py-1.5 rounded-full border border-green-500/20">
                                             当前运行版本: v{config.version || '未知'}
@@ -4925,7 +4996,7 @@ const AdminWidget: React.FC = () => {
                             )}
                         </div>
                     )}
-                </div>
+                </main>
             </div>
         </div>
     );

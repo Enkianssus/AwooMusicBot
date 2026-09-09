@@ -139,9 +139,10 @@ export class PlayerManager {
   }
 
   async getConnectorStatuses(
-    forceRefresh = false
+    forceRefresh = false,
+    connectorId?: NativeConnectorId
   ): Promise<ConnectorUpdateStatus[]> {
-    return this.bridge.getConnectorStatuses(forceRefresh);
+    return this.bridge.getConnectorStatuses(forceRefresh, connectorId);
   }
 
   async isConnectorInstalled(
@@ -427,6 +428,21 @@ export class PlayerManager {
     observeTrack: boolean
   ): void {
     if (sourceKey !== this.selectedKey) return;
+    if (
+      sourceKey === 'qqmusic'
+      && snapshot.ownsLogicalNext === true
+      && snapshot.observationDeferred === true
+    ) {
+      // A busy probe can arrive after the command's newer snapshot event. Keep
+      // the accepted state and never interpret its historical Current/Next as
+      // a track change or a reason to register another logical queue target.
+      // During initial connection it may supply display-only status until a
+      // real observation arrives; it must not drive queue actions even then.
+      if (this.state.snapshot === null) {
+        this.setState(snapshot.connected, this.state.connecting, snapshot);
+      }
+      return;
+    }
     const wasConnected = this.state.connected;
     this.setState(snapshot.connected, this.state.connecting, snapshot);
 
@@ -452,6 +468,11 @@ export class PlayerManager {
         track: snapshot.connected ? snapshot.current || null : null,
         nextTrack,
         nextObservation,
+        nextGuardState: snapshot.nextGuardState || 'none',
+        nextGuardId: Number.isSafeInteger(snapshot.nextGuardId)
+          && Number(snapshot.nextGuardId) > 0
+          ? Number(snapshot.nextGuardId)
+          : 0,
         playbackAnchorReady: snapshot.playbackAnchorReady === true,
         coverUrl: snapshot.current?.coverUrl || '',
         nextDescription: snapshot.next?.title

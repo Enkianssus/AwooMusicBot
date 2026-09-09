@@ -27,6 +27,7 @@ function setOverlayAlwaysOnTop(enabled: boolean): boolean {
 
 contextBridge.exposeInMainWorld('electronAPI', {
   internalApiOrigin,
+  setWindowColorMode: (mode: 'light' | 'dark') => ipcRenderer.send('set-window-color-mode', mode),
   getOverlayAlwaysOnTop,
   setOverlayAlwaysOnTop,
   openAdmin: (tab?: string) => ipcRenderer.send('open-admin', tab),

@@ -28,6 +28,108 @@ export type ImmediatePlaybackCommand =
   | 'PlaySelected'
   | 'InterruptSelected';
 
+export type GuardedQqMismatchAction = 'release-to-guard' | 'play-now';
+
+export type QqGuardTerminalRecoveryAction =
+  | 'none'
+  | 'recover-once'
+  | 'stop';
+
+/**
+ * A QQ guarded request is normally consumed as soon as the connector reports
+ * it as current.  QQ can, however, deliver a previously issued native
+ * selection after that observation.  Keep the recovery bounded: at most one
+ * interrupt transaction is allowed during the short post-consumption window.
+ */
+export const QQ_GUARDED_COMPLETION_RECOVERY_WINDOW_MS = 8_000;
+
+export type QqGuardedCompletionRecoveryAction =
+  | 'none'
+  | 'recover-once'
+  | 'stop'
+  | 'manual-wins';
+
+export function shouldRecordQqGuardedCompletion(options: {
+  playerKey: string;
+  queueHeadObserved: boolean;
+  queueHeadAlreadyGuarded: boolean;
+}): boolean {
+  return options.playerKey === 'qqmusic'
+    && options.queueHeadObserved
+    && options.queueHeadAlreadyGuarded;
+}
+
+export function shouldRetainQqGuardedCompletionAttempt(
+  previousSong: unknown,
+  nextSong: unknown
+): boolean {
+  return previousSong === nextSong;
+}
+
+export function ownsQqGuardedCompletion(options: {
+  playerKey: string;
+  marker: unknown;
+  expectedMarker: unknown;
+}): boolean {
+  return options.playerKey === 'qqmusic'
+    && options.marker === options.expectedMarker;
+}
+
+export function planQqGuardTerminalRecovery(options: {
+  playerKey: string;
+  guardState: string | null | undefined;
+  guardId: number | null | undefined;
+  queueHeadIdentity: string;
+  registeredGuardIdentity: string;
+  registeredGuardId: number;
+  ownershipIdentity: string;
+  recoveryAttempted: boolean;
+}): QqGuardTerminalRecoveryAction {
+  const guardId = Number(options.guardId);
+  if (
+    options.playerKey !== 'qqmusic'
+    || options.guardState !== 'terminalFailure'
+    || !Number.isSafeInteger(guardId)
+    || guardId <= 0
+    || !options.queueHeadIdentity
+    || options.registeredGuardIdentity !== options.queueHeadIdentity
+    || options.registeredGuardId !== guardId
+  ) {
+    return 'none';
+  }
+
+  return options.ownershipIdentity === options.queueHeadIdentity
+    && options.recoveryAttempted
+    ? 'stop'
+    : 'recover-once';
+}
+
+export function planQqGuardedCompletionRecovery(options: {
+  playerKey: string;
+  markerMatchesCurrent: boolean;
+  currentSongMismatched: boolean;
+  ageMs: number;
+  rescueAttempted: boolean;
+}): QqGuardedCompletionRecoveryAction {
+  if (
+    options.playerKey !== 'qqmusic'
+    || !options.markerMatchesCurrent
+    || !options.currentSongMismatched
+  ) {
+    return 'none';
+  }
+
+  if (
+    !Number.isFinite(options.ageMs)
+    || options.ageMs < 0
+    || options.ageMs >= QQ_GUARDED_COMPLETION_RECOVERY_WINDOW_MS
+  ) {
+    return 'manual-wins';
+  }
+
+  return options.rescueAttempted ? 'stop' : 'recover-once';
+}
+
 export function queueSongIdentity(
   song: QueueSongLike | null | undefined,
   fallbackPlayerKey: string
@@ -239,6 +341,27 @@ export function shouldDeferManagedTrackObservation(
   return Boolean(target)
     && Boolean(observed)
     && !tracksRepresentSameSong(target, observed);
+}
+
+/**
+ * A QQ connector's registered native-next guard owns recovery when the
+ * observed current song is no longer the locally tracked request. Replaying
+ * the queue head from the host would race that guard and can repeatedly walk
+ * down QQ's native queue. Other players, unguarded QQ heads, and already
+ * observed heads retain the ordinary immediate-play fallback.
+ */
+export function planGuardedQqMismatchAction(options: {
+  playerKey: string;
+  currentSongMismatched: boolean;
+  queueHeadObserved: boolean;
+  queueHeadAlreadyGuarded: boolean;
+}): GuardedQqMismatchAction {
+  return options.playerKey === 'qqmusic'
+    && options.currentSongMismatched
+    && !options.queueHeadObserved
+    && options.queueHeadAlreadyGuarded
+    ? 'release-to-guard'
+    : 'play-now';
 }
 
 export type ManagedActionTimeoutDecision =

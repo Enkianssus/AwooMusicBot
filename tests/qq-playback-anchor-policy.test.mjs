@@ -12,6 +12,23 @@ import {
 
 const head = 'qqmusic|id:100';
 
+test('explicit anchor-independent backend bypasses native cursor deferrals without faking readiness', () => {
+  const base = {
+    playerKey: 'qqmusic', playbackAnchorReady: false,
+    requiresPlaybackAnchor: false, deferredIdentity: head,
+    queueHeadIdentity: head, songIdentity: head,
+    retryAttempted: true, retryInFlight: true
+  };
+  assert.equal(shouldDeferQqQueueHeadUntilAnchor(base), false);
+  assert.equal(planQqAnchorObservation(base), 'clear');
+  assert.equal(planQqDeferredPlaybackAction(base), 'none');
+  assert.equal(shouldSkipDuplicateQqAnchorInsert(base), false);
+  assert.equal(shouldSuppressQqQueueHeadPlayNow(base), false);
+  assert.equal(shouldDeferQqQueueHeadUntilAnchor({ ...base, requiresPlaybackAnchor: true }), true);
+  assert.equal(shouldDeferQqQueueHeadUntilAnchor({ ...base, requiresPlaybackAnchor: undefined }), true);
+  assert.equal(shouldDeferQqQueueHeadUntilAnchor({ ...base, requiresPlaybackAnchor: null }), true);
+});
+
 test('QQ without an explicit playback anchor stays deferred', () => {
   assert.equal(shouldDeferQqQueueHeadUntilAnchor({
     playerKey: 'qqmusic',

@@ -32,6 +32,14 @@ export interface PlayerCapabilities {
   insertNextLevel: string;
 }
 
+export type NextGuardState =
+  | 'none'
+  | 'armed'
+  | 'waitingLateTarget'
+  | 'completed'
+  | 'terminalFailure'
+  | 'expired';
+
 export interface PlayerSnapshot {
   connected: boolean;
   player: string;
@@ -42,8 +50,17 @@ export interface PlayerSnapshot {
   next?: PlayerTrack | null;
   nextSource?: string;
   nextObservation?: 'unknown' | 'track' | 'empty' | null;
+  nextGuardState?: NextGuardState | null;
+  /** Stable positive id for one connector guard cycle. */
+  nextGuardId?: number | null;
   /** QQ reports true only after the native playlist playback cursor exists. */
   playbackAnchorReady?: boolean;
+  /** Only explicit false opts into an anchor-independent connector backend. */
+  requiresPlaybackAnchor?: boolean;
+  /** The connector owns logical-next handoff, not host track-change correction. */
+  ownsLogicalNext?: boolean;
+  /** A busy QQ Web probe supplied historical data, not a new observation. */
+  observationDeferred?: boolean;
   observedAt: string;
   capabilities?: PlayerCapabilities | null;
 }
@@ -244,9 +261,10 @@ export class PlayerBridgeClient {
   }
 
   async getConnectorStatuses(
-    forceRefresh = false
+    forceRefresh = false,
+    connectorId?: NativeConnectorId
   ): Promise<ConnectorUpdateStatus[]> {
-    return this.updater.getStatuses(forceRefresh);
+    return this.updater.getStatuses(forceRefresh, connectorId);
   }
 
   async isConnectorInstalled(

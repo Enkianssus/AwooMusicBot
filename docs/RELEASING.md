@@ -59,8 +59,10 @@ Enkianssus 项目、日志、提交、Worker 或公开历史中引入其它账�
 MAJOR.MINOR.PATCH
 ```
 
-当前新架构属于 `1.1.x` 通道，Git Tag 使用 `v` 前缀，例如 `v1.1.10`。
-`1.0.x` 是独立旧通道，不得通过版本元数据或更新代理将其静默升级到 `1.1.x`。
+当前 `1.2.x` 延续 `1.1.x` 的嗷呜点歌机架构和更新通道，Git Tag 使用 `v`
+前缀，例如 `v1.2.1`。连接器继续使用 v2 清单和私有共享 Runtime。
+`1.0.x` 是独立旧通道，不得通过版本元数据或更新代理将其静默升级到
+`1.1.x` 或 `1.2.x`；历史 v1 清单、签名资产和公共地址合同保持不变。
 
 准备新版本时同步修改：
 
@@ -73,7 +75,7 @@ MAJOR.MINOR.PATCH
 推荐使用：
 
 ```powershell
-npm version 1.1.10 --no-git-tag-version
+npm version 1.2.1 --no-git-tag-version
 ```
 
 随后手工同步 `build:dev` 的输出目录。`tests/app-version.test.mjs` 会阻止三处
@@ -99,8 +101,8 @@ Velopack 打包。不能因为远端还会测试，就跳过本地的低成本�
 
 ```powershell
 git push origin HEAD:master
-git tag -a v1.1.10 -m "release Awoo MusicBot 1.1.10"
-git push origin v1.1.10
+git tag -a v1.2.1 -m "release Awoo MusicBot 1.2.1"
+git push origin v1.2.1
 ```
 
 `.github/workflows/release.yml` 监听 `v*`，从 Tag 解析版本并创建 GitHub
@@ -187,6 +189,11 @@ https://app.enkianss.us/download/awoo
 不要为了让更新按钮变成“自动”而错误沿用旧播放器前缀。
 `minimumCoreVersion` 只有在连接器协议或行为真正依赖更高点歌机版本时才提高；
 增加 framework-dependent 包不构成提高它的理由。
+
+QQ 音乐连接器 `22.61.2` 的 Web/API 后端依赖本体对逻辑下一首归属、延迟观察、
+动作归因及自动播放取消确认的适配，`minimumCoreVersion` 必须为 `1.2.1`。
+发布时核对连接器包元数据与 v2 Catalog 的值一致；旧本体不能安装此版本，
+不得仅凭连接器协议版本未变就降低这一行为依赖。
 
 ## 5. 连接器 Release 的固定资产合同
 
@@ -427,8 +434,9 @@ immutable 缓存，因此绝对不能用相同版本号覆盖不同内容。
 5. `github-actions[bot]` 的 `catalog-v2.json` 提交已经进入 `main`。
 6. `app.enkianss.us` v2 Catalog 在缓存传播后返回新版本。
 7. 本站 ZIP 完整下载可用，`Range: bytes=0-0` 返回 `206`。
-8. 1.1.10 从 v2 Catalog 选择 `package` framework-dependent 小包且不会下载
-   SelfContained 完整包。
+8. 当前兼容本体从 v2 Catalog 选择 `package` framework-dependent 小包且不会
+   下载 SelfContained 完整包。QQ `22.61.2` 使用本体 `1.2.1` 验收，并确认更旧
+   本体受 `minimumCoreVersion` 门控阻止安装。
 9. Awoo 小包 smoke test 返回正确的 `connectorId`、版本与协议版本。
 
 QQ profile 仍按独立规则验收：两个 ZIP、各自的 `.sig` 和 `.sha256`，合计 6

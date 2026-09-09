@@ -1,4 +1,5 @@
 import type {
+  NextGuardState,
   PlayerOperationResult,
   PlayerSnapshot,
   PlayerTrack
@@ -51,6 +52,8 @@ export interface PlayerTrackObservation {
   track: PlayerTrack | null;
   nextTrack?: PlayerTrack | null;
   nextObservation: NextObservation;
+  nextGuardState: NextGuardState;
+  nextGuardId: number;
   playbackAnchorReady?: boolean;
   coverUrl?: string;
   nextDescription: string;
@@ -95,6 +98,7 @@ export function isSuccessfulPlayerResult(
 }
 
 export type {
+  NextGuardState,
   PlayerOperationResult,
   PlayerSnapshot,
   PlayerTrack

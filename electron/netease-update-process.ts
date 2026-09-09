@@ -23,6 +23,18 @@ export interface NeteaseProcessRuntime {
   wait(milliseconds: number): Promise<void>;
 }
 
+type NeteaseProcessCommandRunner = (
+  executable: string,
+  args: string[],
+  timeout: number
+) => Promise<{ stdout: string; stderr: string }>;
+
+interface WindowsNeteaseProcessRuntimeOptions {
+  execute?: NeteaseProcessCommandRunner;
+  onLog?: (message: string) => void;
+  platform?: NodeJS.Platform;
+}
+
 interface NeteaseUpdateProcessControllerOptions {
   runtime?: NeteaseProcessRuntime;
   onLog?: (message: string) => void;
@@ -134,8 +146,10 @@ export class NeteaseUpdateProcessController {
   private readonly pollIntervalMs: number;
 
   constructor(options: NeteaseUpdateProcessControllerOptions = {}) {
-    this.runtime = options.runtime || new WindowsNeteaseProcessRuntime();
     this.onLog = options.onLog || (() => {});
+    this.runtime = options.runtime || new WindowsNeteaseProcessRuntime({
+      onLog: this.onLog
+    });
     this.gracefulTimeoutMs = options.gracefulTimeoutMs ?? 5000;
     this.forceTimeoutMs = options.forceTimeoutMs ?? 5000;
     this.restartTimeoutMs = options.restartTimeoutMs ?? 10000;
@@ -287,49 +301,78 @@ export class NeteaseUpdateProcessController {
   }
 }
 
-class WindowsNeteaseProcessRuntime implements NeteaseProcessRuntime {
+export class WindowsNeteaseProcessRuntime implements NeteaseProcessRuntime {
+  private readonly execute: NeteaseProcessCommandRunner;
+  private readonly onLog: (message: string) => void;
+  private readonly platform: NodeJS.Platform;
+
+  constructor(options: WindowsNeteaseProcessRuntimeOptions = {}) {
+    this.execute = options.execute || executeFileText;
+    this.onLog = options.onLog || (() => {});
+    this.platform = options.platform || process.platform;
+  }
+
   async listProcesses(): Promise<NeteaseProcessInfo[]> {
-    if (process.platform !== 'win32') return [];
-    const systemRoot = process.env.SystemRoot || 'C:\\Windows';
-    const powershell = path.join(
-      systemRoot,
-      'System32',
-      'WindowsPowerShell',
-      'v1.0',
-      'powershell.exe'
+    if (this.platform !== 'win32') return [];
+
+    const powershell = getWindowsPowerShellPath();
+    const attempts = [
+      {
+        name: 'CIM',
+        script: buildCimProcessQueryScript()
+      },
+      {
+        name: 'WMI',
+        script: buildWmiProcessQueryScript()
+      }
+    ];
+    const failures: string[] = [];
+
+    for (let index = 0; index < attempts.length; index += 1) {
+      const attempt = attempts[index];
+      try {
+        const result = await this.execute(
+          powershell,
+          [
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            attempt.script
+          ],
+          8000
+        );
+        return parseNeteaseProcessList(result.stdout);
+      } catch (error: unknown) {
+        failures.push(`${attempt.name}: ${getProcessQueryDiagnostic(error)}`);
+        const nextAttempt = attempts[index + 1];
+        if (nextAttempt) {
+          this.onLog(
+            `[网易云连接器更新] ${attempt.name} 进程检测失败，`
+              + `正在切换到 ${nextAttempt.name} 备用路径`
+          );
+        }
+      }
+    }
+
+    throw new NeteaseProcessControlError(
+      '网易云进程检测失败；已尝试 CIM 和 WMI 路径；'
+        + failures.join('；')
     );
-    const script = [
-      "$ErrorActionPreference='Stop'",
-      '[Console]::OutputEncoding = '
-        + 'New-Object System.Text.UTF8Encoding($false)',
-      '$items = @(Get-CimInstance Win32_Process '
-        + '-Filter "Name = \'cloudmusic.exe\'" | ForEach-Object { '
-        + '[pscustomobject]@{ processId = [int]$_.ProcessId; '
-        + 'parentProcessId = [int]$_.ParentProcessId; '
-        + 'executablePath = [string]$_.ExecutablePath; '
-        + 'commandLine = [string]$_.CommandLine } })',
-      'ConvertTo-Json -InputObject $items -Compress'
-    ].join('; ');
-    const result = await executeFileText(
-      powershell,
-      ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
-      8000
-    );
-    return parseNeteaseProcessList(result.stdout);
   }
 
   async closeProcessTrees(
     processIds: number[],
     force: boolean
   ): Promise<void> {
-    if (process.platform !== 'win32') return;
-    const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+    if (this.platform !== 'win32') return;
+    const systemRoot = getWindowsSystemRoot();
     const taskkill = path.join(systemRoot, 'System32', 'taskkill.exe');
     await Promise.all(processIds.map(async processId => {
       const args = ['/PID', String(processId), '/T'];
       if (force) args.push('/F');
       try {
-        await executeFileText(taskkill, args, 8000);
+        await this.execute(taskkill, args, 8000);
       } catch {
         // A process can disappear between discovery and taskkill. The caller
         // verifies the complete process list after every close attempt.
@@ -359,6 +402,72 @@ class WindowsNeteaseProcessRuntime implements NeteaseProcessRuntime {
   async wait(milliseconds: number): Promise<void> {
     await new Promise<void>(resolve => setTimeout(resolve, milliseconds));
   }
+}
+
+function getWindowsSystemRoot(): string {
+  return typeof process.env?.SystemRoot === 'string'
+    && process.env.SystemRoot.trim()
+    ? process.env.SystemRoot
+    : typeof process.env?.windir === 'string' && process.env.windir.trim()
+      ? process.env.windir
+      : 'C:\\Windows';
+}
+
+function getWindowsPowerShellPath(): string {
+  const systemRoot = getWindowsSystemRoot();
+  return path.join(
+    systemRoot,
+    'System32',
+    'WindowsPowerShell',
+    'v1.0',
+    'powershell.exe'
+  );
+}
+
+function buildProcessQueryScript(query: string): string {
+  return [
+    "$ErrorActionPreference='Stop'",
+    '[Console]::OutputEncoding = '
+      + 'New-Object System.Text.UTF8Encoding($false)',
+    query,
+    "if ($items.Count -eq 0) { '[]' } else { "
+      + 'ConvertTo-Json -InputObject $items -Compress }'
+  ].join('; ');
+}
+
+function buildCimProcessQueryScript(): string {
+  return buildProcessQueryScript(
+    '$items = @(Get-CimInstance Win32_Process '
+      + '-Filter "Name = \'cloudmusic.exe\'" -ErrorAction Stop '
+      + '| ForEach-Object { '
+      + '[pscustomobject]@{ processId = [int]$_.ProcessId; '
+      + 'parentProcessId = [int]$_.ParentProcessId; '
+      + 'executablePath = [string]$_.ExecutablePath; '
+      + 'commandLine = [string]$_.CommandLine } })'
+  );
+}
+
+function buildWmiProcessQueryScript(): string {
+  return buildProcessQueryScript(
+    '$items = @(Get-WmiObject -Class Win32_Process '
+      + '-Filter "Name = \'cloudmusic.exe\'" -ErrorAction Stop '
+      + '| ForEach-Object { '
+      + '[pscustomobject]@{ processId = [int]$_.ProcessId; '
+      + 'parentProcessId = [int]$_.ParentProcessId; '
+      + 'executablePath = [string]$_.ExecutablePath; '
+      + 'commandLine = [string]$_.CommandLine } })'
+  );
+}
+
+function getProcessQueryDiagnostic(error: unknown): string {
+  const message = getErrorMessage(error)
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    // PowerShell errors can echo a path. Keep the query name and failure text
+    // useful without exposing local usernames or installation directories.
+    .replace(/(?:[A-Za-z]:\\|\\\\)[^\r\n"'<>|?*]*/g, '<路径>')
+    .trim();
+  return message ? message.slice(0, 240) : '未知错误';
 }
 
 function executeFileText(

@@ -33,6 +33,7 @@ import {
   type NeteaseUpdateProcessSession
 } from './netease-update-process';
 import { buildConnectorGitHubReleaseUrl } from './connector-release-url';
+import { shouldRunAutomaticConnectorMaintenance } from './dev-user-data-policy';
 
 export type NativeConnectorId =
   | 'netease'
@@ -271,6 +272,9 @@ export class ConnectorUpdater {
       ? buildPrivateDotnetEnvironment(active.runtimeRid, active.runtimeRoot)
       : {};
     if (connectorId !== 'qqmusic') return environment;
+    if (!shouldRunAutomaticConnectorMaintenance(
+      process.env['AWOO_DEV_USER_DATA_DIR']?.trim() || null
+    )) return { ...environment, BILINCM_QQMUSIC_PROFILE_DIR: '' };
     try {
       const directory = await this.ensureQQMusicProfiles();
       return directory
@@ -303,6 +307,9 @@ export class ConnectorUpdater {
   async ensureInstalled(
     connectorId: NativeConnectorId
   ): Promise<string> {
+    const allowAutomaticMaintenance = shouldRunAutomaticConnectorMaintenance(
+      process.env['AWOO_DEV_USER_DATA_DIR']?.trim() || null
+    );
     const active = await this.readActive(connectorId);
     if (active) {
       const installed = active.executable;
@@ -317,6 +324,12 @@ export class ConnectorUpdater {
           );
           this.validatedExecutables.add(resolved);
         } catch (error: unknown) {
+          if (!allowAutomaticMaintenance) {
+            throw new Error(
+              `[隔离开发] ${CONNECTOR_NAMES[connectorId]}连接器健康检查失败，`
+              + `已禁止自动重装；请手动修复本地连接器：${getErrorMessage(error)}`
+            );
+          }
           this.onLog(
             `[连接器] ${CONNECTOR_NAMES[connectorId]}现有连接器健康检查失败，`
             + `正在自动重新安装：${getErrorMessage(error)}`
@@ -338,6 +351,12 @@ export class ConnectorUpdater {
       return installed;
     }
 
+    if (!allowAutomaticMaintenance) {
+      throw new Error(
+        `[隔离开发] 缺少可用的 ${CONNECTOR_NAMES[connectorId]}本地连接器，`
+        + '已禁止自动下载安装；请显式安装或配置本地连接器后重试。'
+      );
+    }
     this.onLog(
       `[连接器] 首次使用 ${CONNECTOR_NAMES[connectorId]}，`
       + '正在自动下载安装独立连接器'
@@ -358,11 +377,13 @@ export class ConnectorUpdater {
   }
 
   async getStatuses(
-    forceRefresh = false
+    forceRefresh = false,
+    connectorId?: NativeConnectorId
   ): Promise<ConnectorUpdateStatus[]> {
     const checkedAt = new Date().toISOString();
+    const connectorIds = connectorId ? [connectorId] : CONNECTOR_IDS;
     const activeConnectors = await Promise.all(
-      CONNECTOR_IDS.map(id => this.readActive(id))
+      connectorIds.map(id => this.readActive(id))
     );
 
     let catalog: ConnectorCatalog;
@@ -370,7 +391,7 @@ export class ConnectorUpdater {
       catalog = await this.fetchCatalog(forceRefresh);
     } catch (error: unknown) {
       const message = getErrorMessage(error);
-      return CONNECTOR_IDS.map((id, index) =>
+      return connectorIds.map((id, index) =>
         this.makeStatus(
           id,
           activeConnectors[index],
@@ -381,7 +402,7 @@ export class ConnectorUpdater {
       );
     }
 
-    return CONNECTOR_IDS.map((id, index) => {
+    return connectorIds.map((id, index) => {
       const entry = catalog.connectors[id] || null;
       try {
         if (!entry) {
@@ -1569,8 +1590,11 @@ export class ConnectorUpdater {
   private getConnectorRoot(
     connectorId: NativeConnectorId
   ): string {
-    const configuredRoot =
-      process.env.BILINCM_CONNECTOR_ROOT?.trim();
+    // Isolation must not inherit a production connector directory from the
+    // launching shell, including during an explicitly requested manual update.
+    const configuredRoot = shouldRunAutomaticConnectorMaintenance(
+      process.env['AWOO_DEV_USER_DATA_DIR']?.trim() || null
+    ) ? process.env.BILINCM_CONNECTOR_ROOT?.trim() : undefined;
     const root = configuredRoot
       ? path.resolve(configuredRoot)
       : path.join(app.getPath('userData'), 'player-connectors');

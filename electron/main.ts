@@ -11,10 +11,16 @@ import { WebSocket, WebSocketServer } from 'ws';
 import QRCode from 'qrcode';
 import {
   planImmediatePlaybackCommand,
+  planGuardedQqMismatchAction,
   planManagedActionTimeout,
+  planQqGuardedCompletionRecovery,
+  planQqGuardTerminalRecovery,
   planObservedNextAction,
   planQueueHeadMutation,
+  ownsQqGuardedCompletion,
   queueSongIdentity,
+  shouldRecordQqGuardedCompletion,
+  shouldRetainQqGuardedCompletionAttempt,
   shouldDeferManagedTrackObservation,
   shouldPreserveGuardAfterImmediate,
   tracksRepresentSameSong
@@ -96,6 +102,17 @@ import {
   shouldSkipDuplicateQqAnchorInsert,
   shouldSuppressQqQueueHeadPlayNow
 } from './qq-playback-anchor-policy';
+import { ownsQqLogicalNext } from './qq-web-queue-policy';
+import {
+  isQqAutoplayCancellationConfirmed,
+  shouldDiscardQqGuardOperation,
+  shouldSuspendQqAutoplay
+} from './qq-web-autoplay-policy';
+import { managedActionExpirationAt } from './managed-action-lifetime-policy';
+import {
+  resolveDevUserDataDir,
+  shouldRunAutomaticConnectorMaintenance
+} from './dev-user-data-policy';
 import {
   DEFAULT_OVERLAY_ALWAYS_ON_TOP,
   normalizeOverlayAlwaysOnTop
@@ -114,6 +131,7 @@ import {
   isSuccessfulPlayerResult,
   PLAYER_LABELS,
   playerKeyFromConfig,
+  type NextGuardState,
   type PlayerKey,
   type PlayerOperationResult,
   type PlayerSnapshot
@@ -140,15 +158,6 @@ function requestApplicationQuit(): boolean {
   return true;
 }
 
-// 1.1 起底层包名与仓库改为 Awoo MusicBot；面向用户仍使用“嗷呜点歌机”。
-// 继续沿用旧用户数据目录，确保升级时保留登录信息、播放器选择和连接器安装状态。
-if (process.platform === 'win32') {
-  app.setPath(
-    'userData',
-    path.join(app.getPath('appData'), '嗷呜点歌机')
-  );
-}
-
 // Production builds share one user-data directory and must have only one
 // updater owner.  The regular Electron runner and build:dev output are
 // explicitly exempt so a development build can be tested beside production;
@@ -160,6 +169,16 @@ const allowMultipleInstances = shouldAllowMultipleInstances(
   process.execPath,
   app.isPackaged
 );
+// Explicit dev-only isolation is resolved before any lock/config/session work.
+// Invalid requests fail closed rather than accidentally writing real settings.
+const devUserDataDir = resolveDevUserDataDir(process.env, allowMultipleInstances);
+if (devUserDataDir) {
+  fs.mkdirSync(devUserDataDir, { recursive: true });
+  app.setPath('userData', devUserDataDir);
+} else if (process.platform === 'win32') {
+  // Keep the established production data directory unchanged.
+  app.setPath('userData', path.join(app.getPath('appData'), '嗷呜点歌机'));
+}
 const hasSingleInstanceLock = allowMultipleInstances
   || app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) requestApplicationQuit();
@@ -593,8 +612,8 @@ function createAdminWindow(initialTab?: unknown) {
   adminWindow = new BrowserWindow({
     width: 900, height: 640, minWidth: 600, minHeight: 420,
     autoHideMenuBar: true, titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#0d1117', symbolColor: '#ffffff' },
-    backgroundColor: '#0d1117', resizable: true,
+    titleBarOverlay: { color: '#0c1423', symbolColor: '#d9e8f8' },
+    backgroundColor: '#0c1423', resizable: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
       nodeIntegration: false,
@@ -670,6 +689,16 @@ ipcMain.on('set-overlay-always-on-top', (event, value) => {
 });
 
 ipcMain.on('open-admin', (_event, tab) => createAdminWindow(tab));
+ipcMain.on('set-window-color-mode', (event, mode) => {
+  if (mode !== 'light' && mode !== 'dark') return;
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win !== adminWindow) return;
+  const dark = mode === 'dark';
+  win.setBackgroundColor(dark ? '#0c1423' : '#f5faff');
+  if (process.platform === 'win32') {
+    win.setTitleBarOverlay({ color: dark ? '#0c1423' : '#f5faff', symbolColor: dark ? '#d9e8f8' : '#244766' });
+  }
+});
 ipcMain.handle('open-external', async (_event, value) => {
   let target: URL;
   try {
@@ -830,7 +859,11 @@ function saveConfig() {
 
 let isAccepting = true;
 let isPlaying = true;
+let requestedQueuePlaybackEnabled = true;
+let qqAutoplayGeneration = 0;
+let qqAutoplayPauseConfirmed = true;
 let skipForcePlayOnce = false;
+let skipForcePlayOnceSong: any = null;
 let biliCookie = "";
 let biliUid = 0;
 
@@ -883,7 +916,24 @@ type PlayerControlNotice = PlayerControlHint & { detectedAt: string };
 let playerControlNotice: PlayerControlNotice | null = null;
 let registeredNextGuardKey = '';
 let registeredNextGuardSongIdentity = '';
+let registeredNextGuardId = 0;
 let queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+interface RecentQqGuardedCompletion {
+  song: any;
+  identity: string;
+  consumedAt: number;
+  rescueAttempted: boolean;
+}
+
+let recentQqGuardedCompletion: RecentQqGuardedCompletion | null = null;
+interface QqGuardTerminalRecoveryOwnership {
+  song: any;
+  identity: string;
+  attempted: boolean;
+}
+
+let qqGuardTerminalRecoveryOwnership:
+  QqGuardTerminalRecoveryOwnership | null = null;
 let deferredQqInsertIdentity = '';
 let qqDeferredInsertRetryAttempted = false;
 let qqDeferredInsertRetryInFlight = false;
@@ -902,6 +952,7 @@ interface ManagedPlayerAction {
   expiresAt: number;
   inFlight: boolean;
   targetObserved: boolean;
+  logicalNextOwnerAtDispatch: boolean;
   previousCurrentPlayingSong: any;
 }
 
@@ -920,8 +971,108 @@ function shouldDeferQqQueueHeadForMissingAnchor(
 ): boolean {
   return shouldDeferQqQueueHeadUntilAnchor({
     playerKey: getSelectedPlayerKey(),
-    playbackAnchorReady: playbackAnchorReady === true
+    playbackAnchorReady: playbackAnchorReady === true,
+    requiresPlaybackAnchor: activePlayerSnapshot?.requiresPlaybackAnchor
   });
+}
+
+function connectorOwnsQqLogicalNext(): boolean {
+  return ownsQqLogicalNext(getSelectedPlayerKey(), activePlayerSnapshot);
+}
+
+function isQqAutoplaySuspended(): boolean {
+  return shouldSuspendQqAutoplay(connectorOwnsQqLogicalNext(), isPlaying);
+}
+
+function discardQqGuardOperation(operationGeneration: number): boolean {
+  return shouldDiscardQqGuardOperation({
+    ownsLogicalNext: connectorOwnsQqLogicalNext(),
+    playbackEnabled: isPlaying,
+    generation: qqAutoplayGeneration,
+    operationGeneration
+  });
+}
+
+function isAutoplayPauseConfirmed(): boolean {
+  return !connectorOwnsQqLogicalNext() || qqAutoplayPauseConfirmed;
+}
+
+function clearQqAutoplayOwnership(): void {
+  clearRegisteredNextGuard();
+  clearDeferredQqInsert();
+  clearRecentQqGuardedCompletion();
+  clearSkipForcePlayOnce();
+  cancelledNativeNextSongs.clear();
+  queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+  activeManagedPlayerAction = null;
+  currentPlayingSong = null;
+}
+
+async function setQueuePlaybackEnabled(enabled: boolean): Promise<{
+  success: boolean;
+  playing: boolean;
+  autoplayPauseConfirmed: boolean;
+  message?: string;
+}> {
+  requestedQueuePlaybackEnabled = enabled;
+  const generation = ++qqAutoplayGeneration;
+  if (!connectorOwnsQqLogicalNext()) {
+    // Preserve legacy QQ and every other player's existing pause behavior.
+    isPlaying = enabled;
+    if (isPlaying && targetQueue[0]) await guardNextSong(targetQueue[0]);
+    return { success: true, playing: isPlaying, autoplayPauseConfirmed: true };
+  }
+
+  if (!enabled) {
+    // Block new automatic work before waiting for an older command to settle.
+    isPlaying = false;
+    qqAutoplayPauseConfirmed = false;
+    clearQqAutoplayOwnership();
+  }
+  if (!enabled || !qqAutoplayPauseConfirmed) {
+    const confirmed = await serializeNextGuardOperation(async () => {
+      if (!connectorOwnsQqLogicalNext()) return false;
+      // A rapid resume waits behind the pause, without repeating a confirmed
+      // cancellation. A failed/unknown pause is explicitly retried on resume.
+      if (enabled && qqAutoplayPauseConfirmed) return true;
+      try {
+        const result = await executePlayerCommand('ArmNextGuard');
+        const success = isQqAutoplayCancellationConfirmed(result);
+        qqAutoplayPauseConfirmed = success;
+        clearQqAutoplayOwnership();
+        return success;
+      } catch {
+        qqAutoplayPauseConfirmed = false;
+        return false;
+      }
+    });
+    if (!confirmed && generation === qqAutoplayGeneration) {
+      isPlaying = false;
+      requestedQueuePlaybackEnabled = false;
+      const message = '自动操作已停止，但 QQ 兜底取消尚未确认；请重试或重连，暂不能确认已安全解除';
+      setGlobalStatus(message);
+      return { success: false, playing: false, autoplayPauseConfirmed: false, message };
+    }
+  }
+  if (generation !== qqAutoplayGeneration) {
+    return {
+      success: false, playing: isPlaying, autoplayPauseConfirmed: isAutoplayPauseConfirmed(),
+      message: '自动播放状态已被后续操作更新'
+    };
+  }
+  isPlaying = enabled;
+  const success = !enabled || !targetQueue[0] || await guardNextSong(targetQueue[0]);
+  if (generation !== qqAutoplayGeneration) {
+    return {
+      success: false, playing: isPlaying, autoplayPauseConfirmed: isAutoplayPauseConfirmed(),
+      message: '自动播放状态已被后续操作更新'
+    };
+  }
+  const message = !enabled
+    ? '自动播放已暂停；QQ 当前播放及待播队列保持不变，可自由选歌'
+    : success ? '自动播放已恢复，按当前待播队首接管' : '自动播放已开启，但 QQ 队首登记未确认';
+  setGlobalStatus(message);
+  return { success, playing: isPlaying, autoplayPauseConfirmed: isAutoplayPauseConfirmed(), message };
 }
 
 const playerManager = new PlayerManager({
@@ -955,8 +1106,9 @@ const playerManager = new PlayerManager({
     }
     if (!state.connected) {
       clearDeferredQqInsert();
-      registeredNextGuardKey = '';
-      registeredNextGuardSongIdentity = '';
+      clearRecentQqGuardedCompletion();
+      clearRegisteredNextGuard();
+      clearSkipForcePlayOnce();
       queueHeadNeedsGuardOnlyAfterCurrentChange = false;
       activeManagedPlayerAction = null;
       cancelledNativeNextSongs.clear();
@@ -994,7 +1146,9 @@ const playerManager = new PlayerManager({
         '',
         null,
         'legacy',
-        observation.playbackAnchorReady === true
+        observation.playbackAnchorReady === true,
+        observation.nextGuardState,
+        observation.nextGuardId
       );
       return;
     }
@@ -1012,7 +1166,9 @@ const playerManager = new PlayerManager({
       observation.coverUrl || '',
       observation.nextTrack || null,
       observation.nextObservation,
-      observation.playbackAnchorReady === true
+      observation.playbackAnchorReady === true,
+      observation.nextGuardState,
+      observation.nextGuardId
     );
   },
   onTrackUpdated: async (track, observation) => {
@@ -1022,6 +1178,21 @@ const playerManager = new PlayerManager({
       track.artist || '',
       observation.coverUrl || ''
     );
+    if (isQqAutoplaySuspended()) {
+      clearQqAutoplayOwnership();
+      return;
+    }
+    adoptObservedNextGuardId(
+      observation.nextGuardState,
+      observation.nextGuardId,
+      observation.nextTrack
+    );
+    if (await recoverQqGuardTerminalFailureIfNeeded(
+      observation.nextGuardState,
+      observation.nextGuardId
+    ) === 'handled') {
+      return;
+    }
     await retryDeferredQqInsertAfterObservation(
       observation.playbackAnchorReady === true
     );
@@ -2025,6 +2196,7 @@ async function retryDeferredQqInsertAfterObservation(
 
   const deferredOptions = {
     playerKey: getSelectedPlayerKey(),
+    requiresPlaybackAnchor: activePlayerSnapshot?.requiresPlaybackAnchor,
     playbackAnchorReady: playbackAnchorReady === true,
     deferredIdentity: deferredQqInsertIdentity,
     queueHeadIdentity: getQueueSongIdentity(queueHead),
@@ -2048,7 +2220,202 @@ async function retryDeferredQqInsertAfterObservation(
   return 'none';
 }
 
-async function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string, currArtist: string = '', currCoverUrl: string = '', observedNextTrack: any = null, nextObservation: NextObservation = 'legacy', playbackAnchorReady = false): Promise<void> {
+type RecentQqGuardedRecoveryResult = 'none' | 'handled';
+
+type QqGuardTerminalRecoveryResult = 'none' | 'handled';
+
+async function recoverQqGuardTerminalFailureIfNeeded(
+  guardState: NextGuardState | null | undefined,
+  guardId: number | null | undefined
+): Promise<QqGuardTerminalRecoveryResult> {
+  // The Web owner consumes submissions once; native rescue must not retry it.
+  if (connectorOwnsQqLogicalNext()) return 'none';
+  const queueHead = targetQueue[0];
+  const queueHeadIdentity = getQueueSongIdentity(queueHead);
+  const ownership = qqGuardTerminalRecoveryOwnership;
+  const action = planQqGuardTerminalRecovery({
+    playerKey: getSelectedPlayerKey(),
+    guardState,
+    guardId,
+    queueHeadIdentity,
+    registeredGuardIdentity: registeredNextGuardSongIdentity,
+    registeredGuardId: registeredNextGuardId,
+    ownershipIdentity: ownership?.identity || '',
+    recoveryAttempted: ownership?.attempted === true
+  });
+
+  if (action === 'none') {
+    if (
+      getSelectedPlayerKey() === 'qqmusic'
+      && guardState === 'terminalFailure'
+      && registeredNextGuardSongIdentity
+      && registeredNextGuardSongIdentity !== queueHeadIdentity
+    ) {
+      // The terminal event belongs to an older guard. Release its stale host
+      // marker, but leave the current queue head to the ordinary path.
+      clearRegisteredNextGuard();
+      clearQqGuardTerminalRecoveryOwnership();
+    }
+    return 'none';
+  }
+
+  if (action === 'stop') {
+    clearRegisteredNextGuard();
+    currentPlayingSong = null;
+    queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+    setGlobalStatus(
+      `QQ 下一首守卫已终止，保留队首待播: ${queueHead?.SongName || '未知歌曲'}；`
+      + '已停止自动兜底，请手动重试。'
+    );
+    return 'handled';
+  }
+
+  if (!queueHead || !queueHeadIdentity) return 'none';
+
+  // Claim this queue-head/session before the first await. A second terminal
+  // snapshot for the same guard therefore cannot issue another command.
+  const recoverySong = queueHead;
+  qqGuardTerminalRecoveryOwnership = {
+    song: recoverySong,
+    identity: queueHeadIdentity,
+    attempted: true
+  };
+  clearRegisteredNextGuard();
+  queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+  writeLog(
+    `[QQ 守卫终止] 连接器已结束守卫，执行一次队列保留兜底: `
+    + `${recoverySong.SongName || '未知歌曲'}`,
+    'Yellow'
+  );
+
+  const playbackRecovered = await playSongNow(recoverySong, 'interrupt');
+  const stillOwnsRecovery = getSelectedPlayerKey() === 'qqmusic'
+    && targetQueue[0] === recoverySong
+    && qqGuardTerminalRecoveryOwnership?.song === recoverySong
+    && qqGuardTerminalRecoveryOwnership.identity === queueHeadIdentity;
+  if (!stillOwnsRecovery) {
+    // A user queue mutation, player switch, or newer cycle won during the
+    // interrupt transaction. Do not revive or modify the stale queue head.
+    return 'handled';
+  }
+
+  if (playbackRecovered) {
+    setGlobalStatus(`[播放] ${recoverySong.SongName || '未知歌曲'}`);
+    writeLog(
+      `[QQ 守卫终止] 已通过一次队列保留兜底播放: `
+      + `${recoverySong.SongName || '未知歌曲'}`,
+      'Green'
+    );
+    return 'handled';
+  }
+
+  // playSongNow restores its previous current song on failure. Clear that
+  // host-side request marker but keep the exact queue object at the head; the
+  // claimed ownership remains attempted, so no automatic retry follows.
+  currentPlayingSong = null;
+  queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+  setGlobalStatus(
+    `QQ 守卫兜底未确认，已保留队首: ${recoverySong.SongName || '未知歌曲'}；`
+    + '已停止自动命令。'
+  );
+  writeLog(
+    `[QQ 守卫终止] 队列保留兜底未确认，保留队首且不再自动重试: `
+    + `${recoverySong.SongName || '未知歌曲'}`,
+    'Yellow'
+  );
+  return 'handled';
+}
+
+async function recoverRecentQqGuardedCompletionIfNeeded(): Promise<RecentQqGuardedRecoveryResult> {
+  // Preserve 1.2.1's native recovery without issuing competing Web submissions.
+  if (connectorOwnsQqLogicalNext()) return 'none';
+  const completion = recentQqGuardedCompletion;
+  if (!completion) return 'none';
+
+  if (
+    getSelectedPlayerKey() !== 'qqmusic'
+    || !currentPlayingSong
+    || getQueueSongIdentity(currentPlayingSong) !== completion.identity
+  ) {
+    // A new player/current request owns the state now. Do not let an old
+    // completion marker affect the ordinary manual-selection fallback.
+    clearRecentQqGuardedCompletion();
+    return 'none';
+  }
+
+  const action = planQqGuardedCompletionRecovery({
+    playerKey: getSelectedPlayerKey(),
+    markerMatchesCurrent: true,
+    currentSongMismatched: !isObservedSong(currentPlayingSong),
+    ageMs: Date.now() - completion.consumedAt,
+    rescueAttempted: completion.rescueAttempted
+  });
+  if (action !== 'recover-once') {
+    if (action === 'manual-wins') {
+      writeLog(
+        `[QQ 一次性恢复] ${completion.song?.SongName || '点播歌曲'} `
+        + '已超过保护时间，放行当前手动歌曲。',
+        'DarkGray'
+      );
+    } else if (action === 'stop') {
+      writeLog(
+        `[QQ 一次性恢复] ${completion.song?.SongName || '点播歌曲'} `
+        + '已尝试过一次恢复，不再抢占当前歌曲。',
+        'Yellow'
+      );
+    }
+    clearRecentQqGuardedCompletion();
+    return 'none';
+  }
+
+  // Mark before the first await. PlayerManager serializes observations, but
+  // this also makes the one-shot invariant explicit if another caller enters
+  // this path while the interrupt transaction is in flight.
+  completion.rescueAttempted = true;
+  clearSkipForcePlayOnce();
+  const recoverySong = completion.song;
+  writeLog(
+    `[QQ 一次性恢复] 当前歌曲覆盖了刚完成的点播，执行一次插队恢复: `
+    + `${recoverySong?.SongName || '未知歌曲'}`,
+    'Yellow'
+  );
+  const playbackRecovered = await playSongNow(recoverySong, 'interrupt');
+  if (!ownsQqGuardedCompletion({
+    playerKey: getSelectedPlayerKey(),
+    marker: recentQqGuardedCompletion,
+    expectedMarker: completion
+  })) {
+    // The await may have allowed a player switch, reconnect, or newer guard to
+    // take ownership. Never requeue or re-guard a stale completion afterward.
+    // This observation was already handled by the in-flight recovery command;
+    // stop it here so the old C snapshot cannot fall through and act on the
+    // newer current/guard state. "handled" does not restore the old marker.
+    return 'handled';
+  }
+  if (playbackRecovered) {
+    writeLog(
+      `[QQ 一次性恢复] 已恢复点播当前歌曲: ${recoverySong?.SongName || '未知歌曲'}；`
+      + '不再重复恢复。',
+      'Green'
+    );
+    return 'handled';
+  }
+
+  requeueRecentQqGuardedCompletion(completion);
+  currentPlayingSong = null;
+  writeLog(
+    `[QQ 一次性恢复] 恢复未确认，已将原点播放回队首并登记一次守卫；`
+    + '后续不再自动抢占。',
+    'Yellow'
+  );
+  // This is the same guarded-completion cycle after a failed one-shot
+  // recovery. Preserve its attempted bit only for this internal re-guard;
+  // explicit queue return and ordinary new guards start a fresh cycle.
+  await guardNextSong(recoverySong, undefined, true);
+  return 'handled';
+}
+
+async function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string, currArtist: string = '', currCoverUrl: string = '', observedNextTrack: any = null, nextObservation: NextObservation = 'legacy', playbackAnchorReady = false, nextGuardState: NextGuardState | null = 'none', nextGuardId = 0): Promise<void> {
   playerPausedAfterRequests = false;
   updatePlayerCurrentTrack(currId, currName, currArtist, currCoverUrl);
   writeLog(
@@ -2056,6 +2423,27 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
     + `下一首预告: ${nextName}${nextId ? ` (${nextId})` : ''}`,
     'Magenta'
   );
+
+  // Stopping Awoo autoplay does not pause/skip QQ or consume local requests.
+  // Keep actual current metadata visible, but release old request attribution.
+  if (isQqAutoplaySuspended()) {
+    clearQqAutoplayOwnership();
+    return;
+  }
+
+  adoptObservedNextGuardId(
+    nextGuardState,
+    nextGuardId,
+    observedNextTrack
+  );
+
+  if (await recoverQqGuardTerminalFailureIfNeeded(
+        nextGuardState,
+        nextGuardId
+      )
+      === 'handled') {
+    return;
+  }
 
   // QQ Music cannot insert relative to a playlist cursor until its first
   // real current track is observed. The same entry point is also used by
@@ -2070,8 +2458,12 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
     return;
   }
 
+  if (isQqAutoplaySuspended()) {
+    clearQqAutoplayOwnership();
+    return;
+  }
   const managedAction = activeManagedPlayerAction;
-  if (managedAction && Date.now() > managedAction.expiresAt) {
+  if (managedAction && Date.now() >= managedActionExpirationAt(managedAction)) {
     expireManagedAction(managedAction);
   } else if (managedAction) {
     const observed = {
@@ -2094,13 +2486,13 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
     );
   }
   let stateChanged = false;
+  let recentQqRecoveryHandled = false;
 
   const cancelledEntry = [...cancelledNativeNextSongs.entries()]
     .find(([, song]) => isObservedSong(song));
   if (currId && cancelledEntry) {
     cancelledNativeNextSongs.delete(cancelledEntry[0]);
-    registeredNextGuardKey = '';
-    registeredNextGuardSongIdentity = '';
+    clearRegisteredNextGuard();
     writeLog(
       `[队首撤回兜底] 已撤回的预插歌曲开始播放，立即跳过: ${currName}`,
       'Yellow'
@@ -2119,15 +2511,57 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
   }
   else {
     if (currentPlayingSong && !isObservedSong(currentPlayingSong)) {
-      const checkSkipForce = skipForcePlayOnce;
-      skipForcePlayOnce = false;
+      recentQqRecoveryHandled =
+        (await recoverRecentQqGuardedCompletionIfNeeded()) === 'handled';
+      if (recentQqRecoveryHandled) {
+        stateChanged = true;
+      }
+    }
+    if (
+      currentPlayingSong
+      && !isObservedSong(currentPlayingSong)
+      && !recentQqRecoveryHandled
+    ) {
+      const checkSkipForce = skipForcePlayOnce
+        && skipForcePlayOnceSong === currentPlayingSong;
+      clearSkipForcePlayOnce();
 
-      if (targetQueue.length > 0 && isObservedSong(targetQueue[0])) {
+      const queueHead = targetQueue[0];
+      const queueHeadObserved = Boolean(
+        queueHead && isObservedSong(queueHead)
+      );
+      const queueHeadAlreadyGuarded = Boolean(queueHead)
+        && registeredNextGuardSongIdentity
+          === getQueueSongIdentity(queueHead);
+      const guardedQqMismatchAction = planGuardedQqMismatchAction({
+        playerKey: getSelectedPlayerKey(),
+        currentSongMismatched: true,
+        queueHeadObserved,
+        queueHeadAlreadyGuarded
+      });
+
+      if (guardedQqMismatchAction === 'release-to-guard') {
+        writeLog(
+          `[状态同步] QQ 当前点播曲与实际歌曲不符；队首已有下一首守卫，`
+          + '交由连接器独占恢复，暂不并发播放队首',
+          'DarkGray'
+        );
+        // Keep targetQueue and registeredNextGuardSongIdentity intact. The
+        // QQ connector performs the queue-preserving recovery and the next
+        // verified target observation consumes the head below.
+        currentPlayingSong = null;
+        stateChanged = true;
+      } else if (targetQueue.length > 0 && isObservedSong(targetQueue[0])) {
         writeLog(`[状态同步] 自然衔接到队首: ${targetQueue[0]?.SongName}`, 'Green');
-        registeredNextGuardKey = '';
-        registeredNextGuardSongIdentity = '';
+        rememberQqGuardedCompletionIfEligible(
+          queueHead,
+          queueHeadObserved,
+          queueHeadAlreadyGuarded
+        );
+        clearRegisteredNextGuard();
         queueHeadNeedsGuardOnlyAfterCurrentChange = false;
         currentPlayingSong = targetQueue.shift();
+        clearQqGuardTerminalRecoveryOwnership();
         stateChanged = true;
       } else if (targetQueue.length > 0) {
         if (checkSkipForce && targetQueue[0]?.Id === currentPlayingSong?.Id) {
@@ -2135,6 +2569,12 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
           await guardNextSong(targetQueue[0], playbackAnchorReady);
           currentPlayingSong = null;
           stateChanged = true;
+        } else if (connectorOwnsQqLogicalNext()) {
+          // The connector may already be submitting this head for the same
+          // natural-end event. Never send a competing PlaySelected correction.
+          currentPlayingSong = null;
+          stateChanged = true;
+          await guardNextSong(targetQueue[0], playbackAnchorReady);
         } else {
           writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0]?.SongName}`, 'Magenta');
           const queuedSong = targetQueue[0];
@@ -2162,17 +2602,35 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
       && isObservedSong(currentPlayingSong)
       && isObservedSong(targetQueue[0])
     ) {
-      registeredNextGuardKey = '';
-      registeredNextGuardSongIdentity = '';
+      const queueHead = targetQueue[0];
+      const queueHeadAlreadyGuarded = Boolean(queueHead)
+        && registeredNextGuardSongIdentity
+          === getQueueSongIdentity(queueHead);
+      rememberQqGuardedCompletionIfEligible(
+        queueHead,
+        true,
+        queueHeadAlreadyGuarded
+      );
+      clearRegisteredNextGuard();
       queueHeadNeedsGuardOnlyAfterCurrentChange = false;
       targetQueue.shift();
+      clearQqGuardTerminalRecoveryOwnership();
       stateChanged = true;
     } else if (!currentPlayingSong && targetQueue.length > 0) {
       if (isObservedSong(targetQueue[0])) {
-        registeredNextGuardKey = '';
-        registeredNextGuardSongIdentity = '';
+        const queueHead = targetQueue[0];
+        const queueHeadAlreadyGuarded = Boolean(queueHead)
+          && registeredNextGuardSongIdentity
+            === getQueueSongIdentity(queueHead);
+        rememberQqGuardedCompletionIfEligible(
+          queueHead,
+          true,
+          queueHeadAlreadyGuarded
+        );
+        clearRegisteredNextGuard();
         queueHeadNeedsGuardOnlyAfterCurrentChange = false;
         currentPlayingSong = targetQueue.shift();
+        clearQqGuardTerminalRecoveryOwnership();
         stateChanged = true;
       } else if (shouldDeferQqQueueHeadForMissingAnchor(playbackAnchorReady)) {
         // QQ cannot safely use PlaySelected before its native playback cursor
@@ -2180,8 +2638,13 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
         // the next ready observation performs the one InsertNext retry.
         await guardNextSong(targetQueue[0], playbackAnchorReady);
       } else {
+        const recentQqRecoveryHold = getSelectedPlayerKey() === 'qqmusic'
+          && recentQqGuardedCompletion?.rescueAttempted === true
+          && recentQqGuardedCompletion.identity
+            === getQueueSongIdentity(targetQueue[0]);
         const shouldKeepDeferredQqHead = shouldSuppressQqQueueHeadPlayNow({
           playerKey: getSelectedPlayerKey(),
+          requiresPlaybackAnchor: activePlayerSnapshot?.requiresPlaybackAnchor,
           queueHeadIdentity: getQueueSongIdentity(targetQueue[0]),
           deferredIdentity: deferredQqInsertIdentity,
           playbackAnchorReady: playbackAnchorReady === true,
@@ -2190,16 +2653,26 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
         });
         const queueHeadAlreadyGuarded = registeredNextGuardSongIdentity
           === getQueueSongIdentity(targetQueue[0]);
-        if (shouldKeepDeferredQqHead || queueHeadAlreadyGuarded) {
+        if (
+          recentQqRecoveryHold
+          || shouldKeepDeferredQqHead
+          || queueHeadAlreadyGuarded
+        ) {
           // Keep an already inserted/deferred request local instead of
           // starting it immediately as a fallback.
           setGlobalStatus(
-            shouldKeepDeferredQqHead
+            recentQqRecoveryHold
+              ? 'QQ 一次性恢复未确认，已保留点播队首且停止自动抢占'
+              : shouldKeepDeferredQqHead
               ? qqDeferredInsertRetryAttempted
                 ? 'QQ 音乐插入下一首失败，请在基础设置重连后重试'
                 : '等待 QQ 音乐首次播放后插入下一首'
               : `下一首已就绪: ${targetQueue[0]?.SongName}`
           );
+        } else if (connectorOwnsQqLogicalNext()) {
+          // Registration/observation only: an unknown or cancelled connector
+          // attempt must not be retried by this host-side mismatch fallback.
+          await guardNextSong(targetQueue[0], playbackAnchorReady);
         } else {
           writeLog(`[兜底纠正] 实际切歌与待播队首不符，立即切到: ${targetQueue[0]?.SongName}`, 'Magenta');
           const queuedSong = targetQueue[0];
@@ -2210,6 +2683,10 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
       }
     }
 
+    if (isQqAutoplaySuspended()) {
+      clearQqAutoplayOwnership();
+      return;
+    }
     if (stateChanged) setGlobalStatus(currentPlayingSong ? `[播放] ${currentPlayingSong?.SongName}` : '点歌就绪');
 
     if (isPlaying && targetQueue.length > 0 && currentPlayingSong && isObservedSong(currentPlayingSong)) {
@@ -2281,6 +2758,7 @@ function getConnectorAutoRepairAttemptKey(
 async function runConnectorAutoRepair(
   connectorId: NativeConnectorId
 ): Promise<boolean> {
+  if (!shouldRunAutomaticConnectorMaintenance(devUserDataDir)) return false;
   if (connectorAutoRepairInFlight) {
     return await connectorAutoRepairInFlight;
   }
@@ -2476,6 +2954,7 @@ async function recoverPlayerConnectionAfterFailure(): Promise<void> {
 async function maintainPlayerConnectors(
   forceRefresh = false
 ): Promise<void> {
+  if (!shouldRunAutomaticConnectorMaintenance(devUserDataDir)) return;
   if (connectorMaintenanceRunning) return;
   connectorMaintenanceRunning = true;
   try {
@@ -2585,6 +3064,7 @@ function scheduleStartupBackgroundServices(win: BrowserWindow): void {
 
 async function reconnectPlayerBridge(): Promise<boolean> {
   clearDeferredQqInsert();
+  clearRecentQqGuardedCompletion();
   updatePlayerCurrentTrack('', '');
   return await connectWithConnectorMaintenanceStatus(
     () => playerManager.reconnect()
@@ -2593,6 +3073,7 @@ async function reconnectPlayerBridge(): Promise<boolean> {
 
 async function startPlayerRadar(): Promise<boolean> {
   clearDeferredQqInsert();
+  clearRecentQqGuardedCompletion();
   playerManager.resetObservedTrack();
   updatePlayerCurrentTrack('', '');
   return await connectWithConnectorMaintenanceStatus(
@@ -2717,6 +3198,117 @@ function getQueueSongIdentity(songInfo: any): string {
   return queueSongIdentity(songInfo, getSelectedPlayerKey());
 }
 
+function clearRegisteredNextGuard(): void {
+  registeredNextGuardKey = '';
+  registeredNextGuardSongIdentity = '';
+  registeredNextGuardId = 0;
+}
+
+function clearSkipForcePlayOnce(): void {
+  skipForcePlayOnce = false;
+  skipForcePlayOnceSong = null;
+}
+
+function getResultNextGuardId(result: any): number {
+  const guardId = Number(result?.snapshot?.nextGuardId);
+  return Number.isSafeInteger(guardId) && guardId > 0 ? guardId : 0;
+}
+
+function adoptObservedNextGuardId(
+  guardState: NextGuardState | null | undefined,
+  guardId: number | null | undefined,
+  observedNextTrack: any
+): void {
+  if (
+    getSelectedPlayerKey() !== 'qqmusic'
+    || registeredNextGuardId > 0
+    || !['armed', 'waitingLateTarget'].includes(String(guardState || ''))
+  ) return;
+
+  const normalizedGuardId = Number(guardId);
+  if (!Number.isSafeInteger(normalizedGuardId) || normalizedGuardId <= 0) return;
+  if (
+    registeredNextGuardSongIdentity
+    && getQueueSongIdentity(observedNextTrack)
+      === registeredNextGuardSongIdentity
+  ) {
+    registeredNextGuardId = normalizedGuardId;
+  }
+}
+
+function clearRecentQqGuardedCompletion(): void {
+  recentQqGuardedCompletion = null;
+  clearQqGuardTerminalRecoveryOwnership();
+}
+
+function clearQqGuardTerminalRecoveryOwnership(): void {
+  qqGuardTerminalRecoveryOwnership = null;
+}
+
+function rememberQqGuardedCompletionIfEligible(
+  queueHead: any,
+  queueHeadObserved: boolean,
+  queueHeadAlreadyGuarded: boolean
+): void {
+  if (!shouldRecordQqGuardedCompletion({
+    playerKey: getSelectedPlayerKey(),
+    queueHeadObserved,
+    queueHeadAlreadyGuarded
+  })) {
+    return;
+  }
+
+  const identity = getQueueSongIdentity(queueHead);
+  if (!identity) return;
+  const previous = recentQqGuardedCompletion;
+  recentQqGuardedCompletion = {
+    song: queueHead,
+    identity,
+    consumedAt: Date.now(),
+    // The caller clears this marker for a new guard cycle. If an internal
+    // failed recovery re-guards the exact object, keep its one-shot bit.
+    rescueAttempted: previous
+      && shouldRetainQqGuardedCompletionAttempt(previous.song, queueHead)
+      ? previous.rescueAttempted
+      : false
+  };
+}
+
+function requeueRecentQqGuardedCompletion(
+  completion: RecentQqGuardedCompletion
+): void {
+  const sameObjectIndex = targetQueue.indexOf(completion.song);
+  if (sameObjectIndex > 0) {
+    const [sameObject] = targetQueue.splice(sameObjectIndex, 1);
+    targetQueue.unshift(sameObject);
+    return;
+  }
+  if (sameObjectIndex === 0) return;
+
+  // A different request for the same song may legitimately already be in the
+  // queue. Only the exact object is considered a duplicate; otherwise put
+  // back the consumed object so requester metadata is preserved.
+  targetQueue.unshift(completion.song);
+}
+
+function replaceRecentQqGuardedCompletionForNewGuard(
+  songInfo: any,
+  preserveCycle = false
+): void {
+  if (
+    !preserveCycle
+    || (
+      recentQqGuardedCompletion
+      && !shouldRetainQqGuardedCompletionAttempt(
+        recentQqGuardedCompletion.song,
+        songInfo
+      )
+    )
+  ) {
+    clearRecentQqGuardedCompletion();
+  }
+}
+
 function clearDeferredQqInsert(): void {
   deferredQqInsertIdentity = '';
   qqDeferredInsertRetryAttempted = false;
@@ -2772,9 +3364,12 @@ async function waitForManagedPlayerActionSettlement(): Promise<void> {
 
 async function guardNextSong(
   songInfo: any,
-  playbackAnchorReadyOverride?: boolean
+  playbackAnchorReadyOverride?: boolean,
+  preserveQqGuardedCompletionCycle = false
 ): Promise<boolean> {
+  const operationGeneration = qqAutoplayGeneration;
   return serializeNextGuardOperation(async () => {
+    if (discardQqGuardOperation(operationGeneration)) return false;
     if (!songInfo) return false;
     const playbackAnchorReady = playbackAnchorReadyOverride === undefined
       ? activePlayerSnapshot?.playbackAnchorReady === true
@@ -2782,6 +3377,7 @@ async function guardNextSong(
     const songIdentity = getQueueSongIdentity(songInfo);
     const deferredAction = planQqAnchorObservation({
       playerKey: getSelectedPlayerKey(),
+      requiresPlaybackAnchor: activePlayerSnapshot?.requiresPlaybackAnchor,
       playbackAnchorReady,
       deferredIdentity: deferredQqInsertIdentity,
       queueHeadIdentity: songIdentity,
@@ -2794,6 +3390,7 @@ async function guardNextSong(
       deferredAction === 'none'
       && shouldSkipDuplicateQqAnchorInsert({
         playerKey: getSelectedPlayerKey(),
+        requiresPlaybackAnchor: activePlayerSnapshot?.requiresPlaybackAnchor,
         songIdentity,
         deferredIdentity: deferredQqInsertIdentity,
         playbackAnchorReady,
@@ -2841,10 +3438,16 @@ async function guardNextSong(
       return true;
     }
     const result = await executePlayerCommand('InsertNext', songInfo);
+    if (discardQqGuardOperation(operationGeneration)) return false;
     if (isSuccessfulPlayerResult(result)) {
       queueHeadNeedsGuardOnlyAfterCurrentChange = false;
       registeredNextGuardKey = guardKey;
       registeredNextGuardSongIdentity = getQueueSongIdentity(songInfo);
+      registeredNextGuardId = getResultNextGuardId(result);
+      replaceRecentQqGuardedCompletionForNewGuard(
+        songInfo,
+        preserveQqGuardedCompletionCycle
+      );
       writeLog(`✅ 已登记下一首守卫: ${songInfo.SongName}`, 'DarkGray');
       return true;
     }
@@ -2857,21 +3460,25 @@ async function guardNextSong(
       return true;
     }
     if (registeredNextGuardKey === guardKey) {
-      registeredNextGuardKey = '';
-      registeredNextGuardSongIdentity = '';
+      clearRegisteredNextGuard();
     }
     return false;
   });
 }
 
 async function armNextGuardOnly(songInfo: any): Promise<boolean> {
+  const operationGeneration = qqAutoplayGeneration;
   return serializeNextGuardOperation(async () => {
+    if (discardQqGuardOperation(operationGeneration)) return false;
     if (!songInfo) return false;
     const guardKey = getNextGuardKey(songInfo);
     const result = await executePlayerCommand('ArmNextGuard', songInfo);
+    if (discardQqGuardOperation(operationGeneration)) return false;
     if (isSuccessfulPlayerResult(result)) {
       registeredNextGuardKey = guardKey;
       registeredNextGuardSongIdentity = getQueueSongIdentity(songInfo);
+      registeredNextGuardId = getResultNextGuardId(result);
+      replaceRecentQqGuardedCompletionForNewGuard(songInfo);
       writeLog(
         `🛡️ 队首已变化，只更新兜底目标且未再次插入播放器队列: ${songInfo.SongName}`,
         'DarkGray'
@@ -2879,8 +3486,7 @@ async function armNextGuardOnly(songInfo: any): Promise<boolean> {
       return true;
     }
 
-    registeredNextGuardKey = '';
-    registeredNextGuardSongIdentity = '';
+    clearRegisteredNextGuard();
     writeLog(
       `[队首守卫] 连接器未能只更新兜底目标，将由主程序在切歌后纠正: ${songInfo.SongName}`,
       'Yellow'
@@ -2903,6 +3509,7 @@ async function reconcileQueueHeadAfterMutation(
   previousHead: any,
   context: string
 ): Promise<void> {
+  clearRecentQqGuardedCompletion();
   const nextHead = targetQueue[0] || null;
   syncDeferredQqInsertWithQueueHead();
   const hadRegisteredNext = Boolean(registeredNextGuardKey)
@@ -2914,16 +3521,31 @@ async function reconcileQueueHeadAfterMutation(
     hadRegisteredNext,
     isPlaying
   });
-  if (action === 'none') return;
+  // A lost host marker does not prove the connector has no logical target.
+  const clearLogicalNext = connectorOwnsQqLogicalNext()
+    && Boolean(previousHead)
+    && !nextHead;
+  if (action === 'none' && !clearLogicalNext) return;
 
-  registeredNextGuardKey = '';
-  registeredNextGuardSongIdentity = '';
+  clearRegisteredNextGuard();
   if (action === 'insert') {
     await guardNextSong(nextHead);
     return;
   }
 
-  if (action === 'cancel-native') {
+  if (action === 'cancel-native' || clearLogicalNext) {
+    if (connectorOwnsQqLogicalNext()) {
+      const result = await serializeNextGuardOperation(
+        () => executePlayerCommand('ArmNextGuard')
+      );
+      writeLog(
+        isSuccessfulPlayerResult(result)
+          ? `[${context}] 已取消连接器逻辑下一首，未操作 QQ 原生队列`
+          : `[${context}] 逻辑下一首取消未确认，请检查连接器状态`,
+        isSuccessfulPlayerResult(result) ? 'DarkGray' : 'Yellow'
+      );
+      return;
+    }
     rememberCancelledNativeNext(previousHead);
     writeLog(
       `[${context}] 播放器中已预插的旧队首无法撤销；若它开始播放将立即跳过`,
@@ -2943,6 +3565,7 @@ async function playSongNow(
   clearDeferredQqInsert();
   playerPausedAfterRequests = false;
   const operationState = await serializeNextGuardOperation(async () => {
+    const logicalNextOwnerAtDispatch = connectorOwnsQqLogicalNext();
     const previousCurrentPlayingSong = currentPlayingSong;
     const hadRegisteredNativeNext = Boolean(registeredNextGuardKey)
       && registeredNextGuardSongIdentity
@@ -2950,7 +3573,10 @@ async function playSongNow(
     const command = planImmediatePlaybackCommand({
       playerKey: getSelectedPlayerKey(),
       mode,
-      hasCurrentSong: Boolean(previousCurrentPlayingSong)
+      // A terminal guard deliberately releases currentPlayingSong before the
+      // host fallback. The actual QQ track still exists and must use the
+      // queue-preserving InterruptSelected transaction.
+      hasCurrentSong: Boolean(previousCurrentPlayingSong || playerCurrentTrack)
     });
     queueHeadNeedsGuardOnlyAfterCurrentChange =
       shouldPreserveGuardAfterImmediate({
@@ -2958,8 +3584,7 @@ async function playSongNow(
         hadRegisteredGuard: hadRegisteredNativeNext,
         hasDisplacedCurrentSong: Boolean(previousCurrentPlayingSong)
       });
-    registeredNextGuardKey = '';
-    registeredNextGuardSongIdentity = '';
+    clearRegisteredNextGuard();
     currentPlayingSong = songInfo;
     const managedAction: ManagedPlayerAction = {
       id: ++managedPlayerActionSequence,
@@ -2970,17 +3595,11 @@ async function playSongNow(
       expiresAt: Date.now() + 12_000,
       inFlight: true,
       targetObserved: false,
+      logicalNextOwnerAtDispatch,
       previousCurrentPlayingSong
     };
     activeManagedPlayerAction = managedAction;
-    setTimeout(() => {
-      if (
-        activeManagedPlayerAction?.id === managedAction.id
-        && Date.now() >= managedAction.expiresAt
-      ) {
-        expireManagedAction(managedAction);
-      }
-    }, Math.max(0, managedAction.expiresAt - Date.now() + 50));
+    scheduleManagedActionExpiration(managedAction);
     writeLog(
       `[动作归因] 开始点歌机动作 #${managedAction.id}: ${command} -> `
       + songInfo.SongName,
@@ -2988,6 +3607,10 @@ async function playSongNow(
     );
     const result = await executePlayerCommand(command, songInfo);
     managedAction.inFlight = false;
+    // Once dispatch settles, use the original observation deadline again.
+    // The queued snapshot callbacks can confirm metadata before this timer;
+    // an ACK alone cannot keep an unobserved target attributed indefinitely.
+    if (logicalNextOwnerAtDispatch) scheduleManagedActionExpiration(managedAction);
     if (
       managedAction.targetObserved
       && activeManagedPlayerAction?.id === managedAction.id
@@ -2995,6 +3618,7 @@ async function playSongNow(
       activeManagedPlayerAction = null;
     }
     return {
+      logicalNextOwnerAtDispatch,
       previousCurrentPlayingSong,
       hadRegisteredNativeNext,
       result,
@@ -3002,6 +3626,7 @@ async function playSongNow(
     };
   });
   const {
+    logicalNextOwnerAtDispatch,
     previousCurrentPlayingSong,
     hadRegisteredNativeNext,
     result,
@@ -3031,7 +3656,9 @@ async function playSongNow(
       'Yellow'
     );
     queueHeadNeedsGuardOnlyAfterCurrentChange = false;
-    if (hadRegisteredNativeNext && targetQueue[0]) {
+    // The Web connector retains its consumed-attempt latch. Rearming here
+    // would turn an unknown one-shot submission into a later automatic retry.
+    if (!logicalNextOwnerAtDispatch && hadRegisteredNativeNext && targetQueue[0]) {
       await armNextGuardOnly(targetQueue[0]);
     }
     return false;
@@ -3045,8 +3672,20 @@ function isObservedSong(songInfo: any): boolean {
   return tracksRepresentSameSong(songInfo, playerCurrentTrack);
 }
 
+function scheduleManagedActionExpiration(action: ManagedPlayerAction): void {
+  setTimeout(() => {
+    if (activeManagedPlayerAction?.id !== action.id) return;
+    if (Date.now() < managedActionExpirationAt(action)) {
+      scheduleManagedActionExpiration(action);
+      return;
+    }
+    expireManagedAction(action);
+  }, Math.max(0, managedActionExpirationAt(action) - Date.now() + 50));
+}
+
 function expireManagedAction(action: ManagedPlayerAction): void {
   if (activeManagedPlayerAction?.id !== action.id) return;
+  if (Date.now() < managedActionExpirationAt(action)) return;
 
   const targetObserved = action.targetObserved
     || isObservedSong(action.target);
@@ -3246,6 +3885,7 @@ async function tryRequestSong(
     cancelledNativeNextSongs.delete(getQueueSongIdentity(newSong));
 
     if (mode === 'interrupt') {
+      clearRecentQqGuardedCompletion();
       await waitForManagedPlayerActionSettlement();
       if (currentPlayingSong) targetQueue.unshift(currentPlayingSong);
       setGlobalStatus(`⚡ 插队: ${newSong.SongName}`);
@@ -3265,6 +3905,7 @@ async function tryRequestSong(
     }
 
     if (mode === 'play_now') {
+      clearRecentQqGuardedCompletion();
       await waitForManagedPlayerActionSettlement();
       setGlobalStatus(`▶️ 立即: ${newSong.SongName}`);
       const playbackConfirmed = await playSongNow(newSong);
@@ -4442,7 +5083,7 @@ async function startBackendServer(): Promise<void> {
       const displayCurrent = currentPlayingSong || (showPlayerCurrentTrack ? playerCurrentTrack : null);
       const requestedSongArtwork = appConfig.sysConfig?.RequestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar';
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ current: displayCurrent, currentIsRequested: !!currentPlayingSong, playerPausedAfterRequests, requestedSongArtwork, queue: targetQueue, status: connectorMaintenanceStatus || currentStatusMessage, accepting: isAccepting, playing: isPlaying, uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isPlayerConnected, playerConnected: isPlayerConnected, playerConnecting, roomConnection: getBiliRoomConnectionInfo(), commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand } }));
+      res.end(JSON.stringify({ current: displayCurrent, currentIsRequested: !!currentPlayingSong, playerPausedAfterRequests, requestedSongArtwork, queue: targetQueue, status: connectorMaintenanceStatus || currentStatusMessage, accepting: isAccepting, playing: isPlaying, autoplayPauseConfirmed: isAutoplayPauseConfirmed(), uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isPlayerConnected, playerConnected: isPlayerConnected, playerConnecting, roomConnection: getBiliRoomConnectionInfo(), commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand } }));
       return;
     }
 
@@ -4702,6 +5343,9 @@ async function startBackendServer(): Promise<void> {
 
         if (previousPlayerType !== appConfig.sysConfig.PlayerType) {
           clearDeferredQqInsert();
+          clearRecentQqGuardedCompletion();
+          clearRegisteredNextGuard();
+          clearSkipForcePlayOnce();
           targetQueue = [];
           currentPlayingSong = null;
           playerPausedAfterRequests = false;
@@ -4749,6 +5393,7 @@ async function startBackendServer(): Promise<void> {
         version: app.getVersion(),
         accepting: isAccepting,
         playing: isPlaying,
+        autoplayPauseConfirmed: isAutoplayPauseConfirmed(),
         widgetStyle: appConfig.widgetStyle,
         cdpConnected: isPlayerConnected,
         playerConnected: isPlayerConnected,
@@ -4805,6 +5450,7 @@ async function startBackendServer(): Promise<void> {
       } else if (action === 'play_now' && index >= 0 && index < targetQueue.length) {
         const item = targetQueue[index];
         if (item) {
+          clearRecentQqGuardedCompletion();
           const played = await playSongNow(item);
           if (played && targetQueue[index] === item) {
             targetQueue.splice(index, 1);
@@ -4828,7 +5474,24 @@ async function startBackendServer(): Promise<void> {
         }
       } else if (action === 'push_current_to_queue') {
         if (currentPlayingSong) {
-          targetQueue.push(currentPlayingSong); skipForcePlayOnce = true; setGlobalStatus('🔙 已退回点歌列表末端');
+          // Returning the current request to the queue starts a fresh
+          // guard cycle, even when the same song object is reused.
+          const returningSongIdentity = getQueueSongIdentity(
+            currentPlayingSong
+          );
+          if (
+            targetQueue.length === 0
+            || registeredNextGuardSongIdentity === returningSongIdentity
+          ) {
+            // Reject an old terminal snapshot during the gap between the
+            // native Next and registration of this new same-song cycle.
+            clearRegisteredNextGuard();
+          }
+          clearRecentQqGuardedCompletion();
+          skipForcePlayOnceSong = currentPlayingSong;
+          targetQueue.push(currentPlayingSong);
+          skipForcePlayOnce = true;
+          setGlobalStatus('🔙 已退回点歌列表末端');
           await requestPlayerNext();
         }
       }
@@ -4879,12 +5542,9 @@ async function startBackendServer(): Promise<void> {
 
     if (url.pathname === '/api/state/toggle' && req.method === 'POST') { isAccepting = !isAccepting; res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
     if (url.pathname === '/api/state/toggle_play' && req.method === 'POST') {
-      isPlaying = !isPlaying;
-      if (isPlaying && targetQueue[0]) {
-        await guardNextSong(targetQueue[0]);
-      }
+      const result = await setQueuePlaybackEnabled(!requestedQueuePlaybackEnabled);
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ success: true, playing: isPlaying }));
+      res.end(JSON.stringify(result));
       return;
     }
 
@@ -4909,7 +5569,16 @@ async function startBackendServer(): Promise<void> {
     if (url.pathname === '/api/connectors/status' && req.method === 'GET') {
       try {
         const forceRefresh = url.searchParams.get('refresh') === '1';
-        const connectors = await playerManager.getConnectorStatuses(forceRefresh);
+        const connectorId = url.searchParams.get('connectorId');
+        if (connectorId !== null && !['netease', 'kugou', 'qqmusic', 'folia'].includes(connectorId)) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, connectors: [], message: '连接器标识无效' }));
+          return;
+        }
+        const connectors = await playerManager.getConnectorStatuses(
+          forceRefresh,
+          connectorId === null ? undefined : connectorId as NativeConnectorId
+        );
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.end(JSON.stringify({
           success: true,
@@ -5304,10 +5973,12 @@ async function startBackendServer(): Promise<void> {
 if (hasSingleInstanceLock) app.whenReady().then(() => {
   writeLog('=== 嗷呜点歌机内部日志已连接 ===', 'Cyan');
   loadConfig();
-  connectorMaintenanceTimer = setInterval(
-    () => void maintainPlayerConnectors(true),
-    CONNECTOR_MAINTENANCE_INTERVAL_MS
-  );
+  if (shouldRunAutomaticConnectorMaintenance(devUserDataDir)) {
+    connectorMaintenanceTimer = setInterval(
+      () => void maintainPlayerConnectors(true),
+      CONNECTOR_MAINTENANCE_INTERVAL_MS
+    );
+  }
   // 先开始监听本地接口，再加载悬浮窗，避免首次轮询撞上尚未启动的后端。
   void startBackendServer().then(() => {
     attachInternalApiTokenToAppSession();

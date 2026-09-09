@@ -2,10 +2,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   planImmediatePlaybackCommand,
+  planGuardedQqMismatchAction,
   planManagedActionTimeout,
+  planQqGuardTerminalRecovery,
+  planQqGuardedCompletionRecovery,
   planObservedNextAction,
   planQueueHeadMutation,
+  QQ_GUARDED_COMPLETION_RECOVERY_WINDOW_MS,
+  ownsQqGuardedCompletion,
   queueSongIdentity,
+  shouldRecordQqGuardedCompletion,
+  shouldRetainQqGuardedCompletionAttempt,
   shouldDeferManagedTrackObservation,
   shouldPreserveGuardAfterImmediate,
   shouldRepairObservedNext,
@@ -169,6 +176,222 @@ test('same stable ID remains authoritative despite a title variant', () => {
     { Id: '395562465', SongName: 'September (纯音乐)', ArtistName: 'Sparky Deathcap' },
     { id: '395562465', title: 'September (Live)', artist: 'Other Artist' }
   ), true);
+});
+
+test('QQ guarded queue head releases the host current song to connector recovery', () => {
+  assert.equal(planGuardedQqMismatchAction({
+    playerKey: 'qqmusic',
+    currentSongMismatched: true,
+    queueHeadObserved: false,
+    queueHeadAlreadyGuarded: true
+  }), 'release-to-guard');
+});
+
+test('QQ unguarded mismatch keeps the immediate-play fallback', () => {
+  assert.equal(planGuardedQqMismatchAction({
+    playerKey: 'qqmusic',
+    currentSongMismatched: true,
+    queueHeadObserved: false,
+    queueHeadAlreadyGuarded: false
+  }), 'play-now');
+});
+
+test('non-QQ and already-observed heads keep the existing mismatch path', () => {
+  assert.equal(planGuardedQqMismatchAction({
+    playerKey: 'netease',
+    currentSongMismatched: true,
+    queueHeadObserved: false,
+    queueHeadAlreadyGuarded: true
+  }), 'play-now');
+  assert.equal(planGuardedQqMismatchAction({
+    playerKey: 'qqmusic',
+    currentSongMismatched: true,
+    queueHeadObserved: true,
+    queueHeadAlreadyGuarded: true
+  }), 'play-now');
+  assert.equal(planGuardedQqMismatchAction({
+    playerKey: 'qqmusic',
+    currentSongMismatched: false,
+    queueHeadObserved: false,
+    queueHeadAlreadyGuarded: true
+  }), 'play-now');
+});
+
+test('only a strictly observed QQ guarded head is eligible for completion memory', () => {
+  assert.equal(shouldRecordQqGuardedCompletion({
+    playerKey: 'qqmusic',
+    queueHeadObserved: true,
+    queueHeadAlreadyGuarded: true
+  }), true);
+  assert.equal(shouldRecordQqGuardedCompletion({
+    playerKey: 'qqmusic',
+    queueHeadObserved: false,
+    queueHeadAlreadyGuarded: true
+  }), false);
+  assert.equal(shouldRecordQqGuardedCompletion({
+    playerKey: 'qqmusic',
+    queueHeadObserved: true,
+    queueHeadAlreadyGuarded: false
+  }), false);
+  assert.equal(shouldRecordQqGuardedCompletion({
+    playerKey: 'netease',
+    queueHeadObserved: true,
+    queueHeadAlreadyGuarded: true
+  }), false);
+});
+
+test('QQ guarded completion recovers once within the 8 second window', () => {
+  assert.equal(QQ_GUARDED_COMPLETION_RECOVERY_WINDOW_MS, 8_000);
+  assert.equal(planQqGuardedCompletionRecovery({
+    playerKey: 'qqmusic',
+    markerMatchesCurrent: true,
+    currentSongMismatched: true,
+    ageMs: 6_000,
+    rescueAttempted: false
+  }), 'recover-once');
+});
+
+test('terminal QQ guard recovers once only for the still-registered queue head', () => {
+  assert.equal(planQqGuardTerminalRecovery({
+    playerKey: 'qqmusic',
+    guardState: 'terminalFailure',
+    guardId: 7,
+    queueHeadIdentity: 'qqmusic|id:shelter',
+    registeredGuardIdentity: 'qqmusic|id:shelter',
+    registeredGuardId: 7,
+    ownershipIdentity: '',
+    recoveryAttempted: false
+  }), 'recover-once');
+  assert.equal(planQqGuardTerminalRecovery({
+    playerKey: 'qqmusic',
+    guardState: 'terminalFailure',
+    guardId: 7,
+    queueHeadIdentity: 'qqmusic|id:shelter',
+    registeredGuardIdentity: 'qqmusic|id:shelter',
+    registeredGuardId: 7,
+    ownershipIdentity: 'qqmusic|id:shelter',
+    recoveryAttempted: true
+  }), 'stop');
+  assert.equal(planQqGuardTerminalRecovery({
+    playerKey: 'qqmusic',
+    guardState: 'terminalFailure',
+    guardId: 7,
+    queueHeadIdentity: 'qqmusic|id:shelter',
+    registeredGuardIdentity: 'qqmusic|id:shelter',
+    registeredGuardId: 8,
+    ownershipIdentity: '',
+    recoveryAttempted: false
+  }), 'none');
+  assert.equal(planQqGuardTerminalRecovery({
+    playerKey: 'qqmusic',
+    guardState: 'terminalFailure',
+    guardId: 6,
+    queueHeadIdentity: 'qqmusic|id:mirror',
+    registeredGuardIdentity: 'qqmusic|id:shelter',
+    registeredGuardId: 6,
+    ownershipIdentity: '',
+    recoveryAttempted: false
+  }), 'none');
+  assert.equal(planQqGuardTerminalRecovery({
+    playerKey: 'netease',
+    guardState: 'terminalFailure',
+    guardId: 7,
+    queueHeadIdentity: 'qqmusic|id:shelter',
+    registeredGuardIdentity: 'qqmusic|id:shelter',
+    registeredGuardId: 7,
+    ownershipIdentity: '',
+    recoveryAttempted: false
+  }), 'none');
+});
+
+test('a new request object with the same song does not inherit recovery attempt state', () => {
+  const previousRequest = {
+    Id: 'same-song',
+    SongName: 'Same Song',
+    PlayerKey: 'qqmusic'
+  };
+  const newRequest = {
+    Id: 'same-song',
+    SongName: 'Same Song',
+    PlayerKey: 'qqmusic'
+  };
+
+  assert.equal(
+    shouldRetainQqGuardedCompletionAttempt(previousRequest, previousRequest),
+    true
+  );
+  assert.equal(
+    shouldRetainQqGuardedCompletionAttempt(previousRequest, newRequest),
+    false
+  );
+});
+
+test('QQ completion ownership requires the exact marker reference', () => {
+  const marker = {};
+  assert.equal(ownsQqGuardedCompletion({
+    playerKey: 'qqmusic',
+    marker,
+    expectedMarker: marker
+  }), true);
+  assert.equal(ownsQqGuardedCompletion({
+    playerKey: 'qqmusic',
+    marker: {},
+    expectedMarker: marker
+  }), false);
+  assert.equal(ownsQqGuardedCompletion({
+    playerKey: 'netease',
+    marker,
+    expectedMarker: marker
+  }), false);
+});
+
+test('QQ guarded completion gives manual control at the 8 second boundary', () => {
+  assert.equal(planQqGuardedCompletionRecovery({
+    playerKey: 'qqmusic',
+    markerMatchesCurrent: true,
+    currentSongMismatched: true,
+    ageMs: QQ_GUARDED_COMPLETION_RECOVERY_WINDOW_MS,
+    rescueAttempted: false
+  }), 'manual-wins');
+  assert.equal(planQqGuardedCompletionRecovery({
+    playerKey: 'qqmusic',
+    markerMatchesCurrent: true,
+    currentSongMismatched: true,
+    ageMs: 20_000,
+    rescueAttempted: false
+  }), 'manual-wins');
+});
+
+test('already attempted QQ recovery stops without another automatic takeover', () => {
+  assert.equal(planQqGuardedCompletionRecovery({
+    playerKey: 'qqmusic',
+    markerMatchesCurrent: true,
+    currentSongMismatched: true,
+    ageMs: 6_000,
+    rescueAttempted: true
+  }), 'stop');
+});
+
+test('QQ recovery marker mismatch and non-QQ keep the manual path unchanged', () => {
+  assert.equal(planQqGuardedCompletionRecovery({
+    playerKey: 'qqmusic',
+    markerMatchesCurrent: false,
+    currentSongMismatched: true,
+    ageMs: 1_000,
+    rescueAttempted: false
+  }), 'none');
+  assert.equal(planQqGuardedCompletionRecovery({
+    playerKey: 'netease',
+    markerMatchesCurrent: true,
+    currentSongMismatched: true,
+    ageMs: 1_000,
+    rescueAttempted: false
+  }), 'none');
+  assert.equal(planImmediatePlaybackCommand({
+    playerKey: 'qqmusic',
+    mode: 'interrupt',
+    hasCurrentSong: true
+  }), 'InterruptSelected');
 });
 
 test('unconfirmed managed action restores observed playback after timeout', () => {

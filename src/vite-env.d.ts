@@ -3,6 +3,7 @@
 interface Window {
   electronAPI?: {
     internalApiOrigin: string;
+    setWindowColorMode?: (mode: 'light' | 'dark') => void;
     getOverlayAlwaysOnTop?: () => boolean;
     setOverlayAlwaysOnTop?: (enabled: boolean) => boolean;
     openAdmin: (tab?: string) => void;

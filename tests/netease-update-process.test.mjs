@@ -4,6 +4,7 @@ import {
   isTransientNeteaseFileLock,
   NeteaseProcessControlError,
   NeteaseUpdateProcessController,
+  WindowsNeteaseProcessRuntime,
   parseNeteaseProcessList,
   selectNeteaseRestartExecutable,
   selectNeteaseRootProcessIds
@@ -70,6 +71,22 @@ function createController(runtime, logs = []) {
   });
 }
 
+function createWindowsRuntime(responses, logs = []) {
+  const invocations = [];
+  let responseIndex = 0;
+  const runtime = new WindowsNeteaseProcessRuntime({
+    platform: 'win32',
+    onLog: message => logs.push(message),
+    execute: async (executable, args, timeout) => {
+      invocations.push({ executable, args, timeout });
+      const response = responses[responseIndex++];
+      if (response instanceof Error) throw response;
+      return response;
+    }
+  });
+  return { runtime, invocations };
+}
+
 test('parses PowerShell process JSON in object and array forms', () => {
   assert.deepEqual(parseNeteaseProcessList(JSON.stringify({
     processId: 10,
@@ -85,6 +102,64 @@ test('parses PowerShell process JSON in object and array forms', () => {
     () => parseNeteaseProcessList('not-json'),
     NeteaseProcessControlError
   );
+});
+
+test('prefers CIM and returns an empty list for no matching process', async () => {
+  const { runtime, invocations } = createWindowsRuntime([
+    { stdout: '[]', stderr: '' }
+  ]);
+  assert.deepEqual(await runtime.listProcesses(), []);
+  assert.equal(invocations.length, 1);
+  assert.match(
+    invocations[0].args.at(-1),
+    /Get-CimInstance Win32_Process[\s\S]*-ErrorAction Stop/
+  );
+  assert.doesNotMatch(invocations[0].args.at(-1), /Get-WmiObject/);
+});
+
+test('uses the WMI fallback when the CIM query fails', async () => {
+  const logs = [];
+  const expected = [processInfo(321, 12, '"cloudmusic.exe" --play')];
+  const { runtime, invocations } = createWindowsRuntime([
+    new Error('Get-CimInstance failed: CimCmdlets unavailable'),
+    { stdout: JSON.stringify(expected), stderr: '' }
+  ], logs);
+
+  assert.deepEqual(await runtime.listProcesses(), expected);
+  assert.equal(invocations.length, 2);
+  assert.match(
+    invocations[0].args.at(-1),
+    /Get-CimInstance Win32_Process[\s\S]*-ErrorAction Stop/
+  );
+  assert.match(
+    invocations[1].args.at(-1),
+    /Get-WmiObject -Class Win32_Process[\s\S]*-ErrorAction Stop/
+  );
+  assert.doesNotMatch(invocations[1].args.at(-1), /Get-CimInstance/);
+  assert.ok(logs.some(message => message.includes('备用路径')));
+});
+
+test('reports both query failures without exposing local paths', async () => {
+  const logs = [];
+  const { runtime, invocations } = createWindowsRuntime([
+    new Error('CimCmdlets failure at C:\\Users\\private-user\\powershell.exe'),
+    new Error('WMI provider unavailable')
+  ], logs);
+
+  await assert.rejects(
+    runtime.listProcesses(),
+    error => {
+      assert.ok(error instanceof NeteaseProcessControlError);
+      assert.match(error.message, /CIM/);
+      assert.match(error.message, /WMI/);
+      assert.match(error.message, /CimCmdlets failure/);
+      assert.match(error.message, /WMI provider unavailable/);
+      assert.doesNotMatch(error.message, /private-user/);
+      return true;
+    }
+  );
+  assert.equal(invocations.length, 2);
+  assert.ok(logs.some(message => message.includes('切换到 WMI')));
 });
 
 test('selects the main executable and only root process trees', () => {

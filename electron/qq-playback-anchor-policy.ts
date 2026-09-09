@@ -12,6 +12,8 @@ export interface QqAnchorObservationOptions {
   playerKey: string;
   /** Only the connector can confirm that the native playback cursor exists. */
   playbackAnchorReady: boolean;
+  /** Omitted by older connectors: retain their strict native-cursor guard. */
+  requiresPlaybackAnchor?: boolean;
   deferredIdentity: string;
   queueHeadIdentity: string;
   retryAttempted: boolean;
@@ -49,8 +51,10 @@ export function planQqDeferredPlaybackAction(
 export function shouldDeferQqQueueHeadUntilAnchor(options: {
   playerKey: string;
   playbackAnchorReady: boolean;
+  requiresPlaybackAnchor?: boolean;
 }): boolean {
   return options.playerKey === 'qqmusic'
+    && options.requiresPlaybackAnchor !== false
     && options.playbackAnchorReady !== true;
 }
 
@@ -67,6 +71,7 @@ export function planQqAnchorObservation(
   if (!options.deferredIdentity) return 'none';
   if (
     options.playerKey !== 'qqmusic'
+    || options.requiresPlaybackAnchor === false
     || options.queueHeadIdentity !== options.deferredIdentity
   ) {
     return 'clear';
@@ -91,10 +96,12 @@ export function shouldSkipDuplicateQqAnchorInsert(options: {
   songIdentity: string;
   deferredIdentity: string;
   playbackAnchorReady: boolean;
+  requiresPlaybackAnchor?: boolean;
   retryAttempted: boolean;
   retryInFlight: boolean;
 }): boolean {
   return options.playerKey === 'qqmusic'
+    && options.requiresPlaybackAnchor !== false
     && Boolean(options.songIdentity)
     && options.songIdentity === options.deferredIdentity
     && (
@@ -115,10 +122,12 @@ export function shouldSuppressQqQueueHeadPlayNow(options: {
   queueHeadIdentity: string;
   deferredIdentity: string;
   playbackAnchorReady: boolean;
+  requiresPlaybackAnchor?: boolean;
   retryAttempted: boolean;
   retryInFlight: boolean;
 }): boolean {
   return options.playerKey === 'qqmusic'
+    && options.requiresPlaybackAnchor !== false
     && Boolean(options.queueHeadIdentity)
     && options.queueHeadIdentity === options.deferredIdentity
     && (

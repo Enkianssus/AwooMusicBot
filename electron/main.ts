@@ -73,6 +73,7 @@ import {
   normalizeLearnedGifts,
   normalizeGiftRequestRequirements,
   parseBilibiliGiftCreditEvents,
+  parseBilibiliGiftLearningHint,
   rememberLearnedGift,
   type BilibiliGiftCreditEvent,
   type BilibiliGiftParseDiagnostic,
@@ -1220,11 +1221,27 @@ const MAX_GIFT_LEARNING_SESSION_ITEMS = 20;
 let giftLearningStartedAt = 0;
 let giftLearningExpiresAt = 0;
 let giftLearningCaptured: LearnedGift[] = [];
+let giftLearningDiagnostics = createGiftLearningDiagnostics();
 let giftLibrarySaveTimer: NodeJS.Timeout | null = null;
 let recentRejects: { id: number, user: any, reason: string }[] = [];
 
 function isGiftLearningActive(now = Date.now()): boolean {
   return giftLearningExpiresAt > now;
+}
+
+function createGiftLearningDiagnostics() {
+  return {
+    messagesReceived: 0,
+    giftMessagesReceived: 0,
+    parsedGifts: 0,
+    lastMessageAt: null as number | null,
+    lastGiftAt: null as number | null,
+    lastIssue: '',
+    lastCommand: '',
+    commandCounts: {} as Record<string, number>,
+    packetCounts: {} as Record<string, number>,
+    unrecognizedMessages: 0
+  };
 }
 
 function getGiftLearningState(now = Date.now()) {
@@ -1236,7 +1253,12 @@ function getGiftLearningState(now = Date.now()) {
       giftLearningCaptured,
       MAX_GIFT_LEARNING_SESSION_ITEMS
     ),
-    knownGifts: normalizeLearnedGifts(appConfig.learnedGifts)
+    knownGifts: normalizeLearnedGifts(appConfig.learnedGifts),
+    diagnostics: {
+      ...giftLearningDiagnostics,
+      commandCounts: { ...giftLearningDiagnostics.commandCounts },
+      packetCounts: { ...giftLearningDiagnostics.packetCounts }
+    }
   };
 }
 
@@ -1248,13 +1270,23 @@ function scheduleGiftLibrarySave(): void {
   }, 300);
 }
 
-function startGiftLearning(): void {
+function startGiftLearning(): { success: boolean; message?: string } {
+  if (appConfig.roomConnectionEnabled !== true || biliRoomState.status !== 'connected') {
+    return {
+      success: false,
+      message: biliRoomState.status === 'connecting'
+        ? '直播间还在连接中，请等弹幕连接成功后再开始监听礼物'
+        : '请先在控制台连接直播间，再开始监听礼物'
+    };
+  }
   const now = Date.now();
   giftLearningStartedAt = now;
   giftLearningExpiresAt = now + GIFT_LEARNING_DURATION_MS;
   giftLearningCaptured = [];
+  giftLearningDiagnostics = createGiftLearningDiagnostics();
   writeLog('[礼物学习] 已开始监听直播间礼物，持续 60 秒', 'Magenta');
   setGlobalStatus('🎁 正在监听直播间礼物…');
+  return { success: true };
 }
 
 function stopGiftLearning(): void {
@@ -1273,7 +1305,7 @@ function clearLearnedGiftLibrary(): void {
   writeLog('[礼物学习] 已清空本地礼物缓存', 'DarkGray');
 }
 
-function captureGiftForLearning(event: BilibiliGiftCreditEvent): void {
+function captureGiftForLearning(event: Pick<BilibiliGiftCreditEvent, 'giftId' | 'giftName' | 'quantity'>): void {
   if (!isGiftLearningActive()) return;
   const hadGift = giftLearningCaptured.some(item => (
     event.giftId
@@ -1626,9 +1658,14 @@ async function connectToLiveRoom(
         {
           uid: biliUid || 0,
           roomid: realRoomId,
-          protover: 3,
+          // This complete web-client auth combination was verified to receive
+          // SEND_GIFT_V2; the previous combination received only widget/rank updates.
+          protover: 2,
           buvid: finalBuvid,
           support_ack: true,
+          platform: 'web',
+          queue_uuid: randomBytes(4).toString('hex'),
+          scene: 'room',
           type: 2,
           key: token
         },
@@ -1881,23 +1918,53 @@ function startBiliWebSocket(
   }
 }
 
+function reportGiftTransportIssue(message: string): void {
+  if (!isGiftLearningActive()) return;
+  if (giftLearningDiagnostics.lastIssue === message) return;
+  giftLearningDiagnostics.lastIssue = message;
+  writeLog(`[礼物监听] ${message}`, 'DarkGray');
+}
+
 function parseBiliPacket(buffer: Buffer) {
   let offset = 0;
   while (offset < buffer.length) {
-    if (buffer.length - offset < 16) break;
+    if (buffer.length - offset < 16) {
+      reportGiftTransportIssue('收到不完整的直播消息帧');
+      break;
+    }
     const packetLen = buffer.readInt32BE(offset);
     const headerLen = buffer.readInt16BE(offset + 4);
     const protoVer = buffer.readInt16BE(offset + 6);
     const op = buffer.readInt32BE(offset + 8);
 
     if (packetLen < 16 || headerLen < 16 || headerLen > packetLen
-      || offset + packetLen > buffer.length) break;
+      || offset + packetLen > buffer.length) {
+      reportGiftTransportIssue('直播消息帧的长度无效');
+      break;
+    }
     const payload = buffer.subarray(offset + headerLen, offset + packetLen);
 
+    if (isGiftLearningActive()) {
+      const key = `${op}/${protoVer}`;
+      const counts = giftLearningDiagnostics.packetCounts;
+      if (counts[key] !== undefined || Object.keys(counts).length < 32) {
+        counts[key] = (counts[key] || 0) + 1;
+      }
+    }
+
     if (op === 5) {
-      if (protoVer === 3) { try { parseBiliPacket(zlib.brotliDecompressSync(payload)); } catch {} }
-      else if (protoVer === 2) { try { parseBiliPacket(zlib.unzipSync(payload)); } catch {} }
-      else { try { handleRawDanmaku(JSON.parse(payload.toString('utf-8'))); } catch {} }
+      if (protoVer === 3) {
+        try { parseBiliPacket(zlib.brotliDecompressSync(payload)); }
+        catch { reportGiftTransportIssue('直播消息解压失败（Brotli）'); }
+      } else if (protoVer === 2) {
+        try { parseBiliPacket(zlib.unzipSync(payload)); }
+        catch { reportGiftTransportIssue('直播消息解压失败（zlib）'); }
+      } else {
+        try { handleRawDanmaku(JSON.parse(payload.toString('utf-8'))); }
+        catch { reportGiftTransportIssue('直播消息内容读取失败'); }
+      }
+    } else if (op !== 3 && op !== 8) {
+      reportGiftTransportIssue(`收到尚未支持的直播数据包（op=${op}，协议=${protoVer}）`);
     }
     offset += packetLen;
   }
@@ -2007,6 +2074,9 @@ async function processDanmakuCommandQueue(): Promise<void> {
 const recentGiftParseDiagnostics = new Map<string, number>();
 
 function reportGiftParseDiagnostic(diagnostic: BilibiliGiftParseDiagnostic): void {
+  if (isGiftLearningActive()) {
+    giftLearningDiagnostics.lastIssue = `礼物解析未完成：${diagnostic.reason}（${diagnostic.count} 项）`;
+  }
   const now = Date.now();
   const previous = recentGiftParseDiagnostics.get(diagnostic.reason);
   if (previous !== undefined && now - previous < 60_000) return;
@@ -2015,7 +2085,13 @@ function reportGiftParseDiagnostic(diagnostic: BilibiliGiftParseDiagnostic): voi
 }
 
 function handleGiftEvent(doc: unknown): void {
+  if (isGiftLearningActive()) {
+    giftLearningDiagnostics.giftMessagesReceived++;
+    giftLearningDiagnostics.lastGiftAt = Date.now();
+    giftLearningDiagnostics.lastIssue = '';
+  }
   const events = parseBilibiliGiftCreditEvents(doc, reportGiftParseDiagnostic);
+  if (isGiftLearningActive()) giftLearningDiagnostics.parsedGifts += events.length;
   if (appConfig.sysConfig?.ShowAllDanmaku) {
     writeLog(`[礼物协议] 收到 ${events.length} 项有效礼物`, 'DarkGray');
   }
@@ -2023,12 +2099,13 @@ function handleGiftEvent(doc: unknown): void {
 }
 
 function applyGiftCreditEvent(event: BilibiliGiftCreditEvent): void {
+  // Learning records gift metadata, independently of whether this transaction
+  // has already granted credits before the user opened the learning window.
+  captureGiftForLearning(event);
   if (!claimGiftEvent(event)) {
     writeLog('[礼物点歌] 已忽略重复礼物事件', 'DarkGray');
     return;
   }
-
-  captureGiftForLearning(event);
 
   const { tier, requirement } = getGiftRequirementForGuardLevel(
     event.guardLevel
@@ -2046,10 +2123,59 @@ function applyGiftCreditEvent(event: BilibiliGiftCreditEvent): void {
   setGlobalStatus(`🎁 ${event.userName} 获得 ${next - previous} 次点歌`);
 }
 
-function handleRawDanmaku(doc: any) {
-  const cmd = typeof doc?.cmd === 'string' ? doc.cmd.split(':', 1)[0] : '';
+function handleRawDanmaku(doc: any, depth = 0) {
+  // Some gateways group JSON commands in one payload. Route each document;
+  // never interpret activity-widget progress as a gift transaction.
+  if (Array.isArray(doc)) {
+    if (depth >= 4 || doc.length > 2048) {
+      reportGiftTransportIssue('直播批量消息超过解析限制');
+      return;
+    }
+    for (const item of doc) {
+      try { handleRawDanmaku(item, depth + 1); }
+      catch { reportGiftTransportIssue('直播批量消息中有一项读取失败'); }
+    }
+    return;
+  }
+  const cmd = typeof doc?.cmd === 'string' ? doc.cmd.split(':', 1)[0].trim().toUpperCase() : '';
+  if (!cmd) {
+    if (isGiftLearningActive()) {
+      giftLearningDiagnostics.unrecognizedMessages++;
+      reportGiftTransportIssue('收到没有消息类型的直播数据');
+    }
+    return;
+  }
+  if (cmd && isGiftLearningActive()) {
+    giftLearningDiagnostics.messagesReceived++;
+    giftLearningDiagnostics.lastMessageAt = Date.now();
+    const safeCommand = /^[A-Z][A-Z0-9_]{0,63}$/.test(cmd)
+      && !/COOKIE|TOKEN|SESSDATA|BILI_JCT|AUTHORIZATION/.test(cmd);
+    const key = safeCommand ? cmd : 'UNRECOGNIZED_COMMAND';
+    const counts = giftLearningDiagnostics.commandCounts;
+    if (counts[key] !== undefined || Object.keys(counts).length < 64) {
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    if (safeCommand && (cmd.includes('GIFT') || cmd === 'COMBO_SEND')) {
+      giftLearningDiagnostics.lastCommand = cmd;
+    }
+  }
   if (cmd === 'SEND_GIFT' || cmd === 'SEND_GIFT_V2') {
-    handleGiftEvent(doc);
+    handleGiftEvent({ ...doc, cmd });
+    return;
+  }
+  if (cmd === 'COMBO_SEND') {
+    if (isGiftLearningActive()) {
+      giftLearningDiagnostics.giftMessagesReceived++;
+      giftLearningDiagnostics.lastGiftAt = Date.now();
+      const hint = parseBilibiliGiftLearningHint({ ...doc, cmd });
+      if (hint) {
+        giftLearningDiagnostics.lastIssue = '';
+        giftLearningDiagnostics.parsedGifts++;
+        captureGiftForLearning(hint);
+      } else {
+        giftLearningDiagnostics.lastIssue = '收到礼物连击提示，但未识别到礼物名称和 ID';
+      }
+    }
     return;
   }
   if (cmd.startsWith("DANMU_MSG")) {
@@ -5278,7 +5404,14 @@ async function startBackendServer(): Promise<void> {
       }
       if (req.method === 'POST') {
         const body = await readJsonRequest(req);
-        if (body.action === 'start') startGiftLearning();
+        if (body.action === 'start') {
+          const result = startGiftLearning();
+          if (!result.success) {
+            res.writeHead(409);
+            res.end(JSON.stringify({ ...getGiftLearningState(), ...result }));
+            return;
+          }
+        }
         else if (body.action === 'stop') stopGiftLearning();
         else if (body.action === 'clear-cache') clearLearnedGiftLibrary();
         else {

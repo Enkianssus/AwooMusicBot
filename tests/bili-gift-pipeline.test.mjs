@@ -11,7 +11,9 @@ import * as policy from '../electron/gift-request-credit-policy.ts';
 const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8');
 const parsed = ts.createSourceFile('main.ts', main, ts.ScriptTarget.Latest, true);
 const names = ['parseBiliPacket', 'handleRawDanmaku', 'handleGiftEvent', 'applyGiftCreditEvent',
-  'claimGiftEvent', 'captureGiftForLearning', 'getGiftRequirementForGuardLevel', 'reportGiftParseDiagnostic'];
+  'claimGiftEvent', 'captureGiftForLearning', 'getGiftRequirementForGuardLevel', 'reportGiftParseDiagnostic',
+  'isGiftLearningActive', 'startGiftLearning', 'stopGiftLearning', 'getGiftLearningState',
+  'createGiftLearningDiagnostics', 'reportGiftTransportIssue'];
 const source = names.map(name => {
   const declaration = parsed.statements.find(value => ts.isFunctionDeclaration(value) && value.name?.text === name);
   assert.ok(declaration, name);
@@ -21,25 +23,28 @@ const javascript = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS }
 }).outputText;
 
-function fixture() {
+function fixture({ learning = true, connection = 'connected' } = {}) {
   let now = 2_000_000;
   const logs = [], commands = [];
   const context = vm.createContext({
     ...policy, Buffer, zlib, Date: { now: () => now },
     giftRequestCredits: new Map(), recentGiftEvents: new Map(), recentGiftParseDiagnostics: new Map(),
     giftLearningCaptured: [], MAX_GIFT_LEARNING_SESSION_ITEMS: 20,
-    biliRoomState: { realRoomId: '42' },
-    appConfig: { roomId: '42', learnedGifts: [], sysConfig: {
+    giftLearningStartedAt: 0, giftLearningExpiresAt: 0, GIFT_LEARNING_DURATION_MS: 60_000,
+    biliRoomState: { realRoomId: '42', status: connection },
+    appConfig: { roomId: '42', roomConnectionEnabled: connection !== 'disconnected', learnedGifts: [], sysConfig: {
       ShowAllDanmaku: true, GiftRequestRequirements: {
         Normal: { giftId: '1' }, Captain: { giftId: '2' },
         Admiral: { giftId: '3' }, Governor: { giftId: '4' }
       }
     } },
-    isGiftLearningActive: () => true, scheduleGiftLibrarySave() {},
+    scheduleGiftLibrarySave() {},
     writeLog: message => logs.push(message), setGlobalStatus() {},
     enqueueDanmakuCommand: (user, message) => commands.push({ user, message })
   });
   new vm.Script(javascript).runInContext(context);
+  context.giftLearningDiagnostics = context.createGiftLearningDiagnostics();
+  if (learning) context.startGiftLearning();
   return { context, logs, commands, advance: milliseconds => { now += milliseconds; } };
 }
 
@@ -184,4 +189,137 @@ test('invalid socket headers and unsupported commands cannot grant gifts', () =>
   f.context.handleRawDanmaku(null);
   f.context.handleRawDanmaku({ cmd: {}, data: {} });
   assert.equal(f.context.giftRequestCredits.size, 0);
+});
+
+test('learning only starts after the room is connected, then stops capturing at expiry', () => {
+  for (const connection of ['disconnected', 'connecting', 'error']) {
+    const f = fixture({ learning: false, connection });
+    assert.equal(f.context.startGiftLearning().success, false);
+    assert.equal(f.context.getGiftLearningState().active, false);
+    assert.equal(f.context.giftLearningExpiresAt, 0);
+  }
+  const f = fixture({ learning: false });
+  assert.equal(f.context.startGiftLearning().success, true);
+  f.context.handleRawDanmaku(v2([gift({ tid: 'before-expiry' })]));
+  assert.equal(f.context.getGiftLearningState().capturedGifts.length, 1);
+  f.advance(60_001);
+  f.context.handleRawDanmaku(v2([gift({ id: 2, tid: 'after-expiry' })]));
+  assert.equal(f.context.getGiftLearningState().active, false);
+  assert.equal(f.context.getGiftLearningState().capturedGifts.length, 1);
+});
+
+test('learning a previously credited transaction does not grant duplicate credits', () => {
+  const f = fixture({ learning: false });
+  const doc = v2([gift({ quantity: 3 })]);
+  f.context.handleRawDanmaku(doc);
+  assert.equal(f.context.giftRequestCredits.get('9007199254740993'), 3);
+  assert.equal(f.context.appConfig.learnedGifts.length, 0);
+  f.context.startGiftLearning();
+  f.context.handleRawDanmaku(doc);
+  assert.equal(f.context.getGiftLearningState().capturedGifts.length, 1);
+  assert.equal(f.context.giftRequestCredits.get('9007199254740993'), 3);
+});
+
+test('combo hints teach gift metadata without granting cumulative credits', () => {
+  const f = fixture();
+  f.context.handleRawDanmaku({ cmd: 'COMBO_SEND', data: {} });
+  assert.notEqual(f.context.getGiftLearningState().diagnostics.lastIssue, '');
+  const doc = { cmd: 'COMBO_SEND:1', data: {
+    gift_id: 31036, gift_name: '测试礼物', gift_num: 0, combo_num: 99,
+    uid: 'private-sender', uname: 'private-name'
+  } };
+  f.context.handleRawDanmaku(doc);
+  f.context.handleRawDanmaku(doc);
+  assert.equal(f.context.giftRequestCredits.size, 0);
+  const state = f.context.getGiftLearningState();
+  assert.equal(state.capturedGifts.length, 1);
+  assert.equal(state.capturedGifts[0].giftId, '31036');
+  assert.equal(state.capturedGifts[0].lastQuantity, 99);
+  assert.equal(state.diagnostics.giftMessagesReceived, 3);
+  assert.equal(state.diagnostics.lastIssue, '');
+  assert.equal(state.diagnostics.lastCommand, 'COMBO_SEND');
+  assert(!JSON.stringify(state).includes('private-'));
+  f.context.stopGiftLearning();
+  f.context.handleRawDanmaku({ cmd: 'COMBO_SEND', data: { gift_id: 7, gift_name: '停止后的礼物' } });
+  assert.equal(f.context.appConfig.learnedGifts.length, 1);
+});
+
+test('learning diagnostics distinguish ordinary messages, gift parse failures and unreadable frames', () => {
+  const f = fixture();
+  f.context.handleRawDanmaku({ cmd: 'ONLINE_RANK_COUNT', data: {} });
+  assert.equal(f.context.getGiftLearningState().diagnostics.messagesReceived, 1);
+  assert.equal(f.context.getGiftLearningState().diagnostics.giftMessagesReceived, 0);
+  f.context.handleRawDanmaku({ cmd: 'SEND_GIFT_V2', data: { pb: 'PRIVATE-BAD-DATA!' } });
+  let diagnostics = f.context.getGiftLearningState().diagnostics;
+  assert.equal(diagnostics.giftMessagesReceived, 1);
+  assert.equal(diagnostics.parsedGifts, 0);
+  assert.match(diagnostics.lastIssue, /invalid-base64/);
+  f.context.parseBiliPacket(packet(Buffer.from('PRIVATE-BAD-DATA!'), 3));
+  diagnostics = f.context.getGiftLearningState().diagnostics;
+  assert.match(diagnostics.lastIssue, /解压失败/);
+  assert(!JSON.stringify(diagnostics).includes('PRIVATE'));
+  assert(f.logs.every(log => !log.includes('PRIVATE')));
+  f.context.startGiftLearning();
+  assert.equal(f.context.getGiftLearningState().diagnostics.messagesReceived, 0);
+  assert.equal(f.context.getGiftLearningState().diagnostics.lastIssue, '');
+});
+
+test('compressed JSON command batches route gifts even after an invalid sibling', () => {
+  const f = fixture();
+  const batch = [
+    { cmd: 'DANMU_MSG', info: null },
+    { cmd: 'ONLINE_RANK_COUNT', data: {} },
+    { ...v2([gift({ quantity: 2 })]), cmd: ' SEND_GIFT_V2:1' }
+  ];
+  const inner = packet(Buffer.from(JSON.stringify(batch)));
+  const frame = packet(zlib.brotliCompressSync(inner), 3);
+  f.context.parseBiliPacket(frame);
+  assert.equal(f.context.giftRequestCredits.get('9007199254740993'), 2);
+  assert.equal(f.context.getGiftLearningState().capturedGifts.length, 1);
+  const diagnostics = f.context.getGiftLearningState().diagnostics;
+  assert.equal(diagnostics.messagesReceived, 3);
+  assert.equal(diagnostics.commandCounts.SEND_GIFT_V2, 1);
+  assert.equal(diagnostics.packetCounts['5/3'], 1);
+  assert.equal(diagnostics.packetCounts['5/0'], 1);
+  f.context.parseBiliPacket(frame);
+  assert.equal(f.context.giftRequestCredits.get('9007199254740993'), 2);
+});
+
+test('gift-star widget progress is diagnostic metadata and never a gift transaction', () => {
+  const f = fixture();
+  f.context.handleRawDanmaku({ cmd: 'WIDGET_GIFT_STAR_PROCESS_V2', data: {
+    process_list: [{ gift_id: 31036, gift_name: '礼物星球', completed_num: 50 }],
+    private_body: 'PRIVATE-CONTENT'
+  } });
+  const state = f.context.getGiftLearningState();
+  assert.equal(state.diagnostics.messagesReceived, 1);
+  assert.equal(state.diagnostics.giftMessagesReceived, 0);
+  assert.equal(state.diagnostics.parsedGifts, 0);
+  assert.equal(state.diagnostics.commandCounts.WIDGET_GIFT_STAR_PROCESS_V2, 1);
+  assert.equal(state.capturedGifts.length, 0);
+  assert.equal(f.context.giftRequestCredits.size, 0);
+  assert(!JSON.stringify(state).includes('PRIVATE-CONTENT'));
+  state.diagnostics.commandCounts.WIDGET_GIFT_STAR_PROCESS_V2 = 999;
+  assert.equal(f.context.getGiftLearningState().diagnostics.commandCounts.WIDGET_GIFT_STAR_PROCESS_V2, 1);
+});
+
+test('unrecognized JSON and operations are visible with bounded metadata and reset between sessions', () => {
+  const f = fixture();
+  f.context.parseBiliPacket(packet(Buffer.from(JSON.stringify({ private_body: 'PRIVATE-CONTENT' }))));
+  const unknownPacket = packet(Buffer.from('PRIVATE-CONTENT'));
+  unknownPacket.writeInt32BE(1000, 8);
+  f.context.parseBiliPacket(unknownPacket);
+  f.context.handleRawDanmaku({ cmd: 'TOKEN_PRIVATE_CONTENT' });
+  for (let i = 0; i < 100; i++) f.context.handleRawDanmaku({ cmd: `COMMAND_${i}` });
+  const diagnostics = f.context.getGiftLearningState().diagnostics;
+  assert.equal(diagnostics.unrecognizedMessages, 1);
+  assert.equal(diagnostics.packetCounts['1000/0'], 1);
+  assert.match(diagnostics.lastIssue, /op=1000/);
+  assert.equal(Object.keys(diagnostics.commandCounts).length, 64);
+  assert(!JSON.stringify(diagnostics).includes('PRIVATE'));
+  f.context.startGiftLearning();
+  const fresh = f.context.getGiftLearningState().diagnostics;
+  assert.equal(fresh.unrecognizedMessages, 0);
+  assert.equal(Object.keys(fresh.commandCounts).length, 0);
+  assert.equal(Object.keys(fresh.packetCounts).length, 0);
 });

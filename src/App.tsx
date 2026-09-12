@@ -202,13 +202,54 @@ interface LearnedGift {
     lastQuantity: number;
 }
 
+interface GiftLearningDiagnostics {
+    messagesReceived: number;
+    giftMessagesReceived: number;
+    parsedGifts: number;
+    commandCounts: Record<string, number>;
+    packetCounts: Record<string, number>;
+    unrecognizedMessages: number;
+    lastMessageAt: number | null;
+    lastGiftAt: number | null;
+    lastIssue: string;
+    lastCommand: string;
+}
+
 interface GiftLearningState {
     active: boolean;
     startedAt: number | null;
     expiresAt: number | null;
     capturedGifts: LearnedGift[];
     knownGifts: LearnedGift[];
+    diagnostics?: GiftLearningDiagnostics;
 }
+
+const normalizeGiftLearningDiagnostics = (value: unknown): GiftLearningDiagnostics => {
+    const diagnostics = value && typeof value === 'object'
+        ? value as Record<string, unknown>
+        : {};
+    const count = (entry: unknown) => typeof entry === 'number' && Number.isFinite(entry)
+        ? Math.max(0, Math.floor(entry))
+        : 0;
+    const timestamp = (entry: unknown) => typeof entry === 'number' && Number.isFinite(entry) && entry > 0
+        ? entry
+        : null;
+    const counts = (entry: unknown): Record<string, number> => entry && typeof entry === 'object' && !Array.isArray(entry)
+        ? Object.fromEntries(Object.entries(entry).map(([key, total]) => [key, count(total)]))
+        : {};
+    return {
+        messagesReceived: count(diagnostics.messagesReceived),
+        giftMessagesReceived: count(diagnostics.giftMessagesReceived),
+        parsedGifts: count(diagnostics.parsedGifts),
+        commandCounts: counts(diagnostics.commandCounts),
+        packetCounts: counts(diagnostics.packetCounts),
+        unrecognizedMessages: count(diagnostics.unrecognizedMessages),
+        lastMessageAt: timestamp(diagnostics.lastMessageAt),
+        lastGiftAt: timestamp(diagnostics.lastGiftAt),
+        lastIssue: typeof diagnostics.lastIssue === 'string' ? diagnostics.lastIssue : '',
+        lastCommand: typeof diagnostics.lastCommand === 'string' ? diagnostics.lastCommand : ''
+    };
+};
 
 const GIFT_REQUEST_TIER_OPTIONS: ReadonlyArray<{
     key: GiftRequestTier;
@@ -2829,7 +2870,8 @@ const AdminWidget: React.FC = () => {
                 startedAt: result.startedAt ?? null,
                 expiresAt: result.expiresAt ?? null,
                 capturedGifts: Array.isArray(result.capturedGifts) ? result.capturedGifts : [],
-                knownGifts: Array.isArray(result.knownGifts) ? result.knownGifts : []
+                knownGifts: Array.isArray(result.knownGifts) ? result.knownGifts : [],
+                diagnostics: normalizeGiftLearningDiagnostics(result.diagnostics)
             };
             setGiftLearningNow(Date.now());
             setConfig((previous: any) => previous ? ({
@@ -3049,6 +3091,12 @@ const AdminWidget: React.FC = () => {
         Math.ceil((Number(giftLearning.expiresAt || 0) - giftLearningNow) / 1000)
     );
     const giftLearningActive = giftLearning.active && giftLearningRemainingSeconds > 0;
+    const giftLearningDiagnostics = normalizeGiftLearningDiagnostics(giftLearning.diagnostics);
+    const showGiftLearningDiagnostics = giftLearningActive || Number(giftLearning.startedAt) > 0;
+    const giftLearningConnected = roomConnection.status === 'connected';
+    const giftLearningConnectionHint = roomConnection.status === 'connecting'
+        ? '正在连接直播间，请等连接成功后再开始监听。'
+        : '直播间尚未连接，请先在控制台连接直播间，再开始监听。';
     const knownGifts = Array.isArray(giftLearning.knownGifts)
         ? giftLearning.knownGifts
         : [];
@@ -4233,13 +4281,90 @@ const AdminWidget: React.FC = () => {
                                                 }`} />
                                                 <div className="min-w-0 flex-1">
                                                     <div className="text-sm font-bold text-gray-200">
-                                                        {giftLearningActive ? '正在等待直播间投喂礼物…' : '礼物学习模式'}
+                                                        {!giftLearningConnected
+                                                            ? (roomConnection.status === 'connecting' ? '等待直播间连接' : '请先连接直播间')
+                                                            : giftLearningActive ? '正在等待直播间投喂礼物…' : '礼物学习模式'}
                                                     </div>
                                                     <p className="text-xs text-gray-500 mt-1 leading-relaxed">
-                                                        点击开始后，在 60 秒内向当前直播间投喂想要设置的礼物。点歌机只缓存礼物名称、ID、数量和出现时间，不保存送礼人的账号信息。
+                                                        {giftLearningConnected
+                                                            ? '点击开始后，在 60 秒内向当前直播间投喂想要设置的礼物。点歌机只缓存礼物名称、ID、数量和出现时间，不保存送礼人的账号信息。'
+                                                            : giftLearningConnectionHint}
                                                     </p>
                                                 </div>
                                             </div>
+
+                                            {showGiftLearningDiagnostics && (
+                                                <div className="mt-4 rounded-lg border border-blue-500/20 bg-blue-500/5 p-3 text-xs">
+                                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                                        <span className="font-bold text-gray-300">本次监听</span>
+                                                        <span className={giftLearningConnected ? 'text-blue-300' : 'text-amber-300'}>
+                                                            {roomStatusMeta.label}
+                                                        </span>
+                                                    </div>
+                                                    {!giftLearningConnected && roomConnection.message && (
+                                                        <p className="mt-2 break-words text-amber-300">{roomConnection.message}</p>
+                                                    )}
+                                                    <dl className="mt-3 grid grid-cols-3 gap-2">
+                                                        <div>
+                                                            <dt className="text-gray-500">直播消息</dt>
+                                                            <dd className="mt-1 font-bold tabular-nums text-gray-200">{giftLearningDiagnostics.messagesReceived}</dd>
+                                                        </div>
+                                                        <div>
+                                                            <dt className="text-gray-500">礼物消息</dt>
+                                                            <dd className="mt-1 font-bold tabular-nums text-gray-200">{giftLearningDiagnostics.giftMessagesReceived}</dd>
+                                                        </div>
+                                                        <div>
+                                                            <dt className="text-gray-500">已识别礼物</dt>
+                                                            <dd className="mt-1 font-bold tabular-nums text-blue-300">{giftLearningDiagnostics.parsedGifts}</dd>
+                                                        </div>
+                                                    </dl>
+                                                    {giftLearningDiagnostics.lastCommand && (
+                                                        <p className="mt-3 break-words text-gray-500">最近礼物相关通知：{giftLearningDiagnostics.lastCommand}</p>
+                                                    )}
+                                                    {giftLearningDiagnostics.lastCommand === 'WIDGET_GIFT_STAR_PROCESS_V2' && giftLearningDiagnostics.giftMessagesReceived === 0 && (
+                                                        <p className="mt-2 leading-relaxed text-blue-300">这是礼物星球进度通知，尚未收到送礼明细。</p>
+                                                    )}
+                                                    {giftLearningDiagnostics.lastIssue && (
+                                                        <p className="mt-3 break-words text-amber-300">{giftLearningDiagnostics.lastIssue}</p>
+                                                    )}
+                                                    <details className="mt-3 border-t border-blue-500/15 pt-3">
+                                                        <summary className="cursor-pointer font-medium text-blue-300">监听诊断详情</summary>
+                                                        <div className="mt-3 grid gap-4 sm:grid-cols-2">
+                                                            <div className="min-w-0">
+                                                                <p className="font-bold text-gray-300">消息类型</p>
+                                                                {Object.keys(giftLearningDiagnostics.commandCounts).length > 0 ? (
+                                                                    <dl className="mt-2 space-y-1.5">
+                                                                        {Object.entries(giftLearningDiagnostics.commandCounts).sort(([left], [right]) => left.localeCompare(right)).map(([command, total]) => (
+                                                                            <div key={command} className="flex items-start justify-between gap-3">
+                                                                                <dt className="min-w-0 break-all text-gray-500">{command}</dt>
+                                                                                <dd className="shrink-0 tabular-nums text-gray-200">{total}</dd>
+                                                                            </div>
+                                                                        ))}
+                                                                    </dl>
+                                                                ) : (
+                                                                    <p className="mt-2 text-gray-500">暂无消息</p>
+                                                                )}
+                                                            </div>
+                                                            <div className="min-w-0">
+                                                                <p className="font-bold text-gray-300">数据包 <span className="font-normal text-gray-500">（操作码 / 协议）</span></p>
+                                                                {Object.keys(giftLearningDiagnostics.packetCounts).length > 0 ? (
+                                                                    <dl className="mt-2 space-y-1.5">
+                                                                        {Object.entries(giftLearningDiagnostics.packetCounts).sort(([left], [right]) => left.localeCompare(right)).map(([packet, total]) => (
+                                                                            <div key={packet} className="flex items-start justify-between gap-3">
+                                                                                <dt className="min-w-0 break-all text-gray-500">{packet}</dt>
+                                                                                <dd className="shrink-0 tabular-nums text-gray-200">{total}</dd>
+                                                                            </div>
+                                                                        ))}
+                                                                    </dl>
+                                                                ) : (
+                                                                    <p className="mt-2 text-gray-500">暂无数据包</p>
+                                                                )}
+                                                                <p className="mt-3 text-gray-500">未识别消息：<span className="tabular-nums text-gray-200">{giftLearningDiagnostics.unrecognizedMessages}</span></p>
+                                                            </div>
+                                                        </div>
+                                                    </details>
+                                                </div>
+                                            )}
 
                                             {knownGifts.length > 0 ? (
                                                 <div className="mt-4 space-y-2 max-h-72 overflow-y-auto pr-1">
@@ -4286,7 +4411,9 @@ const AdminWidget: React.FC = () => {
                                                 </div>
                                             ) : (
                                                 <div className="mt-4 rounded-lg border border-dashed border-white/10 px-4 py-5 text-center text-xs text-gray-500">
-                                                    {giftLearningActive
+                                                    {!giftLearningConnected
+                                                        ? '连接成功后，点击“开始监听礼物”进行学习。'
+                                                        : giftLearningActive
                                                         ? '还没有捕获到礼物，请在直播间投喂一次。'
                                                         : '暂时没有缓存的礼物，点击“开始监听礼物”进行学习。'}
                                                 </div>

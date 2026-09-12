@@ -248,6 +248,28 @@ export function parseBilibiliGiftCreditEvent(
   };
 }
 
+/** COMBO_SEND can teach gift metadata, but its cumulative count cannot grant credits. */
+export function parseBilibiliGiftLearningHint(
+  document: unknown
+): Pick<BilibiliGiftCreditEvent, 'giftId' | 'giftName' | 'quantity'> | null {
+  if (!document || typeof document !== 'object' || Array.isArray(document)) return null;
+  const envelope = document as Record<string, unknown>;
+  if (typeof envelope.cmd !== 'string' || envelope.cmd.split(':', 1)[0] !== 'COMBO_SEND') return null;
+  if (!envelope.data || typeof envelope.data !== 'object' || Array.isArray(envelope.data)) return null;
+  const data = envelope.data as Record<string, unknown>;
+  const rawId = data.gift_id ?? data.giftId;
+  if (typeof rawId === 'number' && !Number.isSafeInteger(rawId)) return null;
+  const giftId = normalizeIdentifier(rawId);
+  const giftName = normalizeIdentifier(data.gift_name ?? data.giftName);
+  if (!giftId && !giftName) return null;
+  return {
+    giftId,
+    giftName,
+    quantity: normalizeGiftQuantity(data.num ?? data.gift_num)
+      || normalizeGiftQuantity(data.combo_num ?? data.batch_combo_num ?? data.total_num)
+  };
+}
+
 export function addGiftRequestCredits(
   currentBalance: unknown,
   quantity: unknown

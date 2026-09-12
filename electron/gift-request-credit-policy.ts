@@ -1,3 +1,11 @@
+import { normalizeGiftQuantity } from './bili-gift-protocol.ts';
+export {
+  normalizeGiftQuantity,
+  parseBilibiliGiftCreditEvents,
+  type BilibiliGiftParseDiagnostic,
+  type BilibiliGiftParseDiagnosticReason
+} from './bili-gift-protocol.ts';
+
 export type GiftRequestTier =
   | 'Normal'
   | 'Captain'
@@ -38,7 +46,6 @@ const TIER_KEYS: readonly GiftRequestTier[] = [
   'Governor'
 ];
 
-const MAX_GIFT_QUANTITY_PER_EVENT = 10_000;
 const MAX_SESSION_CREDITS = 1_000_000;
 export const MAX_LEARNED_GIFTS = 50;
 
@@ -206,12 +213,6 @@ export function rememberLearnedGift(
       learnedGiftKey(item) !== key
     ))
   ], limit);
-}
-
-export function normalizeGiftQuantity(value: unknown): number {
-  const quantity = Math.floor(Number(value));
-  if (!Number.isFinite(quantity) || quantity <= 0) return 0;
-  return Math.min(quantity, MAX_GIFT_QUANTITY_PER_EVENT);
 }
 
 export function parseBilibiliGiftCreditEvent(

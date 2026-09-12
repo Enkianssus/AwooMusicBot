@@ -72,9 +72,10 @@ import {
   matchesGiftRequestRequirement,
   normalizeLearnedGifts,
   normalizeGiftRequestRequirements,
-  parseBilibiliGiftCreditEvent,
+  parseBilibiliGiftCreditEvents,
   rememberLearnedGift,
   type BilibiliGiftCreditEvent,
+  type BilibiliGiftParseDiagnostic,
   type GiftRequestRequirement,
   type LearnedGift
 } from './gift-request-credit-policy';
@@ -1327,15 +1328,21 @@ function getGiftRequirementForGuardLevel(guardLevel: unknown): {
 
 function claimGiftEvent(event: BilibiliGiftCreditEvent): boolean {
   if (!event.eventId) return true;
-  const key = `${event.uid}|${event.eventId}`;
+  const key = JSON.stringify([
+    biliRoomState.realRoomId || appConfig.roomId,
+    event.uid,
+    event.eventId
+  ]);
   const now = Date.now();
-  const previous = recentGiftEvents.get(key) || 0;
-  if (now - previous < 15 * 60_000) return false;
+  const previous = recentGiftEvents.get(key);
+  // Without a transaction ID, identical bytes can also be a new real gift.
+  const duplicateWindow = event.eventId.startsWith('gift-replay:') ? 3_000 : 15 * 60_000;
+  if (previous !== undefined && now - previous < duplicateWindow) return false;
   recentGiftEvents.set(key, now);
   for (const [storedKey, timestamp] of recentGiftEvents) {
     if (now - timestamp > 15 * 60_000) recentGiftEvents.delete(storedKey);
   }
-  while (recentGiftEvents.size > 1_000) {
+  while (recentGiftEvents.size > 16_384) {
     const oldest = recentGiftEvents.keys().next().value;
     if (typeof oldest !== 'string') break;
     recentGiftEvents.delete(oldest);
@@ -1883,7 +1890,8 @@ function parseBiliPacket(buffer: Buffer) {
     const protoVer = buffer.readInt16BE(offset + 6);
     const op = buffer.readInt32BE(offset + 8);
 
-    if (packetLen < 16 || offset + packetLen > buffer.length) break;
+    if (packetLen < 16 || headerLen < 16 || headerLen > packetLen
+      || offset + packetLen > buffer.length) break;
     const payload = buffer.subarray(offset + headerLen, offset + packetLen);
 
     if (op === 5) {
@@ -1996,12 +2004,25 @@ async function processDanmakuCommandQueue(): Promise<void> {
   }
 }
 
-function handleGiftEvent(doc: any): void {
+const recentGiftParseDiagnostics = new Map<string, number>();
+
+function reportGiftParseDiagnostic(diagnostic: BilibiliGiftParseDiagnostic): void {
+  const now = Date.now();
+  const previous = recentGiftParseDiagnostics.get(diagnostic.reason);
+  if (previous !== undefined && now - previous < 60_000) return;
+  recentGiftParseDiagnostics.set(diagnostic.reason, now);
+  writeLog(`[礼物协议] 已跳过无法识别的数据（${diagnostic.reason}，${diagnostic.count} 项）`, 'DarkGray');
+}
+
+function handleGiftEvent(doc: unknown): void {
+  const events = parseBilibiliGiftCreditEvents(doc, reportGiftParseDiagnostic);
   if (appConfig.sysConfig?.ShowAllDanmaku) {
-    writeLog(`[RAW礼物数据] ${JSON.stringify(doc)}`, 'DarkGray');
+    writeLog(`[礼物协议] 收到 ${events.length} 项有效礼物`, 'DarkGray');
   }
-  const event = parseBilibiliGiftCreditEvent(doc);
-  if (!event) return;
+  for (const event of events) applyGiftCreditEvent(event);
+}
+
+function applyGiftCreditEvent(event: BilibiliGiftCreditEvent): void {
   if (!claimGiftEvent(event)) {
     writeLog('[礼物点歌] 已忽略重复礼物事件', 'DarkGray');
     return;
@@ -2026,8 +2047,8 @@ function handleGiftEvent(doc: any): void {
 }
 
 function handleRawDanmaku(doc: any) {
-  const cmd = doc.cmd || "";
-  if (cmd === 'SEND_GIFT') {
+  const cmd = typeof doc?.cmd === 'string' ? doc.cmd.split(':', 1)[0] : '';
+  if (cmd === 'SEND_GIFT' || cmd === 'SEND_GIFT_V2') {
     handleGiftEvent(doc);
     return;
   }

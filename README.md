@@ -1,8 +1,17 @@
 # 嗷呜点歌机
 
 <p align="center">
-  <img src="docs/images/awoo-musicbot-1.1.5.png" alt="嗷呜点歌机控制面板与 OBS 展示页面" width="100%">
+  <img src="docs/images/awoo-musicbot-1.2.3-dark.png" alt="嗷呜点歌机 1.2.3 深色主题：控制面板与置顶窗口" width="100%">
 </p>
+
+<p align="center">1.2.3 界面预览 · 默认深色主题 · 歌曲、队列与直播间状态为演示数据</p>
+
+<details>
+  <summary>查看浅色主题</summary>
+  <p align="center">
+    <img src="docs/images/awoo-musicbot-1.2.3-light.png" alt="嗷呜点歌机 1.2.3 浅色主题：控制面板与置顶窗口" width="100%">
+  </p>
+</details>
 
 嗷呜点歌机是一款面向 Bilibili 主播的 Windows 弹幕点歌工具。1.1.5
 开始支持网易云音乐、酷狗音乐、QQ 音乐和 Folia，并把各播放器的搜索、

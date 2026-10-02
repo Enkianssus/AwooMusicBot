@@ -34,6 +34,10 @@ import {
 } from './netease-update-process';
 import { buildConnectorGitHubReleaseUrl } from './connector-release-url';
 import { shouldRunAutomaticConnectorMaintenance } from './dev-user-data-policy';
+import {
+  reportCompletedConnectorUpdate,
+  updateInstallationGuard
+} from './update-announcements';
 
 export type NativeConnectorId =
   | 'netease'
@@ -467,12 +471,17 @@ export class ConnectorUpdater {
       }));
     }
 
+    const releaseUpdateLock = updateInstallationGuard.acquire(connectorId);
+    if (!releaseUpdateLock) {
+      throw new Error('另一项更新正在进行，请完成后重试');
+    }
     const update = this.updateInternal(
       connectorId,
       forceReinstall,
       allowPlayerVersionChange
     )
       .finally(() => {
+        releaseUpdateLock();
         if (this.updates.get(connectorId) === update) {
           this.updates.delete(connectorId);
         }
@@ -580,6 +589,22 @@ export class ConnectorUpdater {
         new Date().toISOString(),
         null
       );
+      // install() has completed hash/signature verification, the executable
+      // health check and active.json activation before this notification.
+      if (refreshedStatus.currentVersion === entry.version) {
+        try {
+          await reportCompletedConnectorUpdate(
+            connectorId,
+            `${refreshedStatus.name}连接器`,
+            status.currentVersion,
+            entry.version
+          );
+        } catch (error: unknown) {
+          // Notification persistence must not turn a completed installation
+          // into a failed installation or provoke another reinstall.
+          this.onLog(`[连接器更新] 更新完成通知保存失败：${getErrorMessage(error)}`);
+        }
+      }
       this.onLog(
         `[连接器更新] 已${forceReinstall ? '重新安装' : '安装'} `
         + `${connectorId} ${entry.version}`

@@ -70,6 +70,10 @@ jobs:
             # 3. 写入 GitHub Actions 环境变量
             Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$ver"
             Add-Content -Path $env:GITHUB_ENV -Value "TAG_NAME=$tag"
+            $notesPath = "docs/release-notes/$tag.md"
+            if (Test-Path $notesPath) {
+              Add-Content -Path $env:GITHUB_ENV -Value "RELEASE_NOTES_PATH=$notesPath"
+            }
       
       - name: Build Electron Unpacked
         run: npm run build
@@ -91,7 +95,9 @@ jobs:
         run: |
           chcp 65001 > $null
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          vpk pack -u awoo-musicbot -v $env:VERSION -p dist_electron/win-unpacked -e "嗷呜点歌机.exe" --packTitle "嗷呜点歌机" -i assets/icon.ico
+          $notesArgs = @()
+          if ($env:RELEASE_NOTES_PATH) { $notesArgs = @('--releaseNotes', $env:RELEASE_NOTES_PATH) }
+          vpk pack -u awoo-musicbot -v $env:VERSION -p dist_electron/win-unpacked -e "嗷呜点歌机.exe" --packTitle "嗷呜点歌机" -i assets/icon.ico @notesArgs
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -101,6 +107,7 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          body_path: ${{ env.RELEASE_NOTES_PATH }}
           files: Releases/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -187,7 +194,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "R2 upload verification failed for app release $tag with exit code $LASTEXITCODE"
           }
-          & node @arguments
-          if ($LASTEXITCODE -ne 0) {
-            throw "R2 cleanup failed for app release $tag with exit code $LASTEXITCODE"
+          if ($tag -ne 'v1.2.4') {
+            & node @arguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "R2 cleanup failed for app release $tag with exit code $LASTEXITCODE"
+            }
           }

@@ -52,6 +52,12 @@ import {
 import { PlayerManager } from './players/player-manager';
 import type { NativeConnectorId } from './connector-updater';
 import {
+  UpdateAnnouncementService,
+  UpdateReceiptStore,
+  setConnectorUpdateListener,
+  updateInstallationGuard
+} from './update-announcements';
+import {
   getFeedbackStatus,
   sanitizeFeedbackLog,
   submitFeedback
@@ -149,7 +155,10 @@ import {
 } from './internal-api-port';
 // ⭐ 动态引入 Velopack 规避静态打包分析
 const customRequire = createRequire(import.meta.url);
-const { UpdateManager } = customRequire('velopack');
+const { UpdateManager, VelopackApp } = customRequire('velopack');
+// Complete installer lifecycle callbacks before creating locks, settings or UI.
+// Updates are applied explicitly below so startup cannot bypass that owner.
+VelopackApp.build().setAutoApplyOnStartup(false).run();
 
 let applicationQuitRequested = false;
 
@@ -293,6 +302,61 @@ let appUpdateDownloadStatus: AppUpdateDownloadStatus = {
 };
 let appUpdatePhase: AppUpdatePhase = 'idle';
 let appUpdateOperation: Promise<void> | null = null;
+const updateReceiptStore = new UpdateReceiptStore(app.getPath('userData'));
+let updateAnnouncementService: UpdateAnnouncementService | null = null;
+
+async function checkCoreUpdateAnnouncement() {
+  const manager = new UpdateManager('https://app.enkianss.us/update/awoo');
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const info = await Promise.race([
+      manager.checkForUpdatesAsync(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('更新检查超时')), 15_000);
+      })
+    ]);
+    return info ? {
+      version: String(info.TargetFullRelease?.Version || ''),
+      notes: info.TargetFullRelease?.NotesMarkdown
+    } : null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function getUpdateAnnouncementService(): UpdateAnnouncementService {
+  if (!updateAnnouncementService) {
+    updateAnnouncementService = new UpdateAnnouncementService({
+      currentVersion: app.getVersion(),
+      store: updateReceiptStore,
+      checkCore: checkCoreUpdateAnnouncement,
+      getConnectorStatuses: refresh => playerManager.getConnectorStatuses(refresh),
+      networkEnabled: !devUserDataDir,
+      coreEnabled: !allowMultipleInstances
+    });
+  }
+  return updateAnnouncementService;
+}
+
+setConnectorUpdateListener(async (id, name, previousVersion, version) => {
+  const service = getUpdateAnnouncementService();
+  service.noteInstalled(id, version);
+  const receipt = await updateReceiptStore.recordConnectorUpdate(id, name, previousVersion, version);
+  if (receipt && !applicationQuitRequested && startupBackgroundServicesStarted) {
+    createAdminWindow('updates');
+  }
+});
+
+async function checkStartupUpdateAnnouncements(): Promise<void> {
+  try {
+    const result = await getUpdateAnnouncementService().get();
+    if (!applicationQuitRequested && (result.items.length || result.receipts.length)) {
+      createAdminWindow('updates');
+    }
+  } catch {
+    // A failed optional network check must not interrupt startup.
+  }
+}
 
 function setAppUpdateDownloadStatus(
   patch: Partial<Omit<AppUpdateDownloadStatus, 'updatedAt'>>
@@ -342,8 +406,11 @@ function startAppUpdateOperation(): boolean {
   ) {
     return false;
   }
+  const releaseUpdateLock = updateInstallationGuard.acquire('core');
+  if (!releaseUpdateLock) return false;
   appUpdatePhase = markAppUpdateStarted();
   appUpdateOperation = (async () => {
+    let pendingSaved = false;
     try {
       setAppUpdateDownloadStatus({
         state: 'checking',
@@ -397,6 +464,9 @@ function startAppUpdateOperation(): boolean {
           }
         }
       );
+      if (!version) throw new Error('更新包缺少版本号');
+      await updateReceiptStore.prepareCoreUpdate(app.getVersion(), version);
+      pendingSaved = true;
       setAppUpdateDownloadStatus({
         state: 'applying',
         progress: 100,
@@ -410,6 +480,9 @@ function startAppUpdateOperation(): boolean {
       appUpdatePhase = markAppUpdateExitRequested();
       requestApplicationQuit();
     } catch (error: unknown) {
+      if (pendingSaved) {
+        await updateReceiptStore.clearPendingCoreUpdate().catch(() => undefined);
+      }
       appUpdatePhase = markAppUpdateRetryable();
       const message = error instanceof Error
         ? error.message
@@ -428,6 +501,7 @@ function startAppUpdateOperation(): boolean {
     // old process has actually exited. Failed/no-update attempts are retryable.
     if (appUpdatePhase !== 'exit-requested') {
       appUpdateOperation = null;
+      releaseUpdateLock();
     }
   });
   return true;
@@ -605,7 +679,8 @@ function createOverlayWindow() {
 }
 
 function createAdminWindow(initialTab?: unknown) {
-  const tab = initialTab === 'appearance' ? 'appearance' : '';
+  const tab = initialTab === 'appearance' ? 'appearance'
+    : initialTab === 'update' || initialTab === 'updates' ? 'updates' : '';
   if (adminWindow && !adminWindow.isDestroyed()) {
     presentAdminWindow();
     if (tab) adminWindow.webContents.send('admin-navigate', tab);
@@ -3184,6 +3259,7 @@ async function startPlayerBridge(): Promise<void> {
 function startStartupBackgroundServices(): void {
   if (startupBackgroundServicesStarted) return;
   startupBackgroundServicesStarted = true;
+  void checkStartupUpdateAnnouncements();
   void startPlayerBridge();
   void restartExternalApiServer();
   if (biliCookie) updateCurrentUserInfo();
@@ -5968,6 +6044,39 @@ async function startBackendServer(): Promise<void> {
       return;
     }
 
+    if (url.pathname === '/api/updates/announcements' && req.method === 'GET') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      try {
+        res.end(JSON.stringify(await getUpdateAnnouncementService().get(
+          url.searchParams.get('refresh') === '1'
+        )));
+      } catch {
+        res.writeHead(503);
+        res.end(JSON.stringify({ success: false, message: '更新检查暂时不可用，请稍后重试' }));
+      }
+      return;
+    }
+
+    if (url.pathname === '/api/updates/ack' && req.method === 'POST') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      try {
+        const body = await readJsonRequest(req);
+        if (!Array.isArray(body.ids) || body.ids.length > 1000
+          || body.ids.some((id: unknown) => typeof id !== 'string' || id.length > 100)) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ success: false, message: '更新通知标识无效' }));
+          return;
+        }
+        await updateReceiptStore.acknowledge(body.ids);
+        res.end(JSON.stringify({ success: true }));
+      } catch {
+        res.writeHead(500);
+        res.end(JSON.stringify({ success: false, message: '更新通知确认失败，请稍后重试' }));
+      }
+      return;
+    }
+
     if (url.pathname === '/api/update/check') {
       if (allowMultipleInstances) {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -6006,6 +6115,12 @@ async function startBackendServer(): Promise<void> {
           alreadyRunning: false,
           message: '多实例调试模式下不能启动自动更新，请在正式安装版中操作'
         }));
+        return;
+      }
+      if (updateInstallationGuard.componentId && updateInstallationGuard.componentId !== 'core') {
+        res.writeHead(409, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ success: false, alreadyRunning: false,
+          message: '连接器正在更新，请完成后再更新点歌机' }));
         return;
       }
       const started = startAppUpdateOperation();

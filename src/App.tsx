@@ -21,6 +21,7 @@ import {
 import { internalApiUrl } from './internal-api';
 import { AwooMark, UiIcon, type UiIconName } from './ui-icons';
 import { useColorMode, type ColorMode } from './ui-appearance';
+import UpdateAnnouncements, { type UpdateAnnouncement } from './UpdateAnnouncements';
 import './admin-ui.css';
 import './overlay-polish.css';
 
@@ -1339,10 +1340,12 @@ const AdminWidget: React.FC = () => {
     const { colorMode, toggleColorMode } = useColorMode();
     useEffect(() => { electronAPI?.setWindowColorMode?.(colorMode); }, [colorMode]);
     const [config, setConfig] = useState<any>(null);
-    const [activeTab, setActiveTab] = useState<string>(() => (
-        new URLSearchParams(window.location.search).get('tab') === 'appearance'
-            ? 'appearance'
-            : 'status'
+    const [activeTab, setActiveTab] = useState<string>(() => {
+        const tab = new URLSearchParams(window.location.search).get('tab');
+        return tab === 'appearance' ? 'appearance' : tab === 'updates' || tab === 'update' ? 'update' : 'status';
+    });
+    const [announcementOpenRequest, setAnnouncementOpenRequest] = useState(() => (
+        new URLSearchParams(window.location.search).get('tab') === 'updates' ? 1 : 0
     ));
     const [supportMenuOpen, setSupportMenuOpen] = useState(false);
     const mainContentRef = useRef<HTMLElement>(null);
@@ -1382,6 +1385,7 @@ const AdminWidget: React.FC = () => {
     const [connectorUpdating, setConnectorUpdating] = useState<
         NativeConnectorId | null
     >(null);
+    const connectorUpdateInFlightRef = useRef(false);
     const [connectorStatusError, setConnectorStatusError] = useState('');
     const [feedbackForm, setFeedbackForm] = useState({
         category: 'bug',
@@ -1446,6 +1450,8 @@ const AdminWidget: React.FC = () => {
     useEffect(() => {
         return electronAPI?.onAdminNavigate(tab => {
             if (tab === 'appearance') setActiveTab('appearance');
+            if (tab === 'update' || tab === 'updates') setActiveTab('update');
+            if (tab === 'updates') setAnnouncementOpenRequest(value => value + 1);
         });
     }, []);
 
@@ -2219,10 +2225,18 @@ const AdminWidget: React.FC = () => {
     };
 
     const handleConnectorUpdate = async (
-        connectorId: NativeConnectorId
+        connectorId: NativeConnectorId,
+        announcement?: UpdateAnnouncement
     ) => {
-        if (connectorUpdating) return;
-        const status = connectorStatuses[connectorId];
+        if (connectorUpdateInFlightRef.current || updateApplyRequestInFlightRef.current) return;
+        const status = announcement ? {
+            name: announcement.name,
+            currentVersion: announcement.currentVersion,
+            latestVersion: announcement.version,
+            updateAvailable: announcement.canUpdate,
+            manualUpdateAvailable: announcement.manualUpdate,
+            supportedPlayerVersion: announcement.supportedPlayerVersion
+        } : connectorStatuses[connectorId];
         if (!status?.updateAvailable) {
             showAdminToast('当前连接器没有可安装的更新。');
             return;
@@ -2247,6 +2261,7 @@ const AdminWidget: React.FC = () => {
         };
         const updatesSelectedPlayer =
             config?.config?.PlayerType === playerTypeByConnector[connectorId];
+        connectorUpdateInFlightRef.current = true;
         setConnectorUpdating(connectorId);
         if (updatesSelectedPlayer) {
             setConfig((previous: any) => previous ? ({
@@ -2265,7 +2280,7 @@ const AdminWidget: React.FC = () => {
                 }
             );
             const result = await response.json();
-            if (!result.success) {
+            if (!response.ok || !result.success) {
                 throw new Error(result.message || '连接器更新失败');
             }
             if (result.status) {
@@ -2309,15 +2324,18 @@ const AdminWidget: React.FC = () => {
                     playerConnecting: false
                 }) : previous);
             }
+            if (announcement) throw new Error(message);
         } finally {
+            connectorUpdateInFlightRef.current = false;
             setConnectorUpdating(null);
+            window.dispatchEvent(new Event('awoo-updates-changed'));
         }
     };
 
     const handleConnectorReinstall = async (
         connectorId: NativeConnectorId
     ) => {
-        if (connectorUpdating) return;
+        if (connectorUpdateInFlightRef.current || updateApplyRequestInFlightRef.current) return;
         const playerTypeByConnector: Record<NativeConnectorId, string> = {
             netease: 'NCM',
             kugou: 'Kugou',
@@ -2326,6 +2344,7 @@ const AdminWidget: React.FC = () => {
         };
         const reinstallsSelectedPlayer =
             config?.config?.PlayerType === playerTypeByConnector[connectorId];
+        connectorUpdateInFlightRef.current = true;
         setConnectorUpdating(connectorId);
         if (reinstallsSelectedPlayer) {
             setConfig((previous: any) => previous ? ({
@@ -2409,7 +2428,9 @@ const AdminWidget: React.FC = () => {
                 }) : previous);
             }
         } finally {
+            connectorUpdateInFlightRef.current = false;
             setConnectorUpdating(null);
+            window.dispatchEvent(new Event('awoo-updates-changed'));
         }
     };
 
@@ -2432,6 +2453,10 @@ const AdminWidget: React.FC = () => {
     };
 
     const handleApplyUpdate = async () => {
+        if (connectorUpdateInFlightRef.current) {
+            showAdminToast('请等待连接器更新完成后再更新点歌机。');
+            return;
+        }
         if (updateApplyRequestInFlightRef.current) {
             showAdminToast('更新任务已在进行，请等待唯一一次最终重启。');
             return;
@@ -2491,6 +2516,7 @@ const AdminWidget: React.FC = () => {
                             info: { error: status.message || '更新失败' }
                         });
                         showAdminToast(`❌ ${status.message || '更新失败'}`);
+                        window.dispatchEvent(new Event('awoo-updates-changed'));
                         return;
                     }
                     if (status.state === 'no-update') {
@@ -2501,6 +2527,7 @@ const AdminWidget: React.FC = () => {
                             info: { hasUpdate: false }
                         });
                         showAdminToast('✅ 当前已经是最新版本');
+                        window.dispatchEvent(new Event('awoo-updates-changed'));
                         return;
                     }
 
@@ -2528,11 +2555,16 @@ const AdminWidget: React.FC = () => {
                         : '读取更新进度失败';
                     updateApplyRequestInFlightRef.current = false;
                     setDownloadProgress(null);
+                    setUpdateDownloadStatus({
+                        state: 'error', progress: null, version: null,
+                        message, updatedAt: new Date().toISOString()
+                    });
                     setUpdateInfo({
                         checking: false,
                         info: { error: message }
                     });
                     showAdminToast(`❌ ${message}`);
+                    window.dispatchEvent(new Event('awoo-updates-changed'));
                 }
             };
             void pollUpdateStatus();
@@ -2542,8 +2574,13 @@ const AdminWidget: React.FC = () => {
             const message = error instanceof Error
                 ? error.message
                 : '更新请求失败，请检查网络连接';
+            setUpdateDownloadStatus({
+                state: 'error', progress: null, version: null,
+                message, updatedAt: new Date().toISOString()
+            });
             setUpdateInfo({ checking: false, info: { error: message } });
             showAdminToast(`❌ ${message}`);
+            window.dispatchEvent(new Event('awoo-updates-changed'));
         }
     };
 
@@ -3121,6 +3158,17 @@ const AdminWidget: React.FC = () => {
 
     return (
         <div data-color-mode={colorMode} className="admin-widget-root animate-fade-in flex flex-col font-sans select-none w-full h-screen overflow-hidden">
+
+            <UpdateAnnouncements
+                suspended={onboardingOpen}
+                openRequest={announcementOpenRequest}
+                busy={connectorUpdating !== null || downloadProgress !== null}
+                coreProgress={updateDownloadStatus}
+                onCoreUpdate={handleApplyUpdate}
+                onConnectorUpdate={async item => {
+                    if (item.id !== 'core') await handleConnectorUpdate(item.id, item);
+                }}
+            />
 
             {adminToast && (
                 <div className="fixed top-8 left-1/2 transform -translate-x-1/2 z-[99999] bg-blue-600 text-white px-6 py-3 rounded-full shadow-2xl font-bold animate-slide-in flex items-center gap-2">
@@ -5091,7 +5139,10 @@ const AdminWidget: React.FC = () => {
                                             当前运行版本: v{config.version || '未知'}
                                         </div>
 
-                                        <p className="text-sm text-gray-400 mb-8 leading-relaxed">一键连接 GitHub 检查最新版本。</p>
+                                        <p className="text-sm text-gray-400 mb-4 leading-relaxed">查看点歌机和连接器的新版本与修复说明。</p>
+                                        <button onClick={() => setAnnouncementOpenRequest(value => value + 1)} className="mb-6 px-5 py-3 border border-blue-500/30 bg-blue-500/10 text-blue-300 rounded-xl font-bold w-full hover:bg-blue-500/20">
+                                            更新与公告
+                                        </button>
 
                                         {downloadProgress !== null ? (
                                             <div className="bg-green-900/30 border border-green-500/30 p-5 rounded-xl w-full text-left">
@@ -5110,7 +5161,7 @@ const AdminWidget: React.FC = () => {
                                         ) : updateInfo.info?.hasUpdate ? (
                                             <div className="bg-green-900/30 border border-green-500/30 p-5 rounded-xl w-full">
                                                 <div className="text-green-400 font-bold text-md mb-4">🎉 发现新版本: {updateInfo.info.version}</div>
-                                                <button onClick={handleApplyUpdate} className="px-5 py-3 bg-green-600 hover:bg-green-500 text-white text-md rounded-xl font-bold shadow-lg w-full transition-colors">下载更新并最终重启一次</button>
+                                                <button onClick={handleApplyUpdate} disabled={connectorUpdating !== null} className="px-5 py-3 bg-green-600 hover:bg-green-500 text-white text-md rounded-xl font-bold shadow-lg w-full transition-colors disabled:opacity-50">更新并重启</button>
                                             </div>
                                         ) : (
                                             <button onClick={handleUpdateCheck} disabled={updateInfo.checking} className="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white text-md rounded-xl font-bold shadow-lg disabled:opacity-50 transition-colors w-full">

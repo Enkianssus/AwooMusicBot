@@ -6,6 +6,7 @@ import ts from 'typescript';
 import { managedActionExpirationAt } from '../electron/managed-action-lifetime-policy.ts';
 import * as queue from '../electron/queue-head-policy.ts';
 import { isSuccessfulPlayerResult } from '../electron/players/types.ts';
+import * as compatibility from '../electron/qq-native-compatibility-policy.ts';
 
 test('only an in-flight logical-next owner receives a bounded attribution extension', () => {
   const action = { startedAt: 1000, expiresAt: 13000, inFlight: true, logicalNextOwnerAtDispatch: true };
@@ -20,7 +21,7 @@ const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'u
 const parsed = ts.createSourceFile('main.ts', main, ts.ScriptTarget.Latest, true);
 const names = [
   'playSongNow', 'isObservedSong', 'scheduleManagedActionExpiration',
-  'expireManagedAction', 'updatePlayerCurrentTrack', 'cacheSongCover'
+  'expireManagedAction', 'updatePlayerCurrentTrack', 'cacheSongCover', 'holdUnsupportedQqQueue'
 ];
 const functions = names.map(name => {
   const declaration = parsed.statements.find(statement =>
@@ -39,7 +40,9 @@ function fixture(web = true) {
   const timers = [];
   const command = new Promise(resolve => { resolveCommand = resolve; });
   const context = vm.createContext({
-    ...queue, managedActionExpirationAt, isSuccessfulPlayerResult,
+    ...queue, ...compatibility, managedActionExpirationAt, isSuccessfulPlayerResult,
+    activePlayerSnapshot: { connected: true, version: '22.61', ownsLogicalNext: web },
+    playerControlNotice: null,
     Date: { now: () => now },
     setTimeout(callback, delay) { timers.push({ callback, due: now + delay }); },
     currentPlayingSong: null, playerCurrentTrack: null,

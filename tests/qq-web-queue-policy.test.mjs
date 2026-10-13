@@ -42,7 +42,7 @@ test('ordinary local head mutations retain append/reorder and legacy decisions',
 // Narrow integration assertions intentionally read source, never import the
 // Electron entry point or start a player. Pure policy tests alone would miss
 // a second automatic dispatch left in one of main.ts's mismatch branches.
-const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8');
+const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const between = (start, end) => {
   const begin = main.indexOf(start);
   assert.notEqual(begin, -1, `Missing integration anchor: ${start}`);

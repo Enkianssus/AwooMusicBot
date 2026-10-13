@@ -194,7 +194,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "R2 upload verification failed for app release $tag with exit code $LASTEXITCODE"
           }
-          if ($tag -ne 'v1.2.4') {
+          if ($tag -notin @('v1.2.4', 'v1.2.5')) {
             & node @arguments
             if ($LASTEXITCODE -ne 0) {
               throw "R2 cleanup failed for app release $tag with exit code $LASTEXITCODE"

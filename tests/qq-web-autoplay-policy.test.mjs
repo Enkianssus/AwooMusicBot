@@ -5,6 +5,7 @@ import test from 'node:test';
 import ts from 'typescript';
 import * as policy from '../electron/qq-web-autoplay-policy.ts';
 import { isSuccessfulPlayerResult } from '../electron/players/types.ts';
+import * as compatibility from '../electron/qq-native-compatibility-policy.ts';
 
 test('autoplay suspension and stale generations apply only to the QQ logical owner', () => {
   for (const ownsLogicalNext of [true, false]) {
@@ -29,7 +30,7 @@ const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'u
 const parsed = ts.createSourceFile('main.ts', main, ts.ScriptTarget.Latest, true);
 const names = ['isQqAutoplaySuspended', 'discardQqGuardOperation', 'isAutoplayPauseConfirmed',
   'clearQqAutoplayOwnership', 'setQueuePlaybackEnabled', 'serializeNextGuardOperation',
-  'guardNextSong', 'armNextGuardOnly', 'syncTrackChangeLogic'];
+  'guardNextSong', 'armNextGuardOnly', 'syncTrackChangeLogic', 'holdUnsupportedQqQueue'];
 const source = names.map(name => {
   const declaration = parsed.statements.find(value => ts.isFunctionDeclaration(value) && value.name?.text === name);
   assert.ok(declaration, name);
@@ -51,7 +52,7 @@ function fixture({ web = true, dispatch = async () => ({ outcome: 'applied' }) }
   const commands = [];
   const statuses = [];
   const context = vm.createContext({
-    ...policy, isSuccessfulPlayerResult,
+    ...policy, ...compatibility, isSuccessfulPlayerResult, playerControlNotice: null,
     isPlaying: true, isAccepting: false, requestedQueuePlaybackEnabled: true,
     qqAutoplayGeneration: 0, qqAutoplayPauseConfirmed: true,
     nextGuardOperationTail: Promise.resolve(),
@@ -60,7 +61,7 @@ function fixture({ web = true, dispatch = async () => ({ outcome: 'applied' }) }
     registeredNextGuardKey: '', registeredNextGuardSongIdentity: '', registeredNextGuardId: 0,
     queueHeadNeedsGuardOnlyAfterCurrentChange: false, cancelledNativeNextSongs: new Map([['B', songB]]),
     deferredQqInsertIdentity: '', qqDeferredInsertRetryAttempted: false, qqDeferredInsertRetryInFlight: false,
-    activePlayerSnapshot: { requiresPlaybackAnchor: false, playbackAnchorReady: true },
+    activePlayerSnapshot: { connected: true, version: '22.61', requiresPlaybackAnchor: false, playbackAnchorReady: true },
     connectorOwnsQqLogicalNext: () => web,
     getSelectedPlayerKey: () => web ? 'qqmusic' : 'netease',
     getQueueSongIdentity: song => song?.Id || '', getNextGuardKey: song => song.Id,

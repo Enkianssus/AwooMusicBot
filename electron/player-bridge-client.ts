@@ -7,6 +7,10 @@ import {
   type NativeConnectorId
 } from './connector-updater';
 import { ConnectorLifecycleGate } from './connector-lifecycle-gate';
+import {
+  mergeSnapshotCapabilities,
+  rejectUnsupportedQqCommand
+} from './qq-native-compatibility-policy';
 
 const CONNECTOR_SHUTDOWN_DRAIN_TIMEOUT_MS = 25_000;
 const CONNECTOR_FORCE_EXIT_TIMEOUT_MS = 2_000;
@@ -63,6 +67,8 @@ export interface PlayerSnapshot {
   observationDeferred?: boolean;
   observedAt: string;
   capabilities?: PlayerCapabilities | null;
+  /** Native queue support for the detected player build, independent of connection. */
+  compatibilityFailureCode?: string | null;
 }
 
 export interface PlayerOperationResult {
@@ -98,6 +104,7 @@ export class PlayerBridgeClient {
   private process: ChildProcessWithoutNullStreams | null = null;
   private activePlayer: NativeConnectorId | null = null;
   private activeCapabilities: PlayerCapabilities | null = null;
+  private latestSnapshot: PlayerSnapshot | null = null;
   private activeFeatures = new Set<string>();
   private pending = new Map<string, PendingRequest>();
   private requestSequence = 0;
@@ -171,6 +178,7 @@ export class PlayerBridgeClient {
     this.stopping = false;
     this.stdoutBuffer = '';
     this.activeCapabilities = null;
+    this.latestSnapshot = null;
     this.activeFeatures.clear();
     const connectorEnvironment =
       await this.updater.getLaunchEnvironment(player);
@@ -343,6 +351,7 @@ export class PlayerBridgeClient {
           this.process = null;
           this.activePlayer = null;
           this.activeCapabilities = null;
+          this.latestSnapshot = null;
           this.activeFeatures.clear();
           this.rejectAll(new Error('播放器桥已停止'));
         }
@@ -356,10 +365,7 @@ export class PlayerBridgeClient {
       { action: 'probe', player },
       8000
     );
-    return {
-      ...snapshot,
-      capabilities: this.activeCapabilities
-    };
+    return this.acceptSnapshot(snapshot);
   }
 
   async search(
@@ -376,10 +382,22 @@ export class PlayerBridgeClient {
     track?: PlayerTrack
   ): Promise<PlayerOperationResult> {
     await this.start(player);
-    return this.request(
+    const rejected = rejectUnsupportedQqCommand(player, command, this.latestSnapshot);
+    if (rejected) return rejected;
+    const result = await this.request(
       { action: 'execute', player, command, track },
       23000
     );
+    return result?.snapshot
+      ? { ...result, snapshot: this.acceptSnapshot(result.snapshot) }
+      : result;
+  }
+
+  private acceptSnapshot(snapshot: PlayerSnapshot): PlayerSnapshot {
+    const normalized = mergeSnapshotCapabilities(snapshot, this.activeCapabilities);
+    this.activeCapabilities = normalized.capabilities ?? null;
+    this.latestSnapshot = normalized;
+    return normalized;
   }
 
   private async resolveExecutable(
@@ -442,10 +460,7 @@ export class PlayerBridgeClient {
         this.onEvent({
           ...envelope,
           snapshot: envelope.snapshot
-            ? {
-              ...envelope.snapshot,
-              capabilities: this.activeCapabilities
-            }
+            ? this.acceptSnapshot(envelope.snapshot)
             : envelope.snapshot
         });
       } catch (error: any) {
@@ -476,6 +491,7 @@ export class PlayerBridgeClient {
     this.process = null;
     this.activePlayer = null;
     this.activeCapabilities = null;
+    this.latestSnapshot = null;
     this.activeFeatures.clear();
     this.rejectAll(error);
     if (!this.stopping && exitedPlayer) {

@@ -103,6 +103,11 @@ import {
   type PlayerUpgradeHint
 } from './player-upgrade-hint-policy';
 import {
+  buildQqCompatibilityHint,
+  qqNativeCompatibilityMessage,
+  type QqCompatibilityHint
+} from './qq-native-compatibility-policy';
+import {
   isQqPlaybackAnchorMissing,
   planQqDeferredPlaybackAction,
   planQqAnchorObservation,
@@ -988,7 +993,7 @@ let isPausingAfterRequests = false;
 let lastQueueActionTime = 0; // 全局队列操作防抖冷却时间
 let activePlayerSnapshot: PlayerSnapshot | null = null;
 let playerConnecting = false;
-type PlayerControlHint = PlayerUpgradeHint | PlayerProcessAccessHint;
+type PlayerControlHint = PlayerUpgradeHint | PlayerProcessAccessHint | QqCompatibilityHint;
 type PlayerControlNotice = PlayerControlHint & { detectedAt: string };
 let playerControlNotice: PlayerControlNotice | null = null;
 let registeredNextGuardKey = '';
@@ -1059,6 +1064,29 @@ function connectorOwnsQqLogicalNext(): boolean {
 
 function isQqAutoplaySuspended(): boolean {
   return shouldSuspendQqAutoplay(connectorOwnsQqLogicalNext(), isPlaying);
+}
+
+function holdUnsupportedQqQueue(command = 'InsertNext'): boolean {
+  const hint = buildQqCompatibilityHint(getSelectedPlayerKey(), activePlayerSnapshot, command);
+  if (!hint) return false;
+  const changed = playerControlNotice?.kind !== 'compatibility'
+    || playerControlNotice.currentVersion !== hint.currentVersion
+    || playerControlNotice.processId !== hint.processId;
+  if (changed) {
+    playerControlNotice = { ...hint, detectedAt: new Date().toISOString() };
+    // Discard automatic work queued for the previous support state, keeping
+    // the user's requested songs and manual player controls available.
+    qqAutoplayGeneration++;
+    clearRegisteredNextGuard();
+    clearDeferredQqInsert();
+    clearRecentQqGuardedCompletion();
+    clearSkipForcePlayOnce();
+    queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+    activeManagedPlayerAction = null;
+    writeLog(`[播放器兼容] ${qqNativeCompatibilityMessage(hint.currentVersion)}`, 'Yellow');
+    setGlobalStatus(qqNativeCompatibilityMessage(hint.currentVersion));
+  }
+  return true;
 }
 
 function discardQqGuardOperation(operationGeneration: number): boolean {
@@ -1181,6 +1209,10 @@ const playerManager = new PlayerManager({
     ) {
       playerControlNotice = null;
     }
+    if (!holdUnsupportedQqQueue() && playerControlNotice?.kind === 'compatibility') {
+      playerControlNotice = null;
+      if (state.connected) setGlobalStatus('QQ 音乐点歌插入已恢复可用');
+    }
     if (!state.connected) {
       clearDeferredQqInsert();
       clearRecentQqGuardedCompletion();
@@ -1255,6 +1287,7 @@ const playerManager = new PlayerManager({
       track.artist || '',
       observation.coverUrl || ''
     );
+    if (holdUnsupportedQqQueue()) return;
     if (isQqAutoplaySuspended()) {
       clearQqAutoplayOwnership();
       return;
@@ -2640,6 +2673,7 @@ async function recoverRecentQqGuardedCompletionIfNeeded(): Promise<RecentQqGuard
 async function syncTrackChangeLogic(currId: string, currName: string, nextId: string | null, nextName: string, currArtist: string = '', currCoverUrl: string = '', observedNextTrack: any = null, nextObservation: NextObservation = 'legacy', playbackAnchorReady = false, nextGuardState: NextGuardState | null = 'none', nextGuardId = 0): Promise<void> {
   playerPausedAfterRequests = false;
   updatePlayerCurrentTrack(currId, currName, currArtist, currCoverUrl);
+  if (holdUnsupportedQqQueue()) return;
   writeLog(
     `[状态同步] 🎵 播放器切歌信号: ${currName} (${currId}) | `
     + `下一首预告: ${nextName}${nextId ? ` (${nextId})` : ''}`,
@@ -3324,7 +3358,13 @@ async function executePlayerCommand(
     failureCode: result?.failureCode,
     message: result?.message
   };
-  const hint = buildPlayerProcessAccessHint(hintInput)
+  const hint = buildQqCompatibilityHint(playerKey, snapshot, command)
+    || (playerKey === 'qqmusic' && result?.failureCode === 'player-version-unsupported'
+      ? buildQqCompatibilityHint(playerKey, snapshot
+        ? { ...snapshot, compatibilityFailureCode: result.failureCode }
+        : null, command)
+      : null)
+    || buildPlayerProcessAccessHint(hintInput)
     || buildPlayerUpgradeHint(hintInput);
   if (hint) {
     const duplicate = Boolean(
@@ -3339,6 +3379,9 @@ async function executePlayerCommand(
       ...hint,
       detectedAt: new Date().toISOString()
     };
+    if (!duplicate && hint.kind === 'compatibility') {
+      writeLog(`[播放器兼容] ${qqNativeCompatibilityMessage(hint.currentVersion)}`, 'Yellow');
+    }
     if (!duplicate && hint.kind === 'upgrade') {
       writeLog(
         `[播放器兼容] ${hint.playerName} ${hint.currentVersion} 低于`
@@ -3358,7 +3401,9 @@ async function executePlayerCommand(
         'Yellow'
       );
     }
-    setGlobalStatus(hint.kind === 'upgrade'
+    setGlobalStatus(hint.kind === 'compatibility'
+      ? qqNativeCompatibilityMessage(hint.currentVersion)
+      : hint.kind === 'upgrade'
       ? `⚠️ ${hint.playerName}版本较旧，点歌控制未生效，请打开设置升级播放器`
       : `⚠️ ${hint.playerName}控制被 Windows 拒绝，请打开设置检查权限`);
   } else if (
@@ -3592,6 +3637,7 @@ async function guardNextSong(
 ): Promise<boolean> {
   const operationGeneration = qqAutoplayGeneration;
   return serializeNextGuardOperation(async () => {
+    if (holdUnsupportedQqQueue()) return false;
     if (discardQqGuardOperation(operationGeneration)) return false;
     if (!songInfo) return false;
     const playbackAnchorReady = playbackAnchorReadyOverride === undefined
@@ -3692,6 +3738,7 @@ async function guardNextSong(
 async function armNextGuardOnly(songInfo: any): Promise<boolean> {
   const operationGeneration = qqAutoplayGeneration;
   return serializeNextGuardOperation(async () => {
+    if (holdUnsupportedQqQueue('ArmNextGuard')) return false;
     if (discardQqGuardOperation(operationGeneration)) return false;
     if (!songInfo) return false;
     const guardKey = getNextGuardKey(songInfo);
@@ -3785,6 +3832,7 @@ async function playSongNow(
   mode: 'play-now' | 'interrupt' = 'play-now'
 ): Promise<boolean> {
   if (!songInfo) return false;
+  if (holdUnsupportedQqQueue(mode === 'interrupt' ? 'InterruptSelected' : 'PlaySelected')) return false;
   clearDeferredQqInsert();
   playerPausedAfterRequests = false;
   const operationState = await serializeNextGuardOperation(async () => {
@@ -4954,6 +5002,7 @@ async function buildFeedbackContext(
       capabilities: activePlayerSnapshot?.capabilities || null,
       controlNotice: playerControlNotice,
       compatibilityNotice: playerControlNotice?.kind === 'upgrade'
+        || playerControlNotice?.kind === 'compatibility'
         ? playerControlNotice
         : null
     },

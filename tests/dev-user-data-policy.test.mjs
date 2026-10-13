@@ -69,15 +69,15 @@ test('isolated automatic connection recovery exits before probing or updating a 
 // network, installed files, health-check process, or actual player is involved.
 function makeUpdaterHarness({ isolated = true, active = null, validationFails = false } = {}) {
   const source = fs.readFileSync(new URL('../electron/connector-updater.ts', import.meta.url), 'utf8');
-  const method = (start, end) => {
-    const begin = source.indexOf(start);
-    const finish = source.indexOf(end, begin);
-    assert.ok(begin !== -1 && finish > begin);
-    return source.slice(begin, finish);
-  };
-  const methods = method('  async getLaunchEnvironment(', '  private getPrivateDotnetRuntime(')
-    + method('  async ensureInstalled(', '  async getStatuses(')
-    + method('  private getConnectorRoot(', '\n}\n');
+  const parsed = ts.createSourceFile('connector-updater.ts', source, ts.ScriptTarget.Latest, true);
+  const declaration = parsed.statements.find(node => ts.isClassDeclaration(node)
+    && node.name?.text === 'ConnectorUpdater');
+  assert.ok(declaration);
+  const methods = ['getLaunchEnvironment', 'ensureInstalled', 'getConnectorRoot'].map(name => {
+    const method = declaration.members.find(node => ts.isMethodDeclaration(node) && node.name?.getText(parsed) === name);
+    assert.ok(method, name);
+    return method.getText(parsed);
+  }).join('\n');
   const calls = { validate: 0, update: 0, reinstall: 0, profiles: 0 };
   const context = vm.createContext({
     process: { env: {

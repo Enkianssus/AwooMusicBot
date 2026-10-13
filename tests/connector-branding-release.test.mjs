@@ -8,7 +8,7 @@ import test from 'node:test';
 const repositoryRoot = path.resolve(import.meta.dirname, '..');
 const connectorRoot = path.join(repositoryRoot, 'BiliNCM-Connectors');
 const hash = 'a'.repeat(64);
-const signature = Buffer.from('signed').toString('base64');
+const signature = Buffer.alloc(64, 1).toString('base64');
 
 function withTemporaryDirectory(callback) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'awoo-catalog-test-'));
@@ -80,33 +80,46 @@ test('future connector catalogs prefer Awoo packages and retain old-core aliases
 
 test('future QQ profile catalogs expose an Awoo package without breaking old cores', () => {
   withTemporaryDirectory(directory => {
+    const legacy = {
+      id: 'qqmusic', version: '1.3.0', schemaVersion: 1, minimumConnectorVersion: '22.51.1',
+      asset: 'bilincm-qqmusic-profiles-1.3.0.zip', size: 11, sha256: hash, signature,
+      downloadUrl: 'https://app.enkianss.us/connectors/v1/profiles/qqmusic/download/1.3.0/bilincm-qqmusic-profiles-1.3.0.zip',
+      awooPackage: { asset: 'awoo-qqmusic-profiles-1.3.0.zip', size: 11, sha256: hash, signature }
+    };
     fs.writeFileSync(
       path.join(directory, 'qqmusic-profile-catalog.json'),
-      JSON.stringify({ profiles: { qqmusic: null } })
+      JSON.stringify({ schemaVersion: 1, publicKeyId: 'bilincm-connectors-2026-01',
+        repository: 'Enkianssus/awoo-connectors', profiles: { qqmusic: legacy } })
     );
     runScript(
       path.join(connectorRoot, 'scripts', 'update-profile-catalog.mjs'),
       [
-        '1.2.0',
-        'awoo-qqmusic-profiles-1.2.0.zip',
+        '1.4.0',
+        'awoo-qqmusic-profiles-1.4.0.zip',
         hash,
         signature,
         '11',
-        'bilincm-qqmusic-profiles-1.2.0.zip',
+        'bilincm-qqmusic-profiles-1.4.0.zip',
         hash,
         signature,
         '11'
       ],
       directory
     );
-    const entry = JSON.parse(fs.readFileSync(
+    const catalog = JSON.parse(fs.readFileSync(
       path.join(directory, 'qqmusic-profile-catalog.json'),
       'utf8'
-    )).profiles.qqmusic;
-    assert.equal(entry.asset, 'bilincm-qqmusic-profiles-1.2.0.zip');
+    ));
+    assert.equal(catalog.schemaVersion, 1);
+    assert.equal(catalog.publicKeyId, 'bilincm-connectors-2026-01');
+    assert.deepEqual(catalog.profiles.qqmusic, legacy, 'old cores keep exactly their signed schema 1 entry');
+    const entry = catalog.profiles.qqmusicV2;
+    assert.equal(entry.schemaVersion, 2);
+    assert.equal(entry.minimumConnectorVersion, '22.76.1');
+    assert.equal(entry.asset, 'bilincm-qqmusic-profiles-1.4.0.zip');
     assert.equal(
       entry.awooPackage.asset,
-      'awoo-qqmusic-profiles-1.2.0.zip'
+      'awoo-qqmusic-profiles-1.4.0.zip'
     );
   });
 });

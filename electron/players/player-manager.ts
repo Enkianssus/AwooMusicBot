@@ -19,6 +19,7 @@ import { FoliaPlayerBackend } from './folia-player';
 import { KugouPlayerBackend } from './kugou-player';
 import { NeteasePlayerBackend } from './netease-player';
 import { QQMusicPlayerBackend } from './qqmusic-player';
+import { rejectUnsupportedQqCommand } from '../qq-native-compatibility-policy';
 import {
   isSuccessfulPlayerResult,
   PLAYER_LABELS,
@@ -331,10 +332,17 @@ export class PlayerManager {
 
     const backend = this.backends[requestedKey];
     try {
+      const rejected = rejectUnsupportedQqCommand(requestedKey, command, this.state.snapshot);
+      if (rejected) return rejected;
       const result = await backend.execute(
         command,
         song ? toPlayerTrack(song) : undefined
       );
+      if (result.snapshot && requestedKey === this.selectedKey) {
+        // Command receipts carry compatibility changes just like probes/events.
+        // Track advancement remains owned by independent observations.
+        this.acceptSnapshot(requestedKey, result.snapshot, false);
+      }
       if (!isSuccessfulPlayerResult(result)) {
         this.options.log(
           `⚠️ ${backend.label} ${command} 未生效: ${result.message}`,

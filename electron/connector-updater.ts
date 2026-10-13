@@ -35,6 +35,13 @@ import {
 import { buildConnectorGitHubReleaseUrl } from './connector-release-url';
 import { shouldRunAutomaticConnectorMaintenance } from './dev-user-data-policy';
 import {
+  canUseCachedQqProfiles,
+  isQqProfileNetworkFailure,
+  selectQqProfileEntry,
+  validateQqProfileDocument,
+  verifyQqProfileArchive
+} from './qq-profile-policy';
+import {
   reportCompletedConnectorUpdate,
   updateInstallationGuard
 } from './update-announcements';
@@ -194,11 +201,14 @@ interface QQMusicProfileCatalog {
   publicKeyId: string;
   profiles: {
     qqmusic: QQMusicProfileCatalogEntry | null;
+    qqmusicV2?: QQMusicProfileCatalogEntry | null;
   };
 }
 
 interface ActiveQQMusicProfiles {
   version: string;
+  schemaVersion?: number;
+  minimumConnectorVersion?: string;
   directory: string;
   activatedAt: string;
 }
@@ -1296,6 +1306,7 @@ export class ConnectorUpdater {
 
   private async ensureQQMusicProfilesInternal(): Promise<string | null> {
     const active = await this.readActiveQQMusicProfiles();
+    const connector = await this.readActive('qqmusic');
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
     let catalog: QQMusicProfileCatalog;
@@ -1308,17 +1319,32 @@ export class ConnectorUpdater {
       });
       if (!response.ok) throw new Error(`画像清单 HTTP ${response.status}`);
       catalog = await response.json() as QQMusicProfileCatalog;
+    } catch (error) {
+      if (isQqProfileNetworkFailure(error) && active) {
+        const cached = await this.validateCachedQQMusicProfiles(active, connector?.version || '');
+        if (cached) {
+          this.onLog(`[QQ 画像] 在线目录暂时不可用，已校验并使用缓存画像 ${active.version}：${getErrorMessage(error)}`);
+          return cached;
+        }
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
     }
 
-    const entry = catalog.profiles?.qqmusic;
+    if (catalog.schemaVersion !== 1 || catalog.publicKeyId !== PUBLIC_KEY_ID) {
+      throw new Error('QQ 音乐画像更新清单无效');
+    }
+    const entry = selectQqProfileEntry(
+      catalog.profiles?.qqmusic, catalog.profiles?.qqmusicV2, connector?.version || ''
+    );
+    if (!entry) return null;
     if (
       catalog.schemaVersion !== 1
       || catalog.publicKeyId !== PUBLIC_KEY_ID
       || !entry
       || entry.id !== 'qqmusic'
-      || entry.schemaVersion !== 1
+      || (entry.schemaVersion !== 1 && entry.schemaVersion !== 2)
       || !/^\d+\.\d+\.\d+$/.test(entry.version)
       || !Number.isSafeInteger(entry.size)
       || entry.size <= 0
@@ -1352,8 +1378,10 @@ export class ConnectorUpdater {
       throw new Error('QQ 音乐 Awoo 画像更新清单无效');
     }
 
-    if (active && compareVersions(active.version, entry.version) >= 0) {
-      return active.directory;
+    if (active && (active.schemaVersion ?? 1) === entry.schemaVersion
+        && compareVersions(active.version, entry.version) >= 0) {
+      const cached = await this.validateCachedQQMusicProfiles(active, connector?.version || '');
+      if (cached) return cached;
     }
 
     const profileRoot = this.getQQMusicProfileRoot();
@@ -1381,26 +1409,7 @@ export class ConnectorUpdater {
       } finally {
         clearTimeout(downloadTimeout);
       }
-      if (archive.length !== packageEntry.size) {
-        throw new Error(
-          `画像大小不匹配：${archive.length}/${packageEntry.size}`
-        );
-      }
-      const digest = crypto.createHash('sha256').update(archive).digest('hex');
-      if (!crypto.timingSafeEqual(
-        Buffer.from(digest, 'hex'),
-        Buffer.from(packageEntry.sha256, 'hex')
-      )) {
-        throw new Error('QQ 画像 SHA-256 校验失败');
-      }
-      if (!crypto.verify(
-        null,
-        archive,
-        RELEASE_PUBLIC_KEY,
-        Buffer.from(packageEntry.signature, 'base64')
-      )) {
-        throw new Error('QQ 画像 Ed25519 签名校验失败');
-      }
+      verifyQqProfileArchive(archive, packageEntry, RELEASE_PUBLIC_KEY);
 
       await fs.promises.writeFile(archivePath, archive, { flag: 'wx' });
       await extractZipSafely(archivePath, stagingDirectory, {
@@ -1408,7 +1417,7 @@ export class ConnectorUpdater {
         maxUncompressedBytes: 4 * 1024 * 1024
       });
       const profileFiles = (await fs.promises.readdir(stagingDirectory))
-        .filter(file => /^\d+\.\d+\.json$/i.test(file));
+        .filter(file => /\.json$/i.test(file));
       if (profileFiles.length === 0) {
         throw new Error('QQ 画像包没有版本画像 JSON');
       }
@@ -1417,14 +1426,7 @@ export class ConnectorUpdater {
           path.join(stagingDirectory, file),
           'utf8'
         ));
-        if (
-          document.schemaVersion !== 1
-          || !/^\d+\.\d+$/.test(String(document.fileVersion || ''))
-          || !/^[a-f0-9]{64}$/i.test(String(document.clientSha256 || ''))
-          || !/^[a-f0-9]{64}$/i.test(String(document.commonSha256 || ''))
-        ) {
-          throw new Error(`QQ 画像文件无效：${file}`);
-        }
+        validateQqProfileDocument(document, file, entry.schemaVersion);
       }
 
       if (await pathExists(versionDirectory)) {
@@ -1433,6 +1435,8 @@ export class ConnectorUpdater {
       await fs.promises.rename(stagingDirectory, versionDirectory);
       await this.writeActiveQQMusicProfiles({
         version: entry.version,
+        schemaVersion: entry.schemaVersion,
+        minimumConnectorVersion: entry.minimumConnectorVersion,
         directory: versionDirectory,
         activatedAt: new Date().toISOString()
       });
@@ -1444,6 +1448,28 @@ export class ConnectorUpdater {
         await removeInside(profileRoot, stagingDirectory);
       }
     }
+  }
+
+  private async validateCachedQQMusicProfiles(
+    active: ActiveQQMusicProfiles,
+    connectorVersion: string
+  ): Promise<string | null> {
+    if (!canUseCachedQqProfiles(active, connectorVersion)) return null;
+    const root = await fs.promises.realpath(this.getQQMusicProfileRoot());
+    const directory = await fs.promises.realpath(active.directory);
+    const expected = path.join(root, active.version);
+    if (path.resolve(directory) !== path.resolve(expected)) {
+      throw new Error('QQ 缓存画像目录越界或指向其他版本');
+    }
+    const entries = (await fs.promises.readdir(directory, { withFileTypes: true }))
+      .filter(file => /\.json$/i.test(file.name));
+    if (entries.length === 0) throw new Error('QQ 缓存画像没有版本画像 JSON');
+    for (const file of entries) {
+      if (!file.isFile() || file.isSymbolicLink()) throw new Error('QQ 缓存画像必须是普通 JSON 文件');
+      const document = JSON.parse(await fs.promises.readFile(path.join(directory, file.name), 'utf8'));
+      validateQqProfileDocument(document, file.name, active.schemaVersion ?? 1);
+    }
+    return active.directory;
   }
 
   private async readActiveQQMusicProfiles(): Promise<ActiveQQMusicProfiles | null> {

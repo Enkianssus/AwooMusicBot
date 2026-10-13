@@ -5,6 +5,7 @@ import test from 'node:test';
 import ts from 'typescript';
 import * as queuePolicy from '../electron/queue-head-policy.ts';
 import * as playerTypes from '../electron/players/types.ts';
+import * as compatibility from '../electron/qq-native-compatibility-policy.ts';
 
 // Run the actual manager methods with inert bridge/backend constructors. No
 // Electron module, connector process, media session, network or UI is loaded.
@@ -18,6 +19,7 @@ class InertBackend {}
 const imports = {
   '../player-bridge-client': { PlayerBridgeClient: InertBackend },
   '../queue-head-policy': queuePolicy,
+  '../qq-native-compatibility-policy': compatibility,
   '../player-process-inspector': {
     inspectPlayerProcess() { throw new Error('Pure tests must not inspect processes'); }
   },

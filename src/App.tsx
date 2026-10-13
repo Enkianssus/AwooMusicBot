@@ -328,7 +328,19 @@ interface PlayerProcessAccessNotice {
     detectedAt: string;
 }
 
-type PlayerControlNotice = PlayerUpgradeNotice | PlayerProcessAccessNotice;
+interface PlayerCompatibilityNotice {
+    kind: 'compatibility';
+    code: 'qqmusic-player-version-unsupported';
+    reason: 'player-version-unsupported';
+    playerKey: 'qqmusic';
+    playerName: string;
+    currentVersion: string;
+    blockedCommand: string;
+    processId: number | null;
+    detectedAt: string;
+}
+
+type PlayerControlNotice = PlayerUpgradeNotice | PlayerProcessAccessNotice | PlayerCompatibilityNotice;
 
 type OverlaySettingValue = string | number | boolean;
 
@@ -3329,6 +3341,8 @@ const AdminWidget: React.FC = () => {
                                             <p className="mt-1 text-xs leading-relaxed text-gray-300">
                                                 {playerControlNotice.kind === 'process-access'
                                                     ? 'Windows 或 360 等安全软件拒绝了点歌机对播放器进程的控制。请先完全退出点歌机和播放器，确认两者使用相同权限重新打开，并查看安全软件的行为防护或隔离记录。'
+                                                    : playerControlNotice.kind === 'compatibility'
+                                                        ? `当前 QQ 音乐 v${playerControlNotice.currentVersion} 尚未适配点歌插入，已保留待播歌曲并停止自动切换。搜索、暂停和手动切歌仍可使用。`
                                                     : playerControlNotice.reason === 'older-than-tested-after-control-failure'
                                                         ? `播放器 v${playerControlNotice.currentVersion} 的点歌控制刚刚失败；该版本低于当前连接器已验证的 v${playerUpgradeTargetVersion}。建议升级播放器，而不是反复重新安装连接器。`
                                                         : `连接器已确认当前播放器版本不受支持。建议改用已验证的 v${playerUpgradeTargetVersion}，而不是反复重新安装连接器。`}
@@ -3336,6 +3350,8 @@ const AdminWidget: React.FC = () => {
                                             <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
                                                 {playerControlNotice.kind === 'process-access'
                                                     ? '如需确认，可临时暂停 360 行为防护并只测试一次；如果恢复正常，请立即重新开启防护，再按下方说明加入信任区。不建议长期关闭杀毒软件。'
+                                                    : playerControlNotice.kind === 'compatibility'
+                                                        ? '请检查 QQ 连接器更新，并安装明确支持当前 QQ 版本的连接器；支持恢复后可继续点歌，无需重启点歌机。'
                                                     : `升级后请完全退出并重新打开${playerControlNotice.playerName}，再到播放器设置点击“重新连接”。`}
                                             </p>
                                             {playerControlNotice.kind === 'process-access' && (
@@ -4033,11 +4049,15 @@ const AdminWidget: React.FC = () => {
                                                 <div className={`font-bold ${playerAccessBlocked ? 'text-red-300' : 'text-orange-300'}`}>
                                                     {playerAccessBlocked
                                                         ? `${playerControlNotice.playerName}控制权限被 Windows 拒绝`
+                                                        : playerControlNotice.kind === 'compatibility'
+                                                            ? `当前 QQ 音乐 v${playerControlNotice.currentVersion} 尚未适配`
                                                         : `请升级${playerControlNotice.playerName}客户端`}
                                                 </div>
                                                 <div className="mt-1 leading-relaxed text-gray-300">
                                                     {playerControlNotice.kind === 'process-access'
                                                         ? '请先确认点歌机与播放器使用相同权限。若 360 的行为防护记录与失败时间吻合，可以临时暂停防护测试一次；确认恢复后立即重新开启，并将“嗷呜点歌机.exe 所在文件夹”和“%APPDATA%\\嗷呜点歌机\\player-connectors”加入信任区，然后完全重启点歌机与播放器。不建议长期关闭杀毒软件，也不要把整个下载目录或 AppData 加入白名单。'
+                                                        : playerControlNotice.kind === 'compatibility'
+                                                            ? '已暂停点歌插入和自动队首纠正，待播列表保持不变。请检查 QQ 连接器更新，安装明确支持此版本的连接器。搜索和手动播放控制仍可用；无需反复重装或降级 QQ。'
                                                         : `当前 v${playerControlNotice.currentVersion} 已连接，但播放控制未生效；建议升级到已验证版本 v${playerUpgradeTargetVersion}，或连接器明确支持的更新版本。升级后完全退出并重新打开播放器，再点击下方“重新连接”。无需重复安装连接器。`}
                                                 </div>
                                             </div>

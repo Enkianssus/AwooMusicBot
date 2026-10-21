@@ -40,6 +40,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('admin-navigate', listener)
     return () => ipcRenderer.removeListener('admin-navigate', listener)
   },
+  // 控制面板关闭前，主进程会请求先把防抖中的设置写完再销毁窗口。
+  onFlushPendingSaves: (callback: () => Promise<unknown> | void) => {
+    const listener = (_event: Electron.IpcRendererEvent, requestId: unknown) => {
+      void Promise.resolve()
+        .then(callback)
+        .catch(() => undefined)
+        .finally(() => ipcRenderer.send('admin-pending-saves-flushed', requestId))
+    }
+    ipcRenderer.on('admin-flush-pending-saves', listener)
+    return () => ipcRenderer.removeListener('admin-flush-pending-saves', listener)
+  },
   closeWindow: () => ipcRenderer.send('close-window'),
   minimizeWindow: () => ipcRenderer.send('minimize-window'),
   resizeOverlay: (width: number, height: number) =>

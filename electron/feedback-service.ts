@@ -109,6 +109,16 @@ export async function getFeedbackStatus(
   }
 }
 
+/**
+ * The Windows account name in a profile path such as C:\Users\name\AppData,
+ * C:\\Users\\name (escaped) or file:///C:/Users/name/ (stack traces). Inside
+ * a longer path the name may contain spaces and apostrophes; a path that
+ * ends at the name stops at the first space or quote, so the rest of the
+ * message stays readable.
+ */
+const WINDOWS_PROFILE_PATH =
+  /([a-z]:[\\/]+users[\\/]+)(?:[^\\/\r\n"<>|?*:]+(?=[\\/])|[^\s\\/"'<>|?*:]+)/gi;
+
 export function sanitizeFeedbackLog(message: string): string {
   return String(message)
     .replace(
@@ -119,5 +129,6 @@ export function sanitizeFeedbackLog(message: string): string {
       /([?&](?:token|access_token|csrf|sessdata)=)[^&\s]+/gi,
       '$1[已隐藏]'
     )
+    .replace(WINDOWS_PROFILE_PATH, '$1<用户>')
     .slice(0, 1200);
 }

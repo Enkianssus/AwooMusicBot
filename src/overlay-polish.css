@@ -1,10 +1,11 @@
 /* Day/night mode affects the presentation, never saved custom colors or opacity. */
+/* The status colors (danger, warning, info, success) and muted text reach about 4.5:1 on the light panel. */
 .awoo-overlay {
-  --overlay-accent: #178bdf; --overlay-ink: #244766; --overlay-muted: #7087a0;
+  --overlay-accent: #178bdf; --overlay-ink: #244766; --overlay-muted: #5d7590;
   --overlay-line: #8fc8ee60; --overlay-card: #ffffffba; --overlay-card-hover: #e5f5fff0;
   --overlay-tint: #168cff13; --overlay-toolbar: #f5fafff5; --overlay-shadow: #2e80b820;
   --overlay-contact-shadow: #19374c14;
-  --overlay-danger: #d04462; --overlay-warning: #a66c13;
+  --overlay-danger: #c43d59; --overlay-warning: #97620d; --overlay-info: #0b78a6; --overlay-success: #18794e;
   font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
   color: var(--overlay-ink); -webkit-font-smoothing: antialiased; color-scheme: light;
 }
@@ -13,13 +14,12 @@
   --overlay-line: #5c95cb3b; --overlay-card: #1a2c458c; --overlay-card-hover: #233e5cde;
   --overlay-tint: #259dff16; --overlay-toolbar: #132339f5; --overlay-shadow: #0209134d;
   --overlay-contact-shadow: #02091338;
-  --overlay-danger: #ff8ba1; --overlay-warning: #efd18c; color-scheme: dark;
+  --overlay-danger: #ff8ba1; --overlay-warning: #efd18c; --overlay-info: #67d4f5; --overlay-success: #6fdba5; color-scheme: dark;
 }
 .awoo-overlay .awoo-icon { display: inline-block; width: 18px; height: 18px; flex-shrink: 0; vertical-align: middle; }
 /* Fade out inside the existing 20px transparent window gutter. */
 .awoo-overlay > .glass-panel-base { min-height: 0; border: 1px solid var(--overlay-line); border-radius: 17px; box-shadow: 0 4px 14px -6px var(--overlay-shadow), 0 1px 4px -1px var(--overlay-contact-shadow), inset 0 1px 0 #ffffff35; }
 .awoo-overlay[data-pinned="true"] > .glass-panel-base { border-top: 2px solid var(--overlay-accent); }
-.awoo-overlay > .glass-panel-base > .mix-blend-screen { display: none; }
 .awoo-overlay button { -webkit-app-region: no-drag; transition: background-color .16s, color .16s, opacity .16s, transform .16s; }
 .awoo-overlay button:focus-visible { outline: 2px solid var(--overlay-accent); outline-offset: 2px; }
 .awoo-overlay button:disabled { cursor: default; }
@@ -56,10 +56,18 @@
 .awoo-overlay .current-zone .tracking-wider { letter-spacing: .025em; }
 .awoo-overlay .current-zone .animate-bounce { animation: none; }
 .awoo-overlay .current-zone.opacity-75 { opacity: 1; }
-.awoo-overlay :is(.text-sky-300, .text-sky-400, .text-cyan-300) { color: var(--overlay-accent); }
+.awoo-overlay :is(.text-sky-200, .text-sky-300, .text-sky-400, .text-cyan-300) { color: var(--overlay-accent); }
 .awoo-overlay :is(.text-yellow-400, .text-amber-400\/80) { color: var(--overlay-warning); }
 .awoo-overlay .text-red-400 { color: var(--overlay-danger); }
+.awoo-overlay .text-white\/80 { color: var(--overlay-muted); }
 .awoo-overlay :is(.bg-sky-300, .bg-sky-400) { background-color: var(--overlay-accent); box-shadow: none; }
+.awoo-overlay :is(.bg-yellow-400, .bg-amber-400\/80) { background-color: var(--overlay-warning); }
+.awoo-overlay .bg-white\/30 { background-color: var(--overlay-line); }
+/* Artwork boxes behind avatars and covers. */
+.awoo-overlay :is(.bg-slate-800, .bg-sky-950\/60, .bg-black\/30) { background-color: var(--overlay-tint); }
+.awoo-overlay .artwork-placeholder { display: grid; place-items: center; width: 100%; height: 100%; background: var(--overlay-tint); color: var(--overlay-accent); font-weight: 600; }
+.awoo-overlay .artwork-placeholder .awoo-icon { width: 50%; height: 50%; }
+.awoo-overlay .artwork-placeholder .artwork-initial { width: 100%; height: 100%; }
 .awoo-overlay .overlay-empty { border-style: solid; min-height: 138px; gap: 2px; text-align: center; }
 .awoo-overlay .overlay-empty .awoo-icon { width: 29px; height: 29px; color: var(--overlay-accent); }
 .awoo-overlay .overlay-empty .text-\[10px\] { font-size: 11px; }

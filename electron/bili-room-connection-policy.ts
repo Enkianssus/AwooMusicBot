@@ -141,3 +141,36 @@ export function reduceBiliRoomConnectionState(
       return state;
   }
 }
+
+/**
+ * The server answers every 30 s heartbeat (op=2) with op=3, so an
+ * authenticated socket that has received nothing for this long is a dead,
+ * half-open connection even though it still looks open.
+ */
+export const BILI_SOCKET_SILENCE_TIMEOUT_MS = 70_000;
+
+/**
+ * Waits before the danmaku token and host list are fetched again after a
+ * whole round of endpoints failed; the last entry is the cap.
+ */
+export const BILI_ROOM_REFRESH_DELAYS_MS: readonly number[] = [5000, 15000, 30000, 60000];
+
+/** Whether the socket has been silent for at least `timeoutMs` (invalid times never trigger it). */
+export function shouldReconnectForSilence(
+  lastPacketAt: number,
+  now: number,
+  timeoutMs = BILI_SOCKET_SILENCE_TIMEOUT_MS
+): boolean {
+  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : BILI_SOCKET_SILENCE_TIMEOUT_MS;
+  if (!Number.isFinite(lastPacketAt) || !Number.isFinite(now)) return false;
+  return now - lastPacketAt >= timeout;
+}
+
+/** The wait before refresh number `attempt` (0 for the first since the last successful authentication). */
+export function nextRoomRefreshDelayMs(attempt: number): number {
+  const steps = BILI_ROOM_REFRESH_DELAYS_MS;
+  const index = attempt >= 0 ? Math.min(Math.floor(attempt), steps.length - 1) : 0;
+  return steps[index];
+}

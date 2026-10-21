@@ -14,6 +14,7 @@
           <div class="cover-frame" id="current-cover-frame" data-artwork-kind="fallback">
             <img id="current-cover" alt="" hidden>
             <span class="cover-fallback" id="current-cover-fallback" aria-hidden="true">♫</span>
+            <video id="current-cover-video" muted loop playsinline preload="none" aria-hidden="true" hidden></video>
           </div>
 
           <div class="current-copy">
@@ -64,6 +65,7 @@
             </div>
             <span class="queue-count" id="queue-count">0 首</span>
           </div>
+          <div class="queue-notifications" id="queue-notifications" role="status" aria-live="polite" aria-atomic="false" aria-relevant="additions text" hidden></div>
           <ol class="queue-list" id="queue-list"></ol>
           <p class="queue-empty" id="queue-empty">暂无待播歌曲</p>
         </section>

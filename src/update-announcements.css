@@ -35,7 +35,22 @@
 .update-announcements-version .awoo-icon { width: 14px; height: 14px; }
 .update-announcements-version strong { font-weight: 600; color: var(--studio-strong); }
 .update-announcements-badge { border: 1px solid var(--studio-accent-line); border-radius: 6px; padding: 2px 7px; background: var(--studio-tint); color: var(--studio-strong); font-size: 10px; line-height: 1.7; white-space: nowrap; }
-.update-announcements-notes { margin-top: 14px; color: var(--studio-secondary); font-size: 12px; line-height: 1.9; white-space: pre-wrap; overflow-wrap: anywhere; }
+.update-announcements-notes { margin-top: 14px; }
+.release-notes { color: var(--studio-secondary); font-size: 12px; line-height: 1.9; overflow-wrap: anywhere; }
+.release-notes-content.is-clamped { max-height: calc(1.9em * 8); overflow: hidden; }
+.release-notes-content.is-faded { -webkit-mask-image: linear-gradient(180deg, #000 calc(100% - 2.4em), transparent); mask-image: linear-gradient(180deg, #000 calc(100% - 2.4em), transparent); }
+.release-notes :is(h4, h5) { margin: 0; color: var(--studio-text); font-weight: 650; line-height: 1.7; }
+.release-notes h4 { font-size: 13px; }
+.release-notes h5 { font-size: 12px; }
+.release-notes p, .release-notes ul { margin: 0; }
+.release-notes-content > * + * { margin-top: 6px; }
+.release-notes ul { padding-left: 1.4em; list-style: disc; }
+.release-notes li + li { margin-top: 2px; }
+.release-notes li::marker { color: var(--studio-accent); }
+.release-notes strong { color: var(--studio-text); font-weight: 650; }
+.release-notes code { padding: 1px 5px; border-radius: 5px; background: var(--studio-tint); color: var(--studio-strong); font-family: Consolas, "Cascadia Mono", monospace; font-size: .92em; white-space: pre-wrap; }
+.release-notes-toggle { margin-top: 4px; padding: 2px 0; border: 0; background: transparent; color: var(--studio-strong); font-size: 11px; font-weight: 600; cursor: pointer; }
+.release-notes-toggle:hover { text-decoration: underline; }
 .update-announcements-compatibility { display: flex; gap: 7px; align-items: flex-start; margin: 12px 0 0; padding: 9px 11px; border: 1px solid var(--studio-warning-line); border-radius: 8px; background: var(--studio-warning-tint); color: var(--studio-warning); font-size: 11px; line-height: 1.7; }
 .update-announcements-compatibility .awoo-icon { width: 16px; height: 16px; margin-top: 2px; }
 .update-announcements-card-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 12px; margin-top: 15px; }
@@ -68,6 +83,18 @@
 .update-announcements-progress progress { width: 100%; height: 5px; display: block; margin-top: 10px; border: 0; border-radius: 8px; overflow: hidden; accent-color: var(--studio-accent); background: var(--studio-tint-strong); }
 .update-announcements-progress progress::-webkit-progress-bar { background: var(--studio-tint-strong); }
 .update-announcements-progress progress::-webkit-progress-value { background: var(--studio-accent); }
+.update-announcements-card .update-announcements-progress { margin-top: 13px; }
+.update-announcements-progress-detail { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; margin: 8px 0 0; color: var(--studio-secondary); font-size: 11px; line-height: 1.6; }
+.update-announcements-progress.is-stalled { border-color: var(--studio-warning-line); }
+.update-announcements-stall { color: var(--studio-warning); font-weight: 600; }
+.update-announcements-confirm { margin-top: 15px; padding: 14px 15px; border: 1px solid var(--studio-accent-line); border-radius: 11px; background: var(--studio-tint); color: var(--studio-secondary); font-size: 12px; line-height: 1.7; }
+.update-announcements-body > .update-announcements-confirm:first-child { margin: 0 0 14px; }
+.update-announcements-confirm:focus { outline: none; }
+.update-announcements-confirm > strong { display: block; color: var(--studio-text); font-size: 13px; font-weight: 650; }
+.update-announcements-confirm ul { margin: 7px 0 0; padding-left: 1.4em; list-style: disc; }
+.update-announcements-confirm li + li { margin-top: 3px; }
+.update-announcements-confirm li.is-warning { color: var(--studio-warning); font-weight: 600; }
+.update-announcements-confirm-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 13px; }
 .update-announcements-error, .update-announcements-progress.is-error { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--studio-danger-line); border-radius: 9px; color: var(--studio-danger); background: var(--studio-danger-tint); font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
 .update-announcements-error p { margin: 0; }
 .update-announcements-error p + p { margin-top: 5px; }

@@ -3,6 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { FileHandle } from 'node:fs/promises';
 import { downloadBufferWithRanges } from './connector-download.ts';
+import { createProgressLogThrottle } from './connector-install-policy.ts';
+import {
+  removeStaleEntries,
+  renameWithRetry,
+  rmWithRetry
+} from './fs-retry.ts';
 import { extractZipSafely } from './safe-zip.ts';
 
 export type DotnetRuntimeRid = 'win-x86' | 'win-x64';
@@ -67,6 +73,12 @@ const WHOLE_DOWNLOAD_MAX_ATTEMPTS = 3;
 const WHOLE_DOWNLOAD_RETRY_DELAY_MS = 500;
 const WHOLE_DOWNLOAD_INACTIVITY_TIMEOUT_MS = 60_000;
 const UNKNOWN_SIZE_PROGRESS_STEP = 256 * 1024;
+const METADATA_TIMEOUT_MS = 20_000;
+const PROBE_TIMEOUT_MS = 10_000;
+const FETCH_MAX_ATTEMPTS = 3;
+const RUNTIME_RIDS: readonly DotnetRuntimeRid[] = ['win-x86', 'win-x64'];
+const STALE_DEBRIS_PREFIXES = ['.download-', '.staging-'];
+const STALE_DEBRIS_MAX_AGE_MS = 60 * 60 * 1000;
 
 /**
  * Select and validate the runtime archive advertised by the official
@@ -178,6 +190,10 @@ export interface PrivateDotnetRuntimeOptions {
   rootDirectory: string;
   fetchImpl?: PrivateDotnetFetch;
   onLog?: (message: string) => void;
+  /** Per-attempt limit for the release metadata, including its JSON body. */
+  metadataTimeoutMs?: number;
+  /** Per-attempt limit for the HEAD and one-byte Range size probes. */
+  probeTimeoutMs?: number;
 }
 
 export function readDotnetDownloadSize(
@@ -196,11 +212,28 @@ export class PrivateDotnetRuntimeManager {
   private readonly rootDirectory: string;
   private readonly fetchImpl: PrivateDotnetFetch;
   private readonly onLog: (message: string) => void;
+  private readonly metadataTimeoutMs: number;
+  private readonly probeTimeoutMs: number;
+  private debrisSweep: Promise<void> | null = null;
 
   constructor(options: PrivateDotnetRuntimeOptions) {
     this.rootDirectory = options.rootDirectory;
     this.fetchImpl = options.fetchImpl || fetch;
     this.onLog = options.onLog || (() => undefined);
+    this.metadataTimeoutMs = options.metadataTimeoutMs ?? METADATA_TIMEOUT_MS;
+    this.probeTimeoutMs = options.probeTimeoutMs ?? PROBE_TIMEOUT_MS;
+  }
+
+  /**
+   * Remove downloads and staging directories left by an interrupted install.
+   * Runs once per manager and never rejects; installs wait for it, so it
+   * cannot race their own staging paths.
+   */
+  sweepStaleDebris(): Promise<void> {
+    if (!this.debrisSweep) {
+      this.debrisSweep = this.sweepStaleDebrisInternal();
+    }
+    return this.debrisSweep;
   }
 
   ensure(
@@ -228,6 +261,7 @@ export class PrivateDotnetRuntimeManager {
   ): Promise<string> {
     const ridRoot = path.resolve(this.rootDirectory, runtimeRid);
     await fs.promises.mkdir(ridRoot, { recursive: true });
+    await this.sweepStaleDebris();
 
     const cached = await findVerifiedRuntime(ridRoot, runtimeRid, channel);
     if (cached) {
@@ -237,11 +271,15 @@ export class PrivateDotnetRuntimeManager {
 
     const metadataUrl =
       `https://builds.dotnet.microsoft.com/dotnet/release-metadata/${channel}/releases.json`;
-    const metadataResponse = await this.fetchWithRetry(metadataUrl, {
+    const metadata = await this.fetchWithRetry(metadataUrl, {
       method: 'GET',
       cache: 'no-store'
-    }, '.NET Runtime 元数据');
-    const metadata = await metadataResponse.json() as unknown;
+    }, '.NET Runtime 元数据', {
+      timeoutMs: this.metadataTimeoutMs,
+      // The body is read inside the same attempt so a stalled transfer is
+      // also bounded by the per-attempt timeout.
+      read: response => response.json() as Promise<unknown>
+    });
     const artifact = selectDotnetRuntimeArtifact(metadata, runtimeRid, channel);
     const nonce = crypto.randomBytes(8).toString('hex');
     const archivePath = path.join(
@@ -253,6 +291,7 @@ export class PrivateDotnetRuntimeManager {
       `.staging-${channel}-${nonce}`
     );
     const versionDirectory = path.join(ridRoot, artifact.version);
+    const shouldLogProgress = createProgressLogThrottle();
     try {
       const downloadPlan = await this.resolveDownloadSize(artifact.url);
       if (downloadPlan.strategy === 'whole') {
@@ -262,7 +301,12 @@ export class PrivateDotnetRuntimeManager {
           fetchImpl: this.fetchImpl,
           initialResponse: downloadPlan.response,
           onProgress: progress => {
-            if (progress.total > 0) {
+            const knownTotal = progress.total > 0;
+            if (!shouldLogProgress(
+              knownTotal ? progress.percent : null,
+              Date.now()
+            )) return;
+            if (knownTotal) {
               this.onLog(
                 `[.NET Runtime] ${runtimeRid} 下载进度 ${progress.percent}% `
                 + `(${progress.received}/${progress.total})`
@@ -282,6 +326,7 @@ export class PrivateDotnetRuntimeManager {
           expectedSize: downloadPlan.size,
           fetchImpl: this.fetchImpl,
           onProgress: progress => {
+            if (!shouldLogProgress(progress.percent, Date.now())) return;
             this.onLog(
               `[.NET Runtime] ${runtimeRid} 下载进度 ${progress.percent}% `
               + `(${progress.received}/${progress.total})`
@@ -319,7 +364,9 @@ export class PrivateDotnetRuntimeManager {
         if (existing) return existing;
         await removePath(versionDirectory);
       }
-      await fs.promises.rename(stagingDirectory, versionDirectory);
+      // Antivirus software commonly scans the freshly extracted runtime and
+      // holds it briefly, so the swap retries transient Windows locks.
+      await renameWithRetry(stagingDirectory, versionDirectory);
       return versionDirectory;
     } finally {
       await removePath(archivePath);
@@ -328,11 +375,17 @@ export class PrivateDotnetRuntimeManager {
   }
 
   private async resolveDownloadSize(url: string): Promise<RuntimeDownloadPlan> {
+    const headController = new AbortController();
+    const headTimeout = setTimeout(
+      () => headController.abort(),
+      this.probeTimeoutMs
+    );
     try {
-      const head = await this.fetchImpl(url, {
+      const head = await abortable(this.fetchImpl(url, {
         method: 'HEAD',
-        cache: 'no-store'
-      });
+        cache: 'no-store',
+        signal: headController.signal
+      }), headController.signal);
       if (head.ok) {
         const responseSize = readDotnetDownloadSize(
           head.status,
@@ -343,7 +396,10 @@ export class PrivateDotnetRuntimeManager {
         }
       }
     } catch {
-      // Some CDNs reject HEAD; the one-byte range probe below is equivalent.
+      // Some CDNs reject or stall HEAD; the one-byte range probe below is
+      // equivalent.
+    } finally {
+      clearTimeout(headTimeout);
     }
 
     let rangeResponse: Response;
@@ -353,6 +409,11 @@ export class PrivateDotnetRuntimeManager {
         cache: 'no-store',
         headers: { Range: 'bytes=0-0' }
       }, '.NET Runtime 文件大小探测', {
+        timeoutMs: this.probeTimeoutMs,
+        // Only the headers are bounded here: a server that ignores Range
+        // returns the whole archive, which the full download then streams
+        // under its own inactivity timeout.
+        read: async response => response,
         shouldRetryStatus: status => !isRangeProbeFallbackStatus(status)
       });
     } catch (error: unknown) {
@@ -401,25 +462,42 @@ export class PrivateDotnetRuntimeManager {
     return { strategy: 'ranges', size: contentRange.total };
   }
 
-  private async fetchWithRetry(
+  private async fetchWithRetry<T>(
     url: string,
     init: RequestInit,
     label: string,
-    options: { shouldRetryStatus?: (status: number) => boolean } = {}
-  ): Promise<Response> {
+    options: {
+      timeoutMs: number;
+      read: (response: Response) => Promise<T>;
+      shouldRetryStatus?: (status: number) => boolean;
+    }
+  ): Promise<T> {
     let lastError: unknown;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    for (let attempt = 1; attempt <= FETCH_MAX_ATTEMPTS; attempt += 1) {
+      // Each attempt has its own deadline; without it a stalled connection
+      // would hold the shared update lock indefinitely.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
       try {
-        const response = await this.fetchImpl(url, init);
-        if (response.ok) return response;
+        const response = await abortable(this.fetchImpl(url, {
+          ...init,
+          signal: controller.signal
+        }), controller.signal);
+        if (response.ok) {
+          return await abortable(options.read(response), controller.signal);
+        }
         await cancelResponseBody(response);
         lastError = new DotnetHttpError(response.status);
         if (options.shouldRetryStatus?.(response.status) === false) break;
       } catch (error: unknown) {
-        lastError = error;
+        lastError = controller.signal.aborted
+          ? new Error(`请求超时（${options.timeoutMs / 1000} 秒）`)
+          : error;
+      } finally {
+        clearTimeout(timeout);
       }
-      if (attempt < 3) {
-        await new Promise(resolve => setTimeout(resolve, attempt * 500));
+      if (attempt < FETCH_MAX_ATTEMPTS) {
+        await delay(attempt * 500);
       }
     }
     const message = lastError instanceof Error
@@ -429,6 +507,36 @@ export class PrivateDotnetRuntimeManager {
       throw new DotnetHttpError(lastError.status, `${label}失败：`);
     }
     throw new Error(`${label}失败：${message}`);
+  }
+
+  private async sweepStaleDebrisInternal(): Promise<void> {
+    for (const rid of RUNTIME_RIDS) {
+      try {
+        const { removed, failed } = await removeStaleEntries(
+          path.resolve(this.rootDirectory, rid),
+          {
+            prefixes: STALE_DEBRIS_PREFIXES,
+            maxAgeMs: STALE_DEBRIS_MAX_AGE_MS
+          }
+        );
+        if (removed.length > 0) {
+          this.onLog(
+            `[.NET Runtime] 已清理 ${rid} 中 ${removed.length} 个中断安装留下的临时文件`
+          );
+        }
+        if (failed.length > 0) {
+          this.onLog(
+            `[.NET Runtime] ${rid} 中 ${failed.length} 个过期临时文件暂时无法删除，`
+            + '将在下次启动时重试'
+          );
+        }
+      } catch (error: unknown) {
+        this.onLog(
+          `[.NET Runtime] 清理 ${rid} 临时文件失败：`
+          + (error instanceof Error ? error.message : String(error))
+        );
+      }
+    }
   }
 }
 
@@ -600,6 +708,31 @@ async function writeFileChunk(fileHandle: FileHandle, chunk: Uint8Array): Promis
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+/**
+ * Settle no later than `signal` aborts, even when a fetch implementation
+ * ignores the signal or a body read never completes.
+ */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      value => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      error => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      }
+    );
+  });
 }
 
 async function cancelResponseBody(response: Response): Promise<void> {
@@ -821,7 +954,7 @@ async function isDirectory(directory: string): Promise<boolean> {
 
 async function removePath(target: string): Promise<void> {
   try {
-    await fs.promises.rm(target, { recursive: true, force: true });
+    await rmWithRetry(target);
   } catch {
     // Cleanup is best effort; the primary install error is more useful to the
     // caller than a failed removal of an already-gone staging path.

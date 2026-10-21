@@ -1,6 +1,6 @@
 # 本机只读接口（OBS 浏览器捕捉）
 
-嗷呜点歌机提供一个只读的本机接口，方便第三方开发者制作自己的网页前端，并把网页作为 OBS 的“浏览器”来源显示。接口只提供当前播放、点歌队列和两个业务开关的状态，不提供任何控制命令。
+嗷呜点歌机提供一个只读的本机接口，方便第三方开发者制作自己的网页前端，并把网页作为 OBS 的“浏览器”来源显示。接口只提供当前播放、点歌队列、点歌提示和两个业务开关的状态，不提供任何控制命令。
 
 ## 开启与地址
 
@@ -20,12 +20,14 @@ http://127.0.0.1:5556/overlay/
 
 所有 HTTP 接口均为 `GET`。服务器也接受 `OPTIONS` 预检请求（返回 `204`），以便本地网页跨源读取；不接受 `POST`、`PUT`、`PATCH` 或 `DELETE`。响应为 UTF-8 JSON，并带有 `Cache-Control: no-store`。
 
+请求地址必须使用 `127.0.0.1` 或 `localhost` 加设置中的端口（即 `Host` 请求头为 `127.0.0.1:5556` 或 `localhost:5556`）。通过其他主机名访问，例如指向本机的自定义域名，HTTP 和 WebSocket 都会返回 `403`，以防 DNS 重绑定。
+
 | 方法与路径 | 用途 | 响应 |
 | --- | --- | --- |
 | `GET /health` | 检查接口是否运行 | `{ "ok": true, "schemaVersion": 1, "version": "..." }` |
 | `GET /api/v1/state` | 获取完整快照，推荐作为页面初始化接口 | `ExternalApiState`（见下文） |
 | `GET /api/v1/current` | 只获取当前播放和播放器/业务状态 | `schemaVersion`、`appVersion`、`timestamp`、`player`、`current`、`currentIsRequested`、`service` |
-| `GET /api/v1/queue` | 只获取点歌队列和队列播放状态 | `schemaVersion`、`appVersion`、`timestamp`、`queue`、`queueLength`、`service` |
+| `GET /api/v1/queue` | 只获取点歌队列、点歌提示和队列播放状态 | `schemaVersion`、`appVersion`、`timestamp`、`queue`、`queueLength`、`requestNotifications`、`service` |
 
 没有启用 HTTP 时，HTTP 请求不会返回数据。未知路径返回 `404`；客户端不要把 `404` 当作“队列为空”。
 
@@ -46,7 +48,7 @@ ws://127.0.0.1:5556/ws
 }
 ```
 
-客户端应忽略不认识的消息类型，并在连接关闭时重连。WebSocket 没有控制消息，客户端不应向服务器发送控制指令。
+客户端应忽略不认识的消息类型，并在连接关闭时重连。WebSocket 是只读的，没有控制消息：客户端发送任何消息，服务器都会以关闭码 `1008` 断开连接；单帧最大 4 KiB，超出时连接会被立即断开。服务器每 30 秒发送一次 ping，到下一轮仍未回应 pong 的连接会被断开；浏览器会自动回应 ping，页面无需处理。
 
 ## `ExternalApiState` 完整示例
 
@@ -72,6 +74,7 @@ ws://127.0.0.1:5556/ws
     "artist": "Porter Robinson / Madeon",
     "album": "Shelter",
     "coverUrl": "https://example.invalid/cover.jpg",
+    "dynamicCoverUrl": "https://mvod.itunes.apple.com/itunes-assets/example/cover.m3u8",
     "requestedBy": "观众A",
     "requestedByUid": "10001",
     "requestedByAvatar": "https://example.invalid/avatar.jpg",
@@ -85,6 +88,7 @@ ws://127.0.0.1:5556/ws
       "artist": "示例歌手",
       "album": "示例专辑",
       "coverUrl": "https://example.invalid/queue-cover.jpg",
+      "dynamicCoverUrl": "",
       "requestedBy": "观众B",
       "requestedByUid": "10002",
       "requestedByAvatar": "",
@@ -108,7 +112,19 @@ ws://127.0.0.1:5556/ws
   "commandQueue": {
     "pending": 0,
     "processing": false
-  }
+  },
+  "requestNotifications": [
+    {
+      "id": "mdv8k2xa-12",
+      "kind": "success",
+      "action": "request",
+      "title": "下一首歌曲",
+      "message": "点歌成功，已加入待播队列",
+      "requestedBy": "观众B",
+      "createdAt": 1785729598000,
+      "expiresAt": 1785729604000
+    }
+  ]
 }
 ```
 
@@ -133,6 +149,26 @@ ws://127.0.0.1:5556/ws
 | `pausedAfterRequests` | boolean | 点歌队列播完后是否处于“按设置自动暂停”的状态。它与 `queuePlayback.state` 是不同维度。 |
 | `commandQueue.pending` | number | 点歌机内部待处理弹幕命令数，仅用于诊断或展示。 |
 | `commandQueue.processing` | boolean | 是否正在处理一条内部弹幕命令。 |
+| `requestNotifications` | array | 最近的点歌、撤回和主播移出提示，最多 20 条。旧版本可能不提供，按空数组处理。完整快照、WebSocket 和 `/api/v1/queue` 均包含此字段。 |
+
+### 队列旁的点歌提示
+
+`requestNotifications` 中每条提示包含以下字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 同一次请求的稳定标识；等待变为结果时更新该条提示。 |
+| `kind` | `waiting` / `success` / `cancelled` / `error` | 等待处理、点歌成功、歌曲已移出待播队列、请求失败。 |
+| `action` | `request` / `cancel` / `remove` | 提示对应的操作：观众点歌、观众撤回、主播把歌曲移出待播队列。`kind: "cancelled"` 配合 `cancel` 表示观众撤回成功，配合 `remove` 表示主播移除；`kind: "error"` 配合 `request` 或 `cancel` 区分点歌失败与撤回失败。旧版本没有此字段，缺失时按 `request` 处理；以后可能增加取值，不认识的值也按 `request` 处理。 |
+| `title` | string | 点歌在搜索前为关键词，成功后为实际歌名；未填写歌名时为“未填写歌名”。不带歌名的撤回在完成前为“最近一首点歌”，成功后为实际撤回的歌名。主播移除时为被移除的歌名。 |
+| `message` | string | 等待说明、操作结果或失败原因，仅供展示，不要用它判断操作类型。 |
+| `requestedBy` | string | 发起操作的观众昵称；`action` 为 `remove` 时为“主播”。 |
+| `createdAt` | number | 最近一次更新的 Unix 时间，单位毫秒。 |
+| `expiresAt` | number | 提示失效的 Unix 时间，单位毫秒。结果保留 6 秒，等待状态最多保留 120 秒。 |
+
+`action` 是 `schemaVersion: 1` 内的新增字段，旧页面忽略它即可继续工作。页面应按 `id` 更新提示，并在 `expiresAt` 到期时主动移除，即使没有新快照也应消失；提示也可能在到期前从列表中消失（例如暂停点歌期间被合并的等待提示），此时以最新快照为准。可用快照 `timestamp` 校准时钟；重复快照和重连不得重置到期时间。建议最多同时显示两条，歌名和原因都通过 `textContent` 渲染。
+
+`success` 在歌曲加入待播队列（或播放器确认开始播放）后立即发布，不等待播放器同步，也不承诺播放器已开始播放：立即播放未确认但歌曲已保留队首时，`message` 会说明正在等待播放；当前 QQ 音乐版本暂不支持自动插入时，`message` 会说明歌曲已保留在待播队列、等待主播处理。暂停点歌期间，失败提示每 10 秒最多出现一条。只有直播间弹幕会产生提示，本机测试点歌接口和诊断面板不会。不要通过队列增减猜测点歌或撤回结果，因为自动切歌也会改变队列。
 
 歌曲对象字段：
 
@@ -143,10 +179,15 @@ ws://127.0.0.1:5556/ws
 | `artist` | string | 歌手名。 |
 | `album` | string | 专辑名，可能为空。 |
 | `coverUrl` | string | 封面地址，可能为空；页面加载失败时应使用占位图。 |
+| `dynamicCoverUrl` | string | 当前歌曲匹配到的 Apple Music 动态封面视频（HLS `.m3u8` 或 MP4）。“外观 → 动态封面”默认开启，先返回普通封面，再异步提供动态地址；歌曲持续播放约 2 秒后才开始查询，快速切过的歌曲不会查询。关闭、未匹配到、查询失败或队列歌曲时为空。旧版本可能不提供，按空字符串处理。 |
 | `requestedBy` | string | 点歌人昵称，非点歌歌曲时可能为空。 |
 | `requestedByUid` | string | 点歌人 UID，可能为空。 |
 | `requestedByAvatar` | string | 点歌人头像地址，可能为空。 |
 | `guardLevel` | number | 点歌人身份等级；没有该信息时为 `0`。 |
+
+动态封面只丰富当前曲目，不预加载队列。页面应先显示 `coverUrl`，收到 `dynamicCoverUrl` 后加载静音循环视频，等视频可播放后替换；任何网络、格式或自动播放错误都保留普通封面。HLS 可使用 Hls.js；内置 OBS 展示页从本机 `/overlay/vendor/hls.min.js` 加载依赖。切歌或地址清空时应销毁播放器并释放视频资源。素材来自 Apple Music 网页匹配，部分歌曲没有动态素材；不影响音乐播放器和点歌队列。
+
+`/overlay/vendor/hls.min.js` 是点歌机内置的 hls.js 浏览器构建，Mod UI 也可以直接加载。它带有 `ETag` 和 `Cache-Control: no-cache`：浏览器每次都会校验，文件未变化时只返回 `304`。另有带版本号的别名 `/overlay/vendor/hls-<版本>.min.js`（例如 `hls-1.7.3.min.js`，版本号与内置 hls.js 一致），内容永不变化，可长期缓存（`Cache-Control: public, max-age=31536000, immutable`）；点歌机升级内置 hls.js 后，旧版本号的地址会返回 `404`。需要始终可用的地址时，请使用不带版本号的路径。
 
 `/api/v1/current` 和 `/api/v1/queue` 只是完整快照的稳定子集。需要同时渲染当前歌曲、队列和两个开关时，建议使用 `/api/v1/state` 或 WebSocket 的 `data`，避免多个请求在切歌瞬间读到不同时间点。
 
@@ -199,6 +240,6 @@ connect();
 
 1. **只依赖已文档化字段。** 服务器可能增加字段；客户端应忽略未知字段，并对缺失的可选字符串使用空值和占位图。
 2. **按 `schemaVersion` 处理结构变化。** 同一主版本只做向后兼容的新增；遇到不支持的版本时显示“协议版本不兼容”，不要猜测字段含义。未来发生破坏性变化会递增 `schemaVersion`，并提供新的版本路径或迁移说明。
-3. **传输范围是本机。** CORS 允许本地网页和 OBS 读取，但监听地址仍固定为 `127.0.0.1`。不要通过路由器端口映射、反向代理或公共隧道暴露未认证的接口。
+3. **本机任何网页都能读取。** 只读接口返回 `Access-Control-Allow-Origin: *`，WebSocket 也不校验来源，因此这台电脑上打开的任何网页（包括普通网站）都能读取当前播放、点歌队列和点歌人昵称、头像。接口只接受 `127.0.0.1` 和 `localhost` 主机名，监听地址固定为 `127.0.0.1`，局域网和公网无法直接访问。不要通过路由器端口映射、反向代理或公共隧道暴露未认证的接口。
 4. **只读不代表可信。** 页面应把昵称、歌名、专辑和 URL 当作不可信数据处理；使用 `textContent`、属性赋值和 URL 校验，避免直接插入 HTML 或执行脚本。
 5. **连接可随时中断。** 点歌机关闭外部接口、修改端口或退出时，HTTP 会失败、WebSocket 会关闭；页面应显示离线状态并自动重试。

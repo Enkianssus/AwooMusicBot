@@ -447,3 +447,132 @@ test('reuses a complete HTTP 200 Range-probe response without a duplicate GET', 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+function stalledBody() {
+  // Headers arrive, but the body never completes and ignores abort signals.
+  return new Response(new ReadableStream({ start() {} }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+test('stalled metadata requests time out per attempt and are retried', async () => {
+  const archive = runtimeArchive();
+  const hash = crypto.createHash('sha512').update(archive).digest('hex');
+  const fixture = runtimeFetchFixture({ archive, hash, rangeProbeStatus: 400, useHead: false });
+  const metadataSignals = [];
+  const fetchImpl = async (url, init = {}) => {
+    if (url.includes('/release-metadata/')) {
+      metadataSignals.push(init.signal);
+      // The first attempt never answers, the second stalls in its JSON body.
+      if (metadataSignals.length === 1) return new Promise(() => {});
+      if (metadataSignals.length === 2) return stalledBody();
+    }
+    return fixture.fetchImpl(url, init);
+  };
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'awoo-dotnet-runtime-timeout-'));
+  try {
+    const runtime = new PrivateDotnetRuntimeManager({
+      rootDirectory: root,
+      fetchImpl,
+      metadataTimeoutMs: 20
+    });
+    const installed = await runtime.ensure('win-x64');
+    assert.equal(installed, path.join(root, 'win-x64', '8.0.17'));
+    assert.equal(metadataSignals.length, 3);
+    assert.deepEqual(metadataSignals.map(signal => signal.aborted), [true, true, false]);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('metadata that never answers fails after three bounded attempts', async () => {
+  let calls = 0;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'awoo-dotnet-runtime-stalled-'));
+  try {
+    const runtime = new PrivateDotnetRuntimeManager({
+      rootDirectory: root,
+      fetchImpl: () => {
+        calls += 1;
+        return new Promise(() => {});
+      },
+      metadataTimeoutMs: 20
+    });
+    await assert.rejects(runtime.ensure('win-x64'), /\.NET Runtime 元数据失败：请求超时/);
+    assert.equal(calls, 3);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a stalled HEAD probe falls back to the Range probe after its timeout', async () => {
+  const archive = runtimeArchive({ padded: true });
+  const hash = crypto.createHash('sha512').update(archive).digest('hex');
+  const fixture = runtimeFetchFixture({ archive, hash, useHead: true });
+  let headSignal = null;
+  const fetchImpl = (url, init = {}) => {
+    if (init.method === 'HEAD') {
+      headSignal = init.signal;
+      return new Promise(() => {});
+    }
+    return fixture.fetchImpl(url, init);
+  };
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'awoo-dotnet-runtime-head-'));
+  try {
+    const runtime = new PrivateDotnetRuntimeManager({
+      rootDirectory: root,
+      fetchImpl,
+      probeTimeoutMs: 20
+    });
+    await runtime.ensure('win-x64');
+    assert.equal(headSignal?.aborted, true);
+    assert.equal(
+      fixture.requests.filter(request => request.range === 'bytes=0-0').length,
+      1
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('streamed runtime download progress is logged in 25% steps', async () => {
+  const archive = runtimeArchive({ padded: true });
+  const hash = crypto.createHash('sha512').update(archive).digest('hex');
+  const fixture = runtimeFetchFixture({ archive, hash, rangeProbeStatus: 400, useHead: false });
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('.zip') && init.method === 'GET' && !new Headers(init.headers || {}).get('Range')) {
+      const step = Math.ceil(archive.length / 100);
+      let offset = 0;
+      return new Response(new ReadableStream({
+        pull(controller) {
+          if (offset >= archive.length) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(archive.subarray(offset, offset + step));
+          offset += step;
+        }
+      }), {
+        status: 200,
+        headers: { 'Content-Length': String(archive.length) }
+      });
+    }
+    return fixture.fetchImpl(url, init);
+  };
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'awoo-dotnet-runtime-progress-'));
+  const logs = [];
+  try {
+    const runtime = new PrivateDotnetRuntimeManager({
+      rootDirectory: root,
+      fetchImpl,
+      onLog: message => logs.push(message)
+    });
+    await runtime.ensure('win-x64');
+    const progress = logs
+      .filter(message => message.includes('下载进度'))
+      .map(message => Number(message.match(/下载进度 (\d+)%/)[1]));
+    assert.deepEqual(progress, [25, 50, 75, 100]);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

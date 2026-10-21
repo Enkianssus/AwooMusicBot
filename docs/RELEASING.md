@@ -186,6 +186,9 @@ https://app.enkianss.us/download/awoo
 - QQ 比较前两段。
 - Folia 比较 major 与 Stage API 基线。
 
+后台维护只为当前选择的播放器自动安装缺失连接器；其它播放器的连接器在用户选择该播放器时再安装。
+网易云连接器的补丁更新在网易云运行期间等待，网易云关闭后或下次启动时再应用。
+
 不要为了让更新按钮变成“自动”而错误沿用旧播放器前缀。
 `minimumCoreVersion` 只有在连接器协议或行为真正依赖更高点歌机版本时才提高；
 增加 framework-dependent 包不构成提高它的理由。

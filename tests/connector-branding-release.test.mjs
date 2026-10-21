@@ -7,6 +7,14 @@ import test from 'node:test';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..');
 const connectorRoot = path.join(repositoryRoot, 'BiliNCM-Connectors');
+// An app-only checkout skips the connector contracts; CI sets
+// AWOO_REQUIRE_CONNECTOR_CONTRACTS=1 so a missing checkout fails instead.
+const checkConnectorContracts = fs.existsSync(connectorRoot)
+  || process.env.AWOO_REQUIRE_CONNECTOR_CONTRACTS === '1';
+const contractTest = checkConnectorContracts ? test : () => {};
+if (!checkConnectorContracts) {
+  test.skip('connector contracts not checked out');
+}
 const hash = 'a'.repeat(64);
 const signature = Buffer.alloc(64, 1).toString('base64');
 
@@ -27,7 +35,7 @@ function runScript(script, args, cwd) {
   assert.equal(result.status, 0, result.stderr || result.stdout);
 }
 
-test('future connector catalogs prefer Awoo packages and retain old-core aliases', () => {
+contractTest('future connector catalogs prefer Awoo packages and retain old-core aliases', () => {
   withTemporaryDirectory(directory => {
     fs.writeFileSync(
       path.join(directory, 'catalog.json'),
@@ -78,7 +86,7 @@ test('future connector catalogs prefer Awoo packages and retain old-core aliases
   });
 });
 
-test('future QQ profile catalogs expose an Awoo package without breaking old cores', () => {
+contractTest('future QQ profile catalogs expose an Awoo package without breaking old cores', () => {
   withTemporaryDirectory(directory => {
     const legacy = {
       id: 'qqmusic', version: '1.3.0', schemaVersion: 1, minimumConnectorVersion: '22.51.1',
@@ -124,7 +132,7 @@ test('future QQ profile catalogs expose an Awoo package without breaking old cor
   });
 });
 
-test('all newly built connector assemblies use Awoo executable names', () => {
+contractTest('all newly built connector assemblies use Awoo executable names', () => {
   for (const player of ['Netease', 'Kugou', 'QQMusic', 'Folia']) {
     const project = fs.readFileSync(
       path.join(
@@ -142,7 +150,7 @@ test('all newly built connector assemblies use Awoo executable names', () => {
   }
 });
 
-test('connector proxy uses the renamed repository without changing public contracts', () => {
+contractTest('connector proxy uses the renamed repository without changing public contracts', () => {
   const workerSource = fs.readFileSync(
     path.join(connectorRoot, 'cloudflare', 'appdownload', 'worker.js'),
     'utf8'

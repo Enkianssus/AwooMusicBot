@@ -6,6 +6,7 @@ import ts from 'typescript';
 import * as queuePolicy from '../electron/queue-head-policy.ts';
 import * as playerTypes from '../electron/players/types.ts';
 import * as compatibility from '../electron/qq-native-compatibility-policy.ts';
+import * as backoffModule from '../electron/connector-start-backoff.ts';
 
 // Run the actual manager methods with inert bridge/backend constructors. No
 // Electron module, connector process, media session, network or UI is loaded.
@@ -18,6 +19,7 @@ const compiled = ts.transpileModule(managerSource, {
 class InertBackend {}
 const imports = {
   '../player-bridge-client': { PlayerBridgeClient: InertBackend },
+  '../connector-start-backoff': backoffModule,
   '../queue-head-policy': queuePolicy,
   '../qq-native-compatibility-policy': compatibility,
   '../player-process-inspector': {

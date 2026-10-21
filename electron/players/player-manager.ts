@@ -7,10 +7,14 @@ import {
   tracksRepresentSameSong
 } from '../queue-head-policy';
 import {
+  type ConnectorRollbackResult,
+  type ConnectorUpdateOptions,
   type ConnectorUpdateResult,
   type ConnectorUpdateStatus,
-  type NativeConnectorId
+  type NativeConnectorId,
+  type QQMusicProfileRefreshResult
 } from '../connector-updater';
+import { createStartBackoff } from '../connector-start-backoff';
 import {
   inspectPlayerProcess,
   type PlayerProcessInfo
@@ -51,18 +55,47 @@ interface PlayerManagerOptions {
   ) => Promise<void>;
 }
 
+export interface PlayerConnectorUpdateOptions extends ConnectorUpdateOptions {
+  /**
+   * Asked once the update of the selected connector is installed and any
+   * running command has finished. True keeps the running connector instead
+   * of reconnecting, for example while a reconnect would drop the next-song
+   * guard of requested playback; applyDeferredConnectorRestart() applies the
+   * update later.
+   */
+  deferReconnectWhile?: () => boolean;
+}
+
+export type PlayerConnectorUpdateResult = ConnectorUpdateResult & {
+  reconnected?: boolean;
+  /** Installed, but the previous version keeps running until a restart. */
+  reconnectDeferred?: boolean;
+};
+
+export type DeferredConnectorRestartResult =
+  | { restarted: false }
+  | { restarted: true; reconnected: boolean };
+
 export class PlayerManager {
   private readonly bridge: PlayerBridgeClient;
   private readonly backends: Record<PlayerKey, PlayerBackend>;
   private selectionGeneration = 0;
   private probeGeneration: number | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
+  private readonly startBackoff = createStartBackoff();
+  private startBackoffKey: PlayerKey | null = null;
   private lastObservedTrackKey: string | null = null;
   private lastObservedTrack: PlayerTrack | null = null;
   private missingTrackObservationCount = 0;
   private observationEpoch = 0;
   private observationTail: Promise<void> = Promise.resolve();
   private operationTail: Promise<void> = Promise.resolve();
+  /**
+   * A connector whose update is installed while its previous version still
+   * runs. Anything that ends that process clears it: the next start
+   * launches the active version anyway.
+   */
+  private deferredRestart: NativeConnectorId | null = null;
   private state: PlayerConnectionState = {
     connected: false,
     connecting: false,
@@ -95,6 +128,18 @@ export class PlayerManager {
     return { ...this.state };
   }
 
+  /**
+   * The selected connector whose installed update waits for a restart while
+   * its previous version still runs.
+   */
+  get deferredConnectorRestart(): NativeConnectorId | null {
+    return this.deferredRestart !== null
+      && this.deferredRestart === this.selectedKey
+      && this.bridge.running
+      ? this.deferredRestart
+      : null;
+  }
+
   async start(): Promise<boolean> {
     try {
       const connected = await this.connectSelected();
@@ -116,8 +161,11 @@ export class PlayerManager {
   }
 
   async reconnect(): Promise<boolean> {
-    this.selectionGeneration++;
+    const generation = ++this.selectionGeneration;
+    // The restart below launches the active version.
+    this.deferredRestart = null;
     this.stopPolling();
+    this.startBackoff.reset();
     this.resetObservedTrack();
     this.setState(false, true, null);
     try {
@@ -130,11 +178,26 @@ export class PlayerManager {
       }
       return await this.connectSelected();
     } catch (error: any) {
+      // connectSelected() handles its own failures, so the restart failed.
+      // A newer connect or switch owns the state by now.
+      if (generation !== this.selectionGeneration) return false;
       this.setState(false, false, null);
       this.options.log(
         `❌ 播放器重连失败: ${error?.message || error}`,
         'Red'
       );
+      // Without a poll nothing would start the connector again; the poll
+      // retries it on the start backoff, like after a failed connect.
+      if (
+        this.backends[this.selectedKey].usesNativeBridge
+        && !this.bridge.supportsSnapshotEvents
+      ) {
+        this.stopPolling();
+        this.pollTimer = setInterval(
+          () => void this.pollNativePlayer(generation),
+          350
+        );
+      }
       return false;
     }
   }
@@ -162,20 +225,31 @@ export class PlayerManager {
     return await inspectPlayerProcess(this.selectedKey);
   }
 
+  /**
+   * Installs while normal commands continue on the running connector; the
+   * new version lives in its own directory and only a restart launches it.
+   * After an install of the selected connector it reconnects, unless
+   * `deferReconnectWhile` says that would interrupt playback right now.
+   */
   async updateConnector(
     connectorId: NativeConnectorId,
-    allowPlayerVersionChange = false
-  ): Promise<ConnectorUpdateResult & { reconnected?: boolean }> {
+    allowPlayerVersionChange = false,
+    options: PlayerConnectorUpdateOptions = {}
+  ): Promise<PlayerConnectorUpdateResult> {
     // Download and verify in the background while normal commands continue.
     const result = await this.bridge.updateConnector(
       connectorId,
-      allowPlayerVersionChange
+      allowPlayerVersionChange,
+      { automatic: options.automatic === true }
     );
     if (
       result.success
       && result.updated
       && this.selectedKey === connectorId
     ) {
+      // A freshly installed connector is retried at once, even while the
+      // reconnect below waits for a running command.
+      this.startBackoff.reset();
       let release!: () => void;
       const previous = this.operationTail;
       this.operationTail = new Promise<void>(resolve => {
@@ -185,6 +259,17 @@ export class PlayerManager {
       try {
         if (this.selectedKey !== connectorId) {
           return result;
+        }
+        // Asked only now: requested playback may have started during the
+        // download or the command that just finished. Nothing was stopped
+        // for the install, so a running previous version keeps serving it.
+        if (this.bridge.running && options.deferReconnectWhile?.() === true) {
+          this.deferredRestart = connectorId;
+          return {
+            ...result,
+            reconnectDeferred: true,
+            message: `${result.message}，为避免打断当前播放，将在空闲时重新连接播放器以启用新版本`
+          };
         }
         const reconnected = await this.reconnect();
         return {
@@ -201,9 +286,36 @@ export class PlayerManager {
     return result;
   }
 
+  /**
+   * Starts the installed version after an update that deferred its
+   * reconnect, once any running command has finished; `deferWhile` is asked
+   * again at that point. Restarts nothing when no restart is pending any
+   * more: a reconnect, stop, player switch or connector exit already ended
+   * the previous version.
+   */
+  async applyDeferredConnectorRestart(
+    deferWhile?: () => boolean
+  ): Promise<DeferredConnectorRestartResult> {
+    if (this.deferredConnectorRestart === null) return { restarted: false };
+    let release!: () => void;
+    const previous = this.operationTail;
+    this.operationTail = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      if (this.deferredConnectorRestart === null || deferWhile?.() === true) {
+        return { restarted: false };
+      }
+      return { restarted: true, reconnected: await this.reconnect() };
+    } finally {
+      release();
+    }
+  }
+
   async reinstallConnector(
     connectorId: NativeConnectorId
-  ): Promise<ConnectorUpdateResult & { reconnected?: boolean }> {
+  ): Promise<PlayerConnectorUpdateResult> {
     let release!: () => void;
     const previous = this.operationTail;
     this.operationTail = new Promise<void>(resolve => {
@@ -212,9 +324,16 @@ export class PlayerManager {
     await previous;
 
     const selected = this.selectedKey === connectorId;
+    // Set once the selected connector is being stopped. A reinstall that
+    // fails from then on (the shared update lock is busy, for example) must
+    // still bring the connector back: otherwise polling stays stopped and
+    // the state stays "connecting" with nothing left to start it.
+    let restoreOnFailure = false;
     try {
       if (selected) {
+        restoreOnFailure = true;
         this.selectionGeneration++;
+        this.deferredRestart = null;
         this.stopPolling();
         this.resetObservedTrack();
         this.backends[connectorId].deactivate();
@@ -224,6 +343,7 @@ export class PlayerManager {
 
       const result = await this.bridge.reinstallConnector(connectorId);
       if (selected) {
+        restoreOnFailure = false;
         const reconnected = await this.reconnect();
         return {
           ...result,
@@ -238,18 +358,66 @@ export class PlayerManager {
       return {
         ...result
       };
+    } catch (error: unknown) {
+      if (restoreOnFailure) {
+        // reconnect() reports its own failure and leaves a retrying poll;
+        // the caller still receives the reinstall error.
+        await this.reconnect().catch(() => false);
+      }
+      throw error;
     } finally {
       release();
     }
+  }
+
+  /**
+   * Reverts a connector to the version its last update replaced, after any
+   * running command. The selected connector is stopped and stays
+   * disconnected; the caller reconnects once the rollback has settled.
+   */
+  async rollbackConnector(
+    connectorId: NativeConnectorId
+  ): Promise<ConnectorRollbackResult> {
+    let release!: () => void;
+    const previous = this.operationTail;
+    this.operationTail = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    await previous;
+
+    try {
+      if (this.selectedKey === connectorId) {
+        this.selectionGeneration++;
+        this.deferredRestart = null;
+        this.stopPolling();
+        this.resetObservedTrack();
+        this.backends[connectorId].deactivate();
+        this.setState(false, true, null);
+      }
+      // The bridge stops the connector before its files are switched back.
+      return await this.bridge.rollbackConnector(connectorId);
+    } finally {
+      release();
+    }
+  }
+
+  async refreshConnectorProfiles(
+    connectorId: NativeConnectorId
+  ): Promise<QQMusicProfileRefreshResult> {
+    return this.bridge.refreshConnectorProfiles(connectorId);
   }
 
   async connectSelected(): Promise<boolean> {
     const generation = ++this.selectionGeneration;
     this.observationEpoch++;
     this.stopPolling();
+    this.startBackoff.reset();
     this.setState(false, true, null);
 
     const selectedKey = this.selectedKey;
+    // Starting another player stops the shared bridge process, so the
+    // deferred connector launches its active version when selected again.
+    if (this.deferredRestart !== selectedKey) this.deferredRestart = null;
     for (const [key, backend] of Object.entries(this.backends)) {
       if (key !== selectedKey) backend.deactivate();
     }
@@ -307,6 +475,19 @@ export class PlayerManager {
     const results = await this.backends[requestedKey].search(query);
     if (requestedKey !== this.selectedKey) {
       throw new Error('搜索期间播放器已切换，已丢弃旧播放器结果');
+    }
+    return results;
+  }
+
+  async searchConnected(query: string): Promise<PlayerTrack[]> {
+    const requestedKey = this.selectedKey;
+    const generation = this.selectionGeneration;
+    if (!this.state.connected || this.state.connecting) {
+      throw new Error('播放器尚未连接，无法测试歌曲搜索');
+    }
+    const results = await this.bridge.searchConnected(requestedKey, query);
+    if (requestedKey !== this.selectedKey || generation !== this.selectionGeneration) {
+      throw new Error('搜索期间播放器连接已变化，请重新检查');
     }
     return results;
   }
@@ -370,6 +551,7 @@ export class PlayerManager {
   async stop(): Promise<void> {
     this.selectionGeneration++;
     this.observationEpoch++;
+    this.deferredRestart = null;
     this.stopPolling();
     for (const backend of Object.values(this.backends)) {
       backend.deactivate();
@@ -386,21 +568,37 @@ export class PlayerManager {
         || this.probeGeneration === generation) {
       return;
     }
+    // A connector that failed to start waits out its backoff instead of being
+    // respawned on every tick; a running bridge keeps the 350ms cadence.
+    if (!this.bridge.running && !this.canAttemptStart(selectedKey)) return;
 
     this.probeGeneration = generation;
+    let started = false;
     try {
       if (!this.bridge.running) {
-        await this.bridge.start(selectedKey);
+        try {
+          await this.bridge.start(selectedKey);
+        } catch (error: any) {
+          if (generation !== this.selectionGeneration) return;
+          this.recordStartFailure(backend.label, error);
+          this.setState(false, false, this.state.snapshot);
+          return;
+        }
+        started = true;
       }
       const snapshot = await backend.probe();
       if (generation !== this.selectionGeneration
           || selectedKey !== this.selectedKey) {
         return;
       }
+      this.startBackoff.recordSuccess();
       this.acceptSnapshot(selectedKey, snapshot, true);
     } catch (error: any) {
       if (generation !== this.selectionGeneration) return;
-      if (this.state.connected || this.state.connecting) {
+      if (started && !this.bridge.running) {
+        // It exited before its first snapshot, so the streak continues.
+        this.recordStartFailure(backend.label, error);
+      } else if (this.state.connected || this.state.connecting) {
         this.options.log(
           `⚠️ 播放器状态探测失败: ${error?.message || error}`,
           'Yellow'
@@ -414,6 +612,27 @@ export class PlayerManager {
     }
   }
 
+  private canAttemptStart(key: PlayerKey): boolean {
+    if (this.startBackoffKey !== key) {
+      // A failure streak belongs to one connector; another starts fresh.
+      this.startBackoffKey = key;
+      this.startBackoff.reset();
+    }
+    return this.startBackoff.canAttempt(Date.now());
+  }
+
+  private recordStartFailure(label: string, error: any): void {
+    const failure = this.startBackoff.recordFailure(Date.now());
+    // Log once per streak and once more when the delay settles at its cap.
+    if (failure.firstInStreak || failure.firstAtCap) {
+      this.options.log(
+        `⚠️ ${label} 连接器启动失败，将在 ${failure.delayMs / 1000} 秒后重试：`
+        + `${error?.message || error}`,
+        'Yellow'
+      );
+    }
+  }
+
   private handleBridgeEvent(event: PlayerBridgeEvent): void {
     if (event.player !== this.selectedKey) return;
     if (event.event === 'connectorExit') {
@@ -423,6 +642,8 @@ export class PlayerManager {
       );
       this.observationEpoch++;
       this.resetObservedTrack();
+      // The next start launches the active version.
+      if (this.deferredRestart === event.player) this.deferredRestart = null;
       this.setState(false, false, this.state.snapshot);
       return;
     }

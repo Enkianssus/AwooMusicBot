@@ -8,6 +8,11 @@ import {
   resolveDevUserDataDir,
   shouldRunAutomaticConnectorMaintenance
 } from '../electron/dev-user-data-policy.ts';
+import {
+  createFailureMemo,
+  createReinstallCircuitBreaker,
+  describeAutomaticReinstallBlocker
+} from '../electron/connector-install-policy.ts';
 
 test('Electron resolves isolation before the instance lock and configuration paths', () => {
   const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8');
@@ -73,12 +78,17 @@ function makeUpdaterHarness({ isolated = true, active = null, validationFails = 
   const declaration = parsed.statements.find(node => ts.isClassDeclaration(node)
     && node.name?.text === 'ConnectorUpdater');
   assert.ok(declaration);
-  const methods = ['getLaunchEnvironment', 'ensureInstalled', 'getConnectorRoot'].map(name => {
+  const methods = [
+    'getLaunchEnvironment', 'ensureInstalled', 'recoverUnhealthyConnector',
+    'installMissingConnector', 'getConnectorRoot'
+  ].map(name => {
     const method = declaration.members.find(node => ts.isMethodDeclaration(node) && node.name?.getText(parsed) === name);
     assert.ok(method, name);
     return method.getText(parsed);
   }).join('\n');
   const calls = { validate: 0, update: 0, reinstall: 0, profiles: 0 };
+  const breaker = createReinstallCircuitBreaker();
+  const firstInstallFailures = createFailureMemo(60000);
   const context = vm.createContext({
     process: { env: {
       BILINCM_CONNECTOR_ROOT: path.resolve('production-connectors'),
@@ -93,7 +103,11 @@ function makeUpdaterHarness({ isolated = true, active = null, validationFails = 
     validateConnectorExecutable: async () => {
       calls.validate++;
       if (validationFails) throw new Error('stub health failure');
-    }
+    },
+    CONNECTOR_HEALTH_CHECK_RETRY_TIMEOUT_MS: 15000,
+    describeAutomaticReinstallBlocker,
+    getReinstallCircuitBreaker: () => breaker,
+    getFirstInstallFailures: () => firstInstallFailures
   });
   vm.runInContext(ts.transpileModule(`class Subject { ${methods} } globalThis.Subject = Subject;`, {
     compilerOptions: { target: ts.ScriptTarget.ES2020 }
@@ -106,6 +120,10 @@ function makeUpdaterHarness({ isolated = true, active = null, validationFails = 
     onLog: () => {},
     update: async () => { calls.update++; return { success: true }; },
     reinstall: async () => { calls.reinstall++; return { success: true }; },
+    // ensureInstalled() routes its own installs through the lock-waiting
+    // variant; count them as the public operation they perform.
+    runUpdateWhenAvailable: (id, force) => force ? updater.reinstall(id) : updater.update(id),
+    getStatuses: async (_refresh, id) => [{ id, error: null, compatible: true, manualUpdateAvailable: false }],
     ensureQQMusicProfiles: async () => { calls.profiles++; return 'stub-profiles'; }
   });
   return { updater, calls };

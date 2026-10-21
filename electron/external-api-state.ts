@@ -1,9 +1,15 @@
+import {
+  sanitizeRequestNotifications,
+  type RequestNotification
+} from './request-notifications.ts';
+
 export interface ExternalSong {
   id: string;
   title: string;
   artist: string;
   album: string;
   coverUrl: string;
+  dynamicCoverUrl: string;
   requestedBy: string;
   requestedByUid: string;
   requestedByAvatar: string;
@@ -50,6 +56,7 @@ export interface ExternalApiState {
     pending: number;
     processing: boolean;
   };
+  requestNotifications: RequestNotification[];
 }
 
 export interface BuildExternalApiStateInput {
@@ -66,6 +73,7 @@ export interface BuildExternalApiStateInput {
     pending: number;
     processing: boolean;
   };
+  requestNotifications?: unknown;
 }
 
 type SongRecord = Record<string, unknown>;
@@ -85,6 +93,7 @@ export function sanitizeExternalSong(song: unknown): ExternalSong | null {
     artist: textField(source, 'ArtistName'),
     album: textField(source, 'Album'),
     coverUrl: textField(source, 'CoverUrl'),
+    dynamicCoverUrl: textField(source, 'DynamicCoverUrl'),
     requestedBy: textField(source, 'OrderedBy'),
     requestedByUid: textField(source, 'OrderedByUid'),
     requestedByAvatar: textField(source, 'OrderedByAvatar'),
@@ -122,6 +131,7 @@ export function buildExternalApiState(
     accepting: service.requestIntake.enabled,
     playing: service.queuePlayback.enabled,
     pausedAfterRequests: input.pausedAfterRequests,
-    commandQueue: input.commandQueue
+    commandQueue: input.commandQueue,
+    requestNotifications: sanitizeRequestNotifications(input.requestNotifications)
   };
 }

@@ -2,11 +2,19 @@ import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import fs from 'fs';
 import {
   ConnectorUpdater,
+  type ConnectorRollbackResult,
+  type ConnectorUpdateOptions,
   type ConnectorUpdateResult,
   type ConnectorUpdateStatus,
-  type NativeConnectorId
+  type NativeConnectorId,
+  type QQMusicProfileRefreshResult
 } from './connector-updater';
 import { ConnectorLifecycleGate } from './connector-lifecycle-gate';
+import {
+  createJsonlLineBuffer,
+  type JsonlInvalidReason,
+  type JsonlLineBuffer
+} from './jsonl-line-buffer';
 import {
   mergeSnapshotCapabilities,
   rejectUnsupportedQqCommand
@@ -14,6 +22,25 @@ import {
 
 const CONNECTOR_SHUTDOWN_DRAIN_TIMEOUT_MS = 25_000;
 const CONNECTOR_FORCE_EXIT_TIMEOUT_MS = 2_000;
+// A cold framework-dependent connector can spend several seconds under
+// antivirus scanning before it answers its first ping.
+const FIRST_PING_TIMEOUT_MS = 15_000;
+const SUBSCRIBE_TIMEOUT_MS = 5_000;
+const INVALID_OUTPUT_LOG_INTERVAL_MS = 10_000;
+const INVALID_OUTPUT_PREVIEW_CHARS = 200;
+const STDERR_LINE_MAX_CHARS = 2_000;
+const SNAPSHOT_EVENTS_FEATURE = 'snapshot-events-v1';
+
+const INVALID_OUTPUT_LABELS: Record<JsonlInvalidReason, string> = {
+  'invalid-json': '非 JSON',
+  'not-object': '非对象',
+  'handler-error': '处理失败'
+};
+
+export interface PlayerBridgeClientOptions {
+  /** Overrides the handshake ping timeout, for tests. */
+  firstPingTimeoutMs?: number;
+}
 
 export interface PlayerTrack {
   id: string;
@@ -108,19 +135,23 @@ export class PlayerBridgeClient {
   private activeFeatures = new Set<string>();
   private pending = new Map<string, PendingRequest>();
   private requestSequence = 0;
-  private stdoutBuffer = '';
+  private stdoutLines: JsonlLineBuffer | null = null;
+  private invalidOutputLoggedAt = 0;
   private stopping = false;
   private startPromise: Promise<void> | null = null;
   private lifecycleGeneration = 0;
   private readonly lifecycleGate = new ConnectorLifecycleGate();
   private readonly updater: ConnectorUpdater;
+  private readonly firstPingTimeoutMs: number;
 
   constructor(
     private readonly onLog: (message: string) => void,
     private readonly getFoliaToken: () => string = () => '',
-    private readonly onEvent: (event: PlayerBridgeEvent) => void = () => {}
+    private readonly onEvent: (event: PlayerBridgeEvent) => void = () => {},
+    options: PlayerBridgeClientOptions = {}
   ) {
     this.updater = new ConnectorUpdater(onLog);
+    this.firstPingTimeoutMs = options.firstPingTimeoutMs ?? FIRST_PING_TIMEOUT_MS;
   }
 
   get running(): boolean {
@@ -128,7 +159,7 @@ export class PlayerBridgeClient {
   }
 
   get supportsSnapshotEvents(): boolean {
-    return this.activeFeatures.has('snapshot-events-v1');
+    return this.activeFeatures.has(SNAPSHOT_EVENTS_FEATURE);
   }
 
   async start(player: NativeConnectorId): Promise<void> {
@@ -176,7 +207,6 @@ export class PlayerBridgeClient {
     }
 
     this.stopping = false;
-    this.stdoutBuffer = '';
     this.activeCapabilities = null;
     this.latestSnapshot = null;
     this.activeFeatures.clear();
@@ -197,70 +227,161 @@ export class PlayerBridgeClient {
     });
     this.process = child;
     this.activePlayer = player;
+    // Until its handshake completes, this child's exit or broken pipe is
+    // reported only through the rejected start(); the caller's retry policy
+    // logs it once instead of once per attempt.
+    let ready = false;
 
-    child.stdout.setEncoding('utf8');
-    child.stdout.on(
-      'data',
-      (chunk: string) => this.consumeStdout(child, chunk)
-    );
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => {
-      const message = chunk.trim();
-      if (message) this.onLog(`[播放器桥] ${message}`);
-    });
-    child.on('error', error => this.handleExit(child, error));
-    child.on('exit', (code, signal) => {
-      if (this.process !== child) return;
-      if (!this.stopping) {
-        this.onLog(`[播放器桥] 已退出 (code=${code}, signal=${signal || 'none'})`);
-      }
-      this.handleExit(
-        child,
-        new Error(`播放器桥已退出 (code=${code})`)
-      );
-    });
-
-    const ping = await this.request({ action: 'ping' }, 5000);
-    if (generation !== this.lifecycleGeneration || this.stopping) {
-      throw new Error('连接器启动已取消');
-    }
-    if (
-      ping?.connectorId
-      && (
-        ping.connectorId !== player
-        || ping.protocolVersion !== 1
-      )
-    ) {
-      await this.stop();
-      throw new Error(
-        `连接器协议不匹配: ${ping.connectorId}/`
-        + `${ping.protocolVersion}`
-      );
-    }
-    this.activeCapabilities = ping?.capabilities || null;
-    this.activeFeatures = new Set(
-      Array.isArray(ping?.features)
-        ? ping.features.filter((feature: unknown): feature is string =>
-          typeof feature === 'string'
+    try {
+      const flushStderr = this.logStderrLines(child);
+      this.stdoutLines = createJsonlLineBuffer({
+        onMessage: message => this.consumeMessage(message),
+        onInvalid: (line, reason) => this.reportInvalidOutput(
+          INVALID_OUTPUT_LABELS[reason],
+          line
+        ),
+        onOverflow: droppedChars => this.reportInvalidOutput(
+          `单行过长，已丢弃 ${droppedChars} 个字符`
         )
-        : []
-    );
-    if (this.supportsSnapshotEvents) {
+      });
+      child.stdout.setEncoding('utf8');
+      child.stdout.on(
+        'data',
+        (chunk: string) => this.consumeStdout(child, chunk)
+      );
+      let stdinErrorLogged = false;
+      child.stdin.on('error', (error: Error) => {
+        // request() already rejects the failed write; this listener keeps a
+        // broken pipe from becoming an uncaught exception.
+        if (stdinErrorLogged || !ready || this.process !== child) return;
+        stdinErrorLogged = true;
+        this.onLog(`[播放器桥] 写入连接器失败：${error.message}`);
+      });
+      child.on('error', error => this.handleExit(child, error, ready));
+      child.on('exit', (code, signal) => {
+        flushStderr();
+        if (this.process !== child) return;
+        if (!this.stopping && ready) {
+          this.onLog(`[播放器桥] 已退出 (code=${code}, signal=${signal || 'none'})`);
+        }
+        this.handleExit(
+          child,
+          new Error(`播放器桥已退出 (code=${code})`),
+          ready
+        );
+      });
+
+      const ping = await this.request(
+        { action: 'ping' },
+        this.firstPingTimeoutMs
+      );
+      if (generation !== this.lifecycleGeneration || this.stopping) {
+        throw new Error('连接器启动已取消');
+      }
+      if (
+        ping?.connectorId
+        && (
+          ping.connectorId !== player
+          || ping.protocolVersion !== 1
+        )
+      ) {
+        await this.stop();
+        throw new Error(
+          `连接器协议不匹配: ${ping.connectorId}/`
+          + `${ping.protocolVersion}`
+        );
+      }
+      const features = new Set<string>(
+        Array.isArray(ping?.features)
+          ? ping.features.filter((feature: unknown): feature is string =>
+            typeof feature === 'string'
+          )
+          : []
+      );
+      // Events are advertised only once the connector confirmed the
+      // subscription; until then the manager keeps polling.
+      const offersSnapshotEvents = features.delete(SNAPSHOT_EVENTS_FEATURE);
+      this.activeCapabilities = ping?.capabilities || null;
+      this.activeFeatures = features;
+      const subscribed = offersSnapshotEvents
+        && await this.subscribeSnapshotEvents(child);
+      if (generation !== this.lifecycleGeneration || this.stopping) {
+        throw new Error('连接器启动已取消');
+      }
+      if (subscribed) {
+        this.activeFeatures.add(SNAPSHOT_EVENTS_FEATURE);
+      } else if (offersSnapshotEvents) {
+        this.onLog('[播放器桥] 实时事件订阅不可用，已回退到状态轮询');
+      }
+      ready = true;
+    } catch (error) {
+      // A connector that failed its handshake is never reused, so the next
+      // start() spawns and handshakes afresh. A stop() in progress owns the
+      // child and drains it instead.
+      if (this.process === child && !this.stopping) {
+        this.discardChild(child);
+      }
+      throw error;
+    }
+  }
+
+  /** A failed subscription leaves a working connector in polling mode. */
+  private async subscribeSnapshotEvents(
+    child: ChildProcessWithoutNullStreams
+  ): Promise<boolean> {
+    try {
       const subscription = await this.request(
         {
           action: 'subscribe',
           eventProtocolVersion: 1
         },
-        5000
+        SUBSCRIBE_TIMEOUT_MS
       );
-      if (!subscription?.subscribed) {
-        this.activeFeatures.delete('snapshot-events-v1');
-        this.onLog('[播放器桥] 实时事件订阅不可用，已回退到状态轮询');
+      return subscription?.subscribed === true;
+    } catch (error) {
+      // The connector itself went away, which fails the start.
+      if (this.process !== child) throw error;
+      return false;
+    }
+  }
+
+  /**
+   * Logs connector stderr per complete line, each capped in length. The
+   * returned flush logs a tail without a newline once the child exits.
+   */
+  private logStderrLines(child: ChildProcessWithoutNullStreams): () => void {
+    let pending = '';
+    // The rest of an over-long line is skipped up to its newline.
+    let skipping = false;
+    const log = (text: string) => {
+      const message = text.trim();
+      if (!message) return;
+      const capped = message.length > STDERR_LINE_MAX_CHARS
+        ? `${message.slice(0, STDERR_LINE_MAX_CHARS)}…`
+        : message;
+      this.onLog(`[播放器桥] ${capped}`);
+    };
+    const flush = () => {
+      if (!skipping) log(pending);
+      pending = '';
+      skipping = false;
+    };
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      const lines = `${pending}${chunk}`.split('\n');
+      pending = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!skipping) log(line);
+        skipping = false;
       }
-    }
-    if (generation !== this.lifecycleGeneration || this.stopping) {
-      throw new Error('连接器启动已取消');
-    }
+      if (pending.length > STDERR_LINE_MAX_CHARS) {
+        if (!skipping) log(pending);
+        pending = '';
+        skipping = true;
+      }
+    });
+    child.stderr.on('end', flush);
+    return flush;
   }
 
   async restart(player: NativeConnectorId): Promise<void> {
@@ -281,13 +402,20 @@ export class PlayerBridgeClient {
     return this.updater.isInstalled(connectorId);
   }
 
+  /**
+   * The running connector keeps serving commands during and after the
+   * install: a new version gets its own directory, and active.json only
+   * decides what the next start launches.
+   */
   async updateConnector(
     connectorId: NativeConnectorId,
-    allowPlayerVersionChange = false
+    allowPlayerVersionChange = false,
+    options: ConnectorUpdateOptions = {}
   ): Promise<ConnectorUpdateResult> {
     return this.updater.update(
       connectorId,
-      allowPlayerVersionChange
+      allowPlayerVersionChange,
+      options
     );
   }
 
@@ -295,6 +423,28 @@ export class PlayerBridgeClient {
     connectorId: NativeConnectorId
   ): Promise<ConnectorUpdateResult> {
     return this.updater.reinstall(connectorId);
+  }
+
+  /**
+   * Reverts to the version the last update replaced. The executable being
+   * replaced is stopped first, including a start that is still in flight;
+   * the caller reconnects afterwards.
+   */
+  async rollbackConnector(
+    connectorId: NativeConnectorId
+  ): Promise<ConnectorRollbackResult> {
+    if (this.activePlayer === connectorId || this.startPromise) {
+      await this.stop();
+    }
+    return this.updater.rollbackToPrevious(connectorId);
+  }
+
+  /** Only QQ Music has downloadable compatibility profiles. */
+  async refreshConnectorProfiles(
+    connectorId: NativeConnectorId
+  ): Promise<QQMusicProfileRefreshResult> {
+    if (connectorId !== 'qqmusic') return { changed: false, version: null };
+    return this.updater.refreshQQMusicProfiles();
   }
 
   async stop(): Promise<void> {
@@ -348,11 +498,7 @@ export class PlayerBridgeClient {
         }
       } finally {
         if (this.process === child) {
-          this.process = null;
-          this.activePlayer = null;
-          this.activeCapabilities = null;
-          this.latestSnapshot = null;
-          this.activeFeatures.clear();
+          this.releaseChild();
           this.rejectAll(new Error('播放器桥已停止'));
         }
       }
@@ -373,6 +519,14 @@ export class PlayerBridgeClient {
     query: string
   ): Promise<PlayerTrack[]> {
     await this.start(player);
+    return this.request({ action: 'search', player, query }, 18000);
+  }
+
+  /** A diagnostic probe must never start, install, or switch a connector. */
+  async searchConnected(player: NativeConnectorId, query: string): Promise<PlayerTrack[]> {
+    if (!this.running || this.activePlayer !== player || this.startPromise || this.stopping) {
+      throw new Error('播放器连接已变化，请连接完成后重新检查');
+    }
     return this.request({ action: 'search', player, query }, 18000);
   }
 
@@ -434,26 +588,32 @@ export class PlayerBridgeClient {
     chunk: string
   ): void {
     if (this.process !== child) return;
-    this.stdoutBuffer += chunk;
-    let newlineIndex = this.stdoutBuffer.indexOf('\n');
-    while (newlineIndex >= 0) {
-      const line = this.stdoutBuffer.slice(0, newlineIndex).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
-      if (line) this.consumeLine(line);
-      newlineIndex = this.stdoutBuffer.indexOf('\n');
-    }
+    this.stdoutLines?.push(chunk);
   }
 
-  private consumeLine(line: string): void {
-    let envelope: BridgeEnvelope | PlayerBridgeEvent;
+  /**
+   * Handles one complete stdout line outside the per-child stream buffer,
+   * with the same validation. Protocol tests feed connector lines through it.
+   */
+  consumeLine(line: string): void {
+    const text = line.trim();
+    if (!text) return;
+    let message: unknown;
     try {
-      envelope = JSON.parse(line);
+      message = JSON.parse(text);
     } catch {
-      this.onLog(`[播放器桥] 非协议输出: ${line}`);
+      this.reportInvalidOutput(INVALID_OUTPUT_LABELS['invalid-json'], text);
       return;
     }
+    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+      this.reportInvalidOutput(INVALID_OUTPUT_LABELS['not-object'], text);
+      return;
+    }
+    this.consumeMessage(message as Record<string, unknown>);
+  }
 
-
+  private consumeMessage(message: Record<string, unknown>): void {
+    const envelope = message as unknown as BridgeEnvelope | PlayerBridgeEvent;
     if ('type' in envelope && envelope.type === 'event') {
       if (envelope.player !== this.activePlayer) return;
       try {
@@ -482,19 +642,50 @@ export class PlayerBridgeClient {
     else pending.reject(new Error(envelope.error || '播放器桥请求失败'));
   }
 
-  private handleExit(
-    child: ChildProcessWithoutNullStreams,
-    error: Error
-  ): void {
-    if (this.process !== child) return;
-    const exitedPlayer = this.activePlayer;
+  /** Non-protocol stdout is ignored and logged at most once per interval. */
+  private reportInvalidOutput(reason: string, line = ''): void {
+    const now = Date.now();
+    if (now - this.invalidOutputLoggedAt < INVALID_OUTPUT_LOG_INTERVAL_MS) {
+      return;
+    }
+    this.invalidOutputLoggedAt = now;
+    const preview = line.length > INVALID_OUTPUT_PREVIEW_CHARS
+      ? `${line.slice(0, INVALID_OUTPUT_PREVIEW_CHARS)}…`
+      : line;
+    this.onLog(
+      `[播放器桥] 忽略无效输出（${reason}）${preview ? `：${preview}` : ''}`
+    );
+  }
+
+  /** Forgets the active connector process and everything learned from it. */
+  private releaseChild(): void {
     this.process = null;
     this.activePlayer = null;
     this.activeCapabilities = null;
     this.latestSnapshot = null;
     this.activeFeatures.clear();
+    this.stdoutLines?.reset();
+    this.stdoutLines = null;
+  }
+
+  private discardChild(child: ChildProcessWithoutNullStreams): void {
+    // Release first: kill() can emit 'error' synchronously, and handleExit
+    // must then find the child already inactive.
+    this.releaseChild();
+    this.rejectAll(new Error('连接器启动失败'));
+    child.kill();
+  }
+
+  private handleExit(
+    child: ChildProcessWithoutNullStreams,
+    error: Error,
+    notifyExit: boolean
+  ): void {
+    if (this.process !== child) return;
+    const exitedPlayer = this.activePlayer;
+    this.releaseChild();
     this.rejectAll(error);
-    if (!this.stopping && exitedPlayer) {
+    if (notifyExit && !this.stopping && exitedPlayer) {
       this.onEvent({
         type: 'event',
         event: 'connectorExit',

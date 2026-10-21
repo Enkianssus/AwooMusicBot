@@ -10,6 +10,7 @@ interface Window {
     openExternal: (url: string) => Promise<void>;
     claimWelcomeHint: (legacyHintWasShown: boolean) => Promise<boolean>;
     onAdminNavigate: (callback: (tab: string) => void) => () => void;
+    onFlushPendingSaves?: (callback: () => Promise<unknown> | void) => () => void;
     closeWindow: () => void;
     minimizeWindow: () => void;
     resizeOverlay: (width: number, height: number) => void;

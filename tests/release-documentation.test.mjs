@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
@@ -6,8 +7,16 @@ const readProjectFile = relativePath => readFile(
   new URL(`../${relativePath}`, import.meta.url),
   'utf8'
 );
+// An app-only checkout skips the connector contracts; CI sets
+// AWOO_REQUIRE_CONNECTOR_CONTRACTS=1 so a missing checkout fails instead.
+const checkConnectorContracts = existsSync(new URL('../BiliNCM-Connectors', import.meta.url))
+  || process.env.AWOO_REQUIRE_CONNECTOR_CONTRACTS === '1';
+const contractTest = checkConnectorContracts ? test : () => {};
+if (!checkConnectorContracts) {
+  test.skip('connector contracts not checked out');
+}
 
-test('release instructions preserve repository and account boundaries', async () => {
+contractTest('release instructions preserve repository and account boundaries', async () => {
   const [agents, guide, connectorAgents] = await Promise.all([
     readProjectFile('AGENTS.md'),
     readProjectFile('docs/RELEASING.md'),

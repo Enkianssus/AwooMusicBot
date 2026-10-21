@@ -1,3 +1,9 @@
+import {
+  ConnectorDownloadError,
+  isConnectorDownloadError,
+  isRetryableHttpStatus
+} from './connector-install-policy.ts';
+
 export interface ConnectorDownloadProgress {
   received: number;
   total: number;
@@ -135,22 +141,20 @@ export async function downloadWholeBufferWithRetries(
     throw new Error(`下载重试次数无效：${maxAttempts}`);
   }
 
-  let lastError: unknown;
+  let lastError: ConnectorDownloadError | undefined;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetchImpl(url, {
+      const response = await requestDownload(fetchImpl, url, {
         method: 'GET',
         cache: 'no-store',
         signal: controller.signal
       });
-      if (!response.ok) {
-        throw new Error(`下载 HTTP ${response.status}`);
-      }
-      const archive = Buffer.from(await response.arrayBuffer());
+      const archive = await readDownloadBody(response);
       if (archive.length !== expectedSize) {
-        throw new Error(
+        throw new ConnectorDownloadError(
+          'size',
           `下载文件大小不匹配：${archive.length}/${expectedSize}`
         );
       }
@@ -161,14 +165,14 @@ export async function downloadWholeBufferWithRetries(
       });
       return archive;
     } catch (error: unknown) {
-      lastError = error;
-      if (attempt >= maxAttempts) break;
+      lastError = toDownloadError(error);
+      if (attempt >= maxAttempts || !canRetryDownload(lastError)) break;
       onRetry?.({
         attempt,
         maxAttempts,
         start: 0,
         end: expectedSize - 1,
-        error: getErrorMessage(error)
+        error: lastError.message
       });
       if (retryDelayMs > 0) {
         await delay(retryDelayMs * attempt);
@@ -178,7 +182,7 @@ export async function downloadWholeBufferWithRetries(
     }
   }
 
-  throw new Error(`完整下载失败：${getErrorMessage(lastError)}`);
+  throw wrapDownloadError(lastError, '完整下载失败：');
 }
 
 async function downloadRange(options: {
@@ -193,13 +197,13 @@ async function downloadRange(options: {
   onRetry?: (retry: ConnectorDownloadRetry) => void;
 }): Promise<DownloadedRange> {
   const expectedRangeSize = options.end - options.start + 1;
-  let lastError: unknown;
+  let lastError: ConnectorDownloadError | undefined;
 
   for (let attempt = 1; attempt <= options.maxAttempts; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
     try {
-      const response = await options.fetchImpl(options.url, {
+      const response = await requestDownload(options.fetchImpl, options.url, {
         method: 'GET',
         cache: 'no-store',
         headers: {
@@ -207,11 +211,8 @@ async function downloadRange(options: {
         },
         signal: controller.signal
       });
-      if (!response.ok) {
-        throw new Error(`下载 HTTP ${response.status}`);
-      }
 
-      const data = Buffer.from(await response.arrayBuffer());
+      const data = await readDownloadBody(response);
       if (
         response.status === 200
         && options.start === 0
@@ -220,7 +221,10 @@ async function downloadRange(options: {
         return { data, completeArchive: true };
       }
       if (response.status !== 206) {
-        throw new Error(`下载服务器未返回分块响应：HTTP ${response.status}`);
+        throw new ConnectorDownloadError(
+          'http',
+          `下载服务器未返回分块响应：HTTP ${response.status}`
+        );
       }
 
       const contentRange = parseContentRange(
@@ -232,25 +236,30 @@ async function downloadRange(options: {
         || contentRange.end !== options.end
         || contentRange.total !== options.expectedSize
       ) {
-        throw new Error(
+        throw new ConnectorDownloadError(
+          'http',
           `下载分块范围不匹配：${response.headers.get('content-range') || '缺失'}`
         );
       }
       if (data.length !== expectedRangeSize) {
-        throw new Error(
+        throw new ConnectorDownloadError(
+          'size',
           `下载分块大小不匹配：${data.length}/${expectedRangeSize}`
         );
       }
       return { data, completeArchive: false };
     } catch (error: unknown) {
-      lastError = error;
-      if (attempt >= options.maxAttempts) break;
+      lastError = toDownloadError(error);
+      if (
+        attempt >= options.maxAttempts
+        || !canRetryDownload(lastError)
+      ) break;
       options.onRetry?.({
         attempt,
         maxAttempts: options.maxAttempts,
         start: options.start,
         end: options.end,
-        error: getErrorMessage(error)
+        error: lastError.message
       });
       if (options.retryDelayMs > 0) {
         await delay(options.retryDelayMs * attempt);
@@ -260,8 +269,63 @@ async function downloadRange(options: {
     }
   }
 
-  throw new Error(
-    `下载分块 ${options.start}-${options.end} 失败：${getErrorMessage(lastError)}`
+  throw wrapDownloadError(
+    lastError,
+    `下载分块 ${options.start}-${options.end} 失败：`
+  );
+}
+
+async function requestDownload(
+  fetchImpl: ConnectorFetch,
+  url: string,
+  init: RequestInit
+): Promise<Response> {
+  let response: Response;
+  try {
+    response = await fetchImpl(url, init);
+  } catch (error: unknown) {
+    throw new ConnectorDownloadError('network', getErrorMessage(error));
+  }
+  if (!response.ok) {
+    throw new ConnectorDownloadError(
+      'http',
+      `下载 HTTP ${response.status}`,
+      response.status
+    );
+  }
+  return response;
+}
+
+async function readDownloadBody(response: Response): Promise<Buffer> {
+  try {
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error: unknown) {
+    throw new ConnectorDownloadError('network', getErrorMessage(error));
+  }
+}
+
+function toDownloadError(error: unknown): ConnectorDownloadError {
+  return isConnectorDownloadError(error)
+    ? error
+    : new ConnectorDownloadError('network', getErrorMessage(error));
+}
+
+/**
+ * A rejected request such as 403 or 404 fails the same way on every attempt;
+ * transport errors, incomplete bodies, 408, 429 and 5xx may recover.
+ */
+function canRetryDownload(error: ConnectorDownloadError): boolean {
+  return error.status === undefined || isRetryableHttpStatus(error.status);
+}
+
+function wrapDownloadError(
+  error: ConnectorDownloadError | undefined,
+  prefix: string
+): ConnectorDownloadError {
+  return new ConnectorDownloadError(
+    error?.kind || 'network',
+    `${prefix}${error?.message || '未知错误'}`,
+    error?.status
   );
 }
 

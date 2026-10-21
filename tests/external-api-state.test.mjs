@@ -25,6 +25,7 @@ test('publishes explicit request intake and queue playback states', () => {
       SongName: 'Test Song',
       ArtistName: 'Test Artist',
       CoverUrl: 'https://example.com/album.jpg',
+      DynamicCoverUrl: 'https://mvod.itunes.apple.com/cover.m3u8',
       OrderedByAvatar: 'https://example.com/avatar.jpg'
     },
     currentIsRequested: true,
@@ -39,6 +40,7 @@ test('publishes explicit request intake and queue playback states', () => {
   assert.equal(state.timestamp, '2026-08-03T00:00:00.000Z');
   assert.equal(state.current?.id, '1403356922');
   assert.equal(state.current?.coverUrl, 'https://example.com/album.jpg');
+  assert.equal(state.current?.dynamicCoverUrl, 'https://mvod.itunes.apple.com/cover.m3u8');
   assert.equal(
     state.current?.requestedByAvatar,
     'https://example.com/avatar.jpg'
@@ -50,6 +52,7 @@ test('publishes explicit request intake and queue playback states', () => {
   });
   assert.equal(state.accepting, false);
   assert.equal(state.playing, true);
+  assert.deepEqual(state.requestNotifications, []);
 });
 
 test('sanitizes malformed optional song fields without leaking native data', () => {
@@ -68,6 +71,7 @@ test('sanitizes malformed optional song fields without leaking native data', () 
     artist: 'Artist',
     album: '',
     coverUrl: '',
+    dynamicCoverUrl: '',
     requestedBy: '',
     requestedByUid: '',
     requestedByAvatar: '',
@@ -97,4 +101,56 @@ test('drops non-object queue entries and reports the sanitized queue length', ()
     enabled: false,
     state: 'paused'
   });
+});
+
+test('publishes bounded public request feedback without native or credential data', () => {
+  const now = Date.now();
+  const notification = {
+    id: 'request-1', kind: 'success', title: '歌名', message: '点歌成功',
+    requestedBy: '观众', createdAt: now, expiresAt: now + 6_000
+  };
+  const state = buildExternalApiState({
+    appVersion: '1.2.4', player, currentSong: null, currentIsRequested: false,
+    queue: [], acceptingRequests: true, queuePlaybackEnabled: true,
+    pausedAfterRequests: false, commandQueue: { pending: 0, processing: false },
+    requestNotifications: [
+      { ...notification, NativeData: 'secret', cookie: 'secret' },
+      { ...notification, id: 'expired', createdAt: now - 10_000, expiresAt: now - 1 }
+    ]
+  });
+  assert.deepEqual(state.requestNotifications, [{ ...notification, action: 'request' }]);
+  assert.equal(JSON.stringify(state).includes('secret'), false);
+});
+
+test('request notifications name their action, defaulting to a viewer request', () => {
+  const now = Date.now();
+  const notification = {
+    kind: 'cancelled', title: '歌名', message: '主播已将歌曲移出待播队列',
+    requestedBy: '主播', createdAt: now, expiresAt: now + 6_000
+  };
+  const state = buildExternalApiState({
+    appVersion: '1.2.6', player, currentSong: null, currentIsRequested: false,
+    queue: [], acceptingRequests: true, queuePlaybackEnabled: true,
+    pausedAfterRequests: false, commandQueue: { pending: 0, processing: false },
+    requestNotifications: [
+      { ...notification, id: 'legacy' },
+      { ...notification, id: 'withdrawal', action: 'cancel' },
+      { ...notification, id: 'removal', action: 'remove' },
+      { ...notification, id: 'unknown', action: 'delete-everything' }
+    ]
+  });
+  assert.equal(state.schemaVersion, 1);
+  assert.deepEqual(state.requestNotifications.map(item => [item.id, item.action]), [
+    ['legacy', 'request'], ['withdrawal', 'cancel'], ['removal', 'remove'], ['unknown', 'request']
+  ]);
+});
+
+test('queue songs never expose the internal request identity', () => {
+  const state = buildExternalApiState({
+    appVersion: '1.2.6', player, currentSong: { Id: 'now', RequestId: 'internal-request' },
+    currentIsRequested: true, queue: [{ Id: 'next', RequestId: 'internal-request-2' }],
+    acceptingRequests: true, queuePlaybackEnabled: true, pausedAfterRequests: false,
+    commandQueue: { pending: 0, processing: false }
+  });
+  assert.equal(JSON.stringify(state).includes('internal-request'), false);
 });

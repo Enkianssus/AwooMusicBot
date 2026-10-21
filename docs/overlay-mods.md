@@ -102,7 +102,7 @@ const unsubscribe = window.AwooOverlay?.subscribe(detail => {
 
 参数调整会同步到点歌机内预览和 OBS，不改变浏览器捕捉地址。Mod 切换、重启和兼容更新都会保留各自设置；用户也可以单独恢复某个 Mod 的默认值。
 
-包只能包含 HTML、CSS、JavaScript、JSON、字体和常见图片资源。入口脚本需要是独立文件；宿主的内容安全策略不会执行内联脚本。页面运行在沙箱 iframe 中，只应调用外部只读 API。
+包只能包含 HTML、CSS、JavaScript、JSON、字体和常见图片资源。入口脚本需要是独立文件；宿主的内容安全策略不会执行内联脚本。页面运行在沙箱 iframe 中，只应调用外部只读 API，具体限制见下文“Mod 网络与 CSP”。
 
 ## GitHub 仓库识别
 
@@ -136,5 +136,49 @@ const unsubscribe = window.AwooOverlay?.subscribe(detail => {
 - `GET /api/v1/current`：当前歌曲。
 - `GET /api/v1/queue`：待播队列。
 - `WebSocket /ws`：状态变化推送，消息为 `{ "type": "state", "data": ... }`。
+
+## Mod 网络与 CSP
+
+Mod 页面运行在 `sandbox="allow-scripts"` 的 iframe 中，请求来源为 `null`。宿主为 Mod 内容附加以下内容安全策略（CSP）：
+
+| 指令 | 允许 | 对 Mod 的影响 |
+| --- | --- | --- |
+| `script-src` | `'self'` | 只能加载包内脚本和 `/overlay/vendor/` 下的依赖；内联脚本和 `eval` 不会执行。 |
+| `style-src` | `'self' 'unsafe-inline'` | 可使用包内样式表、`<style>` 和行内样式。 |
+| `connect-src` | `http://127.0.0.1:*`、`ws://127.0.0.1:*`、`http://localhost:*`、`ws://localhost:*`、`https://*.itunes.apple.com`、`https://*.mzstatic.com` | `fetch` 和 WebSocket 只能访问本机回环地址和 Apple 动态封面域名，不能请求其他网站。 |
+| `media-src` | `blob:`、`https://*.itunes.apple.com`、`https://*.mzstatic.com` | `<video>` 只能播放 Apple 动态封面，或 Hls.js 生成的 `blob:` 地址。 |
+| `img-src` | `http:`、`https:`、`data:`、`blob:` | 封面和头像可以直接使用接口返回的地址。 |
+| `font-src` | `'self' data:` | 字体需要放进 ZIP，或以 `data:` 内联。 |
+| `object-src`、`base-uri` | `'none'` | 不能嵌入插件；`<base>` 标签无效，请使用相对入口 HTML 的路径。 |
+
+### 只读接口
+
+Mod 只能使用外部只读接口，也就是 `/overlay/` 页面所在的端口（默认 `5556`）。用页面自身的 `location.port` 拼接 `http://127.0.0.1:端口/api/v1/state` 和 `ws://127.0.0.1:端口/ws`，用户改过端口时也能正常工作。点歌机窗口使用的内部管理接口（默认 `5555`）会拒绝来自 Mod 的请求；它的路径和字段也不属于公开协议，可能随版本变化。
+
+### 动态封面
+
+歌曲对象的 `dynamicCoverUrl` 是 Apple Music 动态封面（HLS `.m3u8` 或 MP4），只有 `current` 可能有值。动态封面关闭、未匹配到或查询失败时为空字符串，队列歌曲始终为空。请先显示 `coverUrl`，收到动态地址后再加载静音循环视频，等视频能播放时再替换；任何错误都保留静态封面。
+
+播放 HLS 需要 Hls.js。宿主在同源路径提供随点歌机附带的版本，Mod 无需自行打包：
+
+- `/overlay/vendor/hls.min.js`：固定地址，始终对应当前附带的版本，推荐 Mod 使用。
+- `/overlay/vendor/hls-<版本号>.min.js`（例如 `hls-1.7.3.min.js`）：带版本号的别名，内容不会变化，可长期缓存；只提供当前附带的版本，点歌机升级 Hls.js 后旧文件名不再可用。
+
+Hls.js 约 600 KB，建议在第一次收到 `.m3u8` 地址时再插入 `<script src="/overlay/vendor/hls.min.js">`，脚本加载完成前保留静态封面。内置 UI 就是这样加载的。
+
+### 点歌提示
+
+`requestNotifications` 是队列旁的短时提示。用 `kind` 区分状态，用 `action` 区分是谁做了什么：
+
+| `kind` | `action` | 内置 UI 显示 |
+| --- | --- | --- |
+| `waiting` | `request` 或 `cancel` | 待处理 |
+| `success` | `request` | 点歌成功 |
+| `error` | `request` | 点歌失败 |
+| `error` | `cancel` | 撤回失败 |
+| `cancelled` | `cancel` | 撤回成功 |
+| `cancelled` | `remove` | 主播已移出 |
+
+`action` 为 `remove` 时，`requestedBy` 固定为“主播”，不要显示成观众撤回。缺少 `action` 或遇到不认识的值时按 `request` 处理，不要根据 `message` 文本判断操作类型。请按 `id` 更新同一张卡片，在 `expiresAt` 到期时主动移除，并避免遮挡待播歌曲。完整字段见 [本机只读接口](external-api.md)。
 
 参考实现位于 [AwooMusicBot-Overlay-Default](https://github.com/Enkianssus/AwooMusicBot-Overlay-Default)。

@@ -10,7 +10,14 @@ export interface UpdateAnnouncement {
     canUpdate: boolean;
     blockedReason?: string;
     manualUpdate: boolean;
+    /**
+     * This connector version failed to connect on this computer and was rolled
+     * back. It is offered only as a manual retry; its notes explain why.
+     */
+    quarantined?: boolean;
     supportedPlayerVersion?: string;
+    /** Package size, when the server reports it; shown before the core update starts. */
+    sizeBytes?: number;
 }
 
 export interface UpdateReceipt {
@@ -34,7 +41,43 @@ export interface AnnouncementSessionState {
     dismissedReceiptIds: string[];
 }
 
+export type ConnectorProgressPhase = 'runtime' | 'download' | 'verify' | 'install' | 'restart';
+
+export interface ConnectorUpdateProgress {
+    phase: ConnectorProgressPhase;
+    percent: number | null;
+    updatedAt?: string;
+}
+
+/** What the in-dialog confirmation shows before the core update restarts the app. */
+export interface CoreUpdateConfirmation {
+    version: string | null;
+    sizeBytes: number | null;
+    /** Pending requests in the queue; null when the queue could not be read. */
+    pendingCount: number | null;
+}
+
+/** When the core progress last changed, for the stall hint. */
+export interface CoreProgressMark {
+    state: string;
+    progress: number | null;
+    changedAt: number;
+}
+
+export const DISMISSED_ANNOUNCEMENTS_STORAGE_KEY = 'awoo-update-announcements-dismissed';
+export const CORE_UPDATE_STALL_MS = 120_000;
+
+const MAX_DISMISSED_ANNOUNCEMENTS = 40;
 const componentIds: UpdateComponentId[] = ['core', 'netease', 'kugou', 'qqmusic', 'folia'];
+const coreActiveStates = ['checking', 'downloading', 'applying'];
+const coreProgressStates = [...coreActiveStates, 'error'];
+const connectorPhaseLabels: Record<ConnectorProgressPhase, string> = {
+    runtime: '准备运行环境',
+    download: '下载',
+    verify: '校验',
+    install: '安装',
+    restart: '重启连接器',
+};
 const text = (value: unknown, limit: number) => typeof value === 'string' ? value.trim().slice(0, limit) : '';
 const versionKey = (value: string | null) => (value || '').trim().replace(/^v/i, '');
 
@@ -75,10 +118,125 @@ export function selectUpdateActions(items: UpdateAnnouncement[]): UpdateAnnounce
     return selectVisibleAnnouncements(items).filter(item => item.canUpdate);
 }
 
+/** Only an update that installs without a player-branch decision opens the dialog on its own. */
+export function opensAutomatically(item: UpdateAnnouncement): boolean {
+    return item.canUpdate && !item.manualUpdate;
+}
+
+/** Manual player-branch and blocked items wait for the user; dismissing one version lasts across launches. */
+export function needsPersistentDismissal(item: UpdateAnnouncement): boolean {
+    return !item.canUpdate || item.manualUpdate;
+}
+
 export function automaticAnnouncementMode(snapshot: UpdateAnnouncementSnapshot, session: AnnouncementSessionState): 'success' | 'updates' | null {
     if (snapshot.receipts.some(receipt => !session.dismissedReceiptIds.includes(receipt.id))) return 'success';
-    if (!session.updatesDismissed && selectVisibleAnnouncements(snapshot.items).length > 0) return 'updates';
+    if (!session.updatesDismissed && selectVisibleAnnouncements(snapshot.items).some(opensAutomatically)) return 'updates';
     return null;
+}
+
+export function announcementDismissalKey(item: Pick<UpdateAnnouncement, 'id' | 'version'>): string {
+    return `${item.id}@${versionKey(item.version)}`;
+}
+
+export function parseDismissedAnnouncementKeys(raw: string | null): string[] {
+    try {
+        const stored: unknown = JSON.parse(raw || '[]');
+        if (!Array.isArray(stored)) return [];
+        const keys = stored.filter((key): key is string => typeof key === 'string' && /^[a-z]+@\S{1,100}$/.test(key));
+        return [...new Set(keys)].slice(-MAX_DISMISSED_ANNOUNCEMENTS);
+    } catch {
+        return [];
+    }
+}
+
+/** Adds the visible manual and blocked versions; the newest dismissals are kept. */
+export function rememberDismissedAnnouncements(previous: string[], items: UpdateAnnouncement[]): string[] {
+    const keys = selectVisibleAnnouncements(items).filter(needsPersistentDismissal).map(announcementDismissalKey);
+    if (keys.every(key => previous.includes(key))) return previous;
+    return [...previous.filter(key => !keys.includes(key)), ...keys].slice(-MAX_DISMISSED_ANNOUNCEMENTS);
+}
+
+/** The badge counts installable updates, plus manual and blocked ones until that version is dismissed. */
+export function countPendingAnnouncements(items: UpdateAnnouncement[], dismissedKeys: string[]): number {
+    return selectVisibleAnnouncements(items)
+        .filter(item => opensAutomatically(item) || !dismissedKeys.includes(announcementDismissalKey(item)))
+        .length;
+}
+
+export interface AnnouncementDismissalPlan {
+    /** Receipts the close button acknowledges, exactly as “知道了” does. */
+    acknowledgeIds: string[];
+    dismissedKeys: string[];
+}
+
+/** Closing the success view acknowledges its receipts; closing the update list remembers manual and blocked versions. */
+export function planAnnouncementDismissal(view: 'updates' | 'success', snapshot: UpdateAnnouncementSnapshot | null, dismissedKeys: string[]): AnnouncementDismissalPlan {
+    if (!snapshot) return { acknowledgeIds: [], dismissedKeys };
+    if (view === 'success') return { acknowledgeIds: snapshot.receipts.map(receipt => receipt.id), dismissedKeys };
+    return { acknowledgeIds: [], dismissedKeys: rememberDismissedAnnouncements(dismissedKeys, snapshot.items) };
+}
+
+export function isCoreUpdateActive(state: unknown): boolean {
+    return typeof state === 'string' && coreActiveStates.includes(state);
+}
+
+/** Progress, including a failure, is shown until the next attempt; idle and no-update states show nothing. */
+export function isCoreProgressVisible(state: unknown): boolean {
+    return typeof state === 'string' && coreProgressStates.includes(state);
+}
+
+export function clampPercent(value: unknown): number | null {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.max(0, Math.min(100, number)) : null;
+}
+
+/** Formats in the unit of `unitOf`, so a downloaded amount reads in the same unit as the total. */
+export function formatUpdateBytes(bytes: number, unitOf = bytes): string {
+    const value = Math.max(0, bytes);
+    if (unitOf >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
+    if (unitOf >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+    return `${Math.round(value / 1024)} KB`;
+}
+
+/** “已下载 52.3 MB / 160.4 MB” when the package size is known. */
+export function describeDownloadedBytes(progress: unknown, sizeBytes: unknown): string | null {
+    const size = typeof sizeBytes === 'number' ? sizeBytes : Number.NaN;
+    const percent = clampPercent(progress);
+    if (!Number.isFinite(size) || size <= 0 || percent === null) return null;
+    return `已下载 ${formatUpdateBytes(size * percent / 100, size)} / ${formatUpdateBytes(size)}`;
+}
+
+/** Keeps the time of the last change; repeated polls with the same value do not reset it. */
+export function trackCoreUpdateProgress(previous: CoreProgressMark | null, status: { state: string; progress: unknown }, now: number): CoreProgressMark {
+    const progress = clampPercent(status.progress);
+    if (previous && previous.state === status.state && previous.progress === progress) return previous;
+    return { state: status.state, progress, changedAt: now };
+}
+
+export function isCoreUpdateStalled(mark: CoreProgressMark | null, now: number, limitMs = CORE_UPDATE_STALL_MS): boolean {
+    return Boolean(mark && (mark.state === 'checking' || mark.state === 'downloading') && now - mark.changedAt >= limitMs);
+}
+
+export function normalizeConnectorProgress(value: unknown): ConnectorUpdateProgress | null {
+    if (!value || typeof value !== 'object') return null;
+    const source = value as Record<string, unknown>;
+    const phase = source.phase as ConnectorProgressPhase;
+    if (!Object.prototype.hasOwnProperty.call(connectorPhaseLabels, phase)) return null;
+    const percent = clampPercent(source.percent);
+    return {
+        phase,
+        percent: percent === null ? null : Math.round(percent),
+        ...(typeof source.updatedAt === 'string' ? { updatedAt: source.updatedAt } : {}),
+    };
+}
+
+/** “下载 45%”, or the phase alone while its share is unknown. */
+export function describeConnectorProgress(value: unknown): { label: string; percent: number | null; text: string } | null {
+    const progress = normalizeConnectorProgress(value);
+    if (!progress) return null;
+    const label = connectorPhaseLabels[progress.phase];
+    return { label, percent: progress.percent, text: progress.percent === null ? label : `${label} ${progress.percent}%` };
 }
 
 export function normalizeAnnouncementSnapshot(value: unknown): UpdateAnnouncementSnapshot {
@@ -94,6 +252,7 @@ export function normalizeAnnouncementSnapshot(value: unknown): UpdateAnnouncemen
         const version = text(item.version, 100);
         const name = text(item.name, 100);
         if (!componentIds.includes(id) || !version || !name) continue;
+        const sizeBytes = typeof item.sizeBytes === 'number' && Number.isFinite(item.sizeBytes) && item.sizeBytes > 0 ? item.sizeBytes : undefined;
         items.push({
             id, name, version,
             currentVersion: text(item.currentVersion, 100) || null,
@@ -102,7 +261,9 @@ export function normalizeAnnouncementSnapshot(value: unknown): UpdateAnnouncemen
             canUpdate: item.canUpdate === true,
             blockedReason: text(item.blockedReason, 1000) || undefined,
             manualUpdate: item.manualUpdate === true,
+            ...(item.quarantined === true ? { quarantined: true } : {}),
             supportedPlayerVersion: text(item.supportedPlayerVersion, 100) || undefined,
+            ...(sizeBytes ? { sizeBytes } : {}),
         });
     }
     const receipts = new Map<string, UpdateReceipt>();

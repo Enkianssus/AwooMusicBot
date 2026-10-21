@@ -25,13 +25,17 @@ const javascript = ts.transpileModule(source, {
 
 function fixture({ learning = true, connection = 'connected' } = {}) {
   let now = 2_000_000;
-  const logs = [], commands = [];
+  const logs = [], commands = [], receivedDanmaku = [];
   const context = vm.createContext({
     ...policy, Buffer, zlib, Date: { now: () => now },
     giftRequestCredits: new Map(), recentGiftEvents: new Map(), recentGiftParseDiagnostics: new Map(),
     giftLearningCaptured: [], MAX_GIFT_LEARNING_SESSION_ITEMS: 20,
     giftLearningStartedAt: 0, giftLearningExpiresAt: 0, GIFT_LEARNING_DURATION_MS: 60_000,
     biliRoomState: { realRoomId: '42', status: connection },
+    biliRoomSession: 1,
+    danmakuReceptionTracker: {
+      observe: (session, roomId, message) => receivedDanmaku.push({ session, roomId, message })
+    },
     appConfig: { roomId: '42', roomConnectionEnabled: connection !== 'disconnected', learnedGifts: [], sysConfig: {
       ShowAllDanmaku: true, GiftRequestRequirements: {
         Normal: { giftId: '1' }, Captain: { giftId: '2' },
@@ -45,7 +49,7 @@ function fixture({ learning = true, connection = 'connected' } = {}) {
   new vm.Script(javascript).runInContext(context);
   context.giftLearningDiagnostics = context.createGiftLearningDiagnostics();
   if (learning) context.startGiftLearning();
-  return { context, logs, commands, advance: milliseconds => { now += milliseconds; } };
+  return { context, logs, commands, receivedDanmaku, advance: milliseconds => { now += milliseconds; } };
 }
 
 function varint(value) {
@@ -96,11 +100,25 @@ for (const protocol of [0, 2, 3]) {
     assert.equal(f.context.giftRequestCredits.get('9007199254740993'), 5);
     assert.equal(f.context.appConfig.learnedGifts.length, 2);
     assert.equal(f.commands[0].message, '点歌 测试');
+    assert.deepEqual(f.receivedDanmaku, [{ session: 1, roomId: '42', message: '点歌 测试' }]);
     f.context.parseBiliPacket(frame);
     assert.equal(f.context.giftRequestCredits.get('9007199254740993'), 5);
     assert.ok(f.logs.every(log => !log.includes(doc.data.pb)));
   });
 }
+
+test('only valid authenticated danmaku contributes to reception diagnostics', () => {
+  for (const connection of ['connected', 'connecting', 'disconnected']) {
+    const f = fixture({ learning: false, connection });
+    for (const info of [null, [], [[], 42, []], [[], '  ', []], [[], '测试', null]]) {
+      f.context.handleRawDanmaku({ cmd: 'DANMU_MSG', info });
+    }
+    assert.equal(f.receivedDanmaku.length, 0);
+    f.context.handleRawDanmaku({ cmd: 'DANMU_MSG', info: [[], '嗷呜测试abc123', ['99', '观众', 0]] });
+    assert.equal(f.receivedDanmaku.length, connection === 'connected' ? 1 : 0);
+    assert.equal(f.commands.length, 1);
+  }
+});
 
 test('all four viewer tiers use their configured gift and only the real quantity', () => {
   for (const [guard, id] of [[0, 1], [3, 2], [2, 3], [1, 4]]) {

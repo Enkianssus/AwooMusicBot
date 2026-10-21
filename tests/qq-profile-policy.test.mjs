@@ -7,6 +7,7 @@ import vm from 'node:vm';
 import ts from 'typescript';
 import * as profilePolicy from '../electron/qq-profile-policy.ts';
 import * as branding from '../electron/connector-branding-policy.ts';
+import * as catalogPolicy from '../electron/connector-catalog-policy.ts';
 import {
   selectQqProfileEntry, validateQqProfileDocument, verifyQqProfileArchive
 } from '../electron/qq-profile-policy.ts';
@@ -95,21 +96,25 @@ async function installHarness({ connectorVersion = '22.76.1', active = null,
   } };
   const source = fs.readFileSync(new URL('../electron/connector-updater.ts', import.meta.url), 'utf8');
   const module = { exports: {} };
+  // Profiles use Electron's net.fetch, which honours the system proxy.
+  const fetch = async url => {
+    requests.push(url);
+    if (url.endsWith('catalog.json') && networkError) throw networkError;
+    return url.endsWith('catalog.json')
+      ? { ok: catalogStatus === 200, status: catalogStatus, json: async () => {
+        if (catalogJsonError) throw catalogJsonError;
+        return catalog;
+      } }
+      : { ok: true, arrayBuffer: async () => archive };
+  };
   vm.runInNewContext(ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
   }).outputText, {
     module, exports: module.exports, Buffer, URL, AbortController, setTimeout, clearTimeout, process: { env: {} },
-    fetch: async url => {
-      requests.push(url);
-      if (url.endsWith('catalog.json') && networkError) throw networkError;
-      return url.endsWith('catalog.json')
-        ? { ok: catalogStatus === 200, status: catalogStatus, json: async () => {
-          if (catalogJsonError) throw catalogJsonError;
-          return catalog;
-        } }
-        : { ok: true, arrayBuffer: async () => archive };
-    },
     require: name => {
+      if (name === 'electron') return { net: { fetch } };
+      // The pinned key and key id moved to the catalog policy module.
+      if (name === './connector-catalog-policy.ts') return catalogPolicy;
       if (name === 'node:fs') return { default: fakeFs };
       if (name === 'node:path') return { default: path };
       if (name === 'node:crypto') return { default: crypto };
@@ -216,14 +221,23 @@ test('broken, unknown or out-of-root cache does not turn network failure into su
     assert.ok(result.logs.every(message => !/使用缓存画像/.test(message)));
   }
 });
-test('invalid catalog JSON, HTTP errors and bad new signatures never fall back to active cache', async () => {
+test('invalid catalog JSON, HTTP errors and bad new signatures keep the verified active cache', async () => {
+  // CHU-06: any failure after the active profile is known revalidates that
+  // cache; a rejected newer package is never extracted or activated.
+  const cachedOlder = { ...cachedV2, version: '1.3.9', directory: path.resolve('test-profile-root/1.3.9') };
   for (const options of [
-    { catalogJsonError: new SyntaxError('invalid JSON') }, { catalogStatus: 500 },
-    { badSignature: true, active: { ...cachedV2, version: '1.3.9', directory: path.resolve('test-profile-root/1.3.9') } }
+    { catalogJsonError: new SyntaxError('invalid JSON') }, { catalogStatus: 500 }, { catalogStatus: 429 },
+    { badSignature: true, active: cachedOlder }
   ]) {
+    const active = options.active || cachedV2;
     const result = await installHarness({ active: cachedV2, ...options });
-    assert.notEqual(result.error, null);
-    assert.equal(result.result, null);
-    assert.ok(result.logs.every(message => !/使用缓存画像/.test(message)));
+    assert.equal(result.error, null);
+    assert.equal(result.result, active.directory);
+    assert.equal(result.activation, null);
+    assert.equal(result.extracted, 0);
+    assert.ok(result.logs.some(message => message.includes(`使用缓存画像 ${active.version}`)));
   }
+  const withoutCache = await installHarness({ catalogStatus: 500 });
+  assert.match(withoutCache.error.message, /画像清单 HTTP 500/);
+  assert.equal(withoutCache.result, null);
 });

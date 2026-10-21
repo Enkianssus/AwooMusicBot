@@ -6,7 +6,19 @@ module.exports = {
     'plugin:@typescript-eslint/recommended',
     'plugin:react-hooks/recommended',
   ],
-  ignorePatterns: ['dist', '.eslintrc.cjs', 'AwooMusicBot-Skins/**'],
+  ignorePatterns: [
+    'dist',
+    '.eslintrc.cjs',
+    'AwooMusicBot-Skins/**',
+    // Build output, release staging, experiments and the nested connector checkout are not app source.
+    'artifacts/**',
+    'experiments/**',
+    'dist-electron/**',
+    'dist_electron*/**',
+    'release/**',
+    'Releases/**',
+    'BiliNCM-Connectors/**',
+  ],
   parser: '@typescript-eslint/parser',
   plugins: ['react-refresh'],
   rules: {
@@ -16,7 +28,7 @@ module.exports = {
     'no-empty': ['error', { allowEmptyCatch: true }],
     'react-refresh/only-export-components': [
       'warn',
-      { allowConstantExport: true },
+      { allowConstantExport: true, allowExportNames: ['useAdminToast'] },
     ],
   },
 }

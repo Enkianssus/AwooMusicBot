@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
     FEEDBACK_HISTORY_STORAGE_KEY,
     countUnreadFeedbackReplies,
@@ -18,10 +18,46 @@ import {
     checkFeedbackSubmissionEvidence,
     isTechnicalFeedbackCategory
 } from './feedback-submission-policy';
+import {
+    adoptPolledSysConfig,
+    isConfigSaveAccepted,
+    isFoliaTokenConfigured,
+    isTextEntryElement,
+    mergePolledConfig,
+    shouldRetrySave
+} from './config-sync-policy';
+import { finiteNumberOr, parsePortDraft } from './number-field-policy';
+import {
+    buildCurrentActionBody,
+    buildQueueActionBody,
+    buildReorderBody,
+    queueRowKeys,
+    type QueueActionBody
+} from './queue-action-request';
 import { internalApiUrl } from './internal-api';
 import { AwooMark, UiIcon, type UiIconName } from './ui-icons';
-import { useColorMode, type ColorMode } from './ui-appearance';
-import UpdateAnnouncements, { type UpdateAnnouncement } from './UpdateAnnouncements';
+import { useColorMode } from './ui-appearance';
+import UpdateAnnouncements, {
+    CoreUpdateProgress,
+    type ConnectorUpdateProgress,
+    type CoreUpdateConfirmation,
+    type UpdateAnnouncement
+} from './UpdateAnnouncements';
+import {
+    clampPercent,
+    describeConnectorProgress,
+    isCoreUpdateActive,
+    isCoreUpdateStalled,
+    trackCoreUpdateProgress,
+    type CoreProgressMark
+} from './update-announcement-policy';
+import DynamicCover from './DynamicCover';
+import DiagnosticsPanel from './DiagnosticsPanel';
+import { AdminToast, useAdminToast } from './components/AdminToast';
+import NumberField from './components/NumberField';
+import LogsPanel from './components/LogsPanel';
+import { sameJson, usePolling } from './hooks/usePolling';
+import { clampOverlaySize } from './overlay-size-policy';
 import './admin-ui.css';
 import './overlay-polish.css';
 
@@ -49,6 +85,36 @@ function formatFeedbackTime(value: string): string {
         : '时间未知';
 }
 
+const CONFIG_SAVE_DEBOUNCE_MS = 800;
+const THEME_SAVE_DEBOUNCE_MS = 300;
+const OVERLAY_SETTINGS_SAVE_DEBOUNCE_MS = 220;
+
+function postInternalJson(pathname: string, payload: unknown, keepalive = false): Promise<Response> {
+    const body = JSON.stringify(payload);
+    // A keepalive request outlives the closing window. Without the JSON header it
+    // needs no CORS preflight; the server parses the body as JSON either way.
+    return fetch(internalApiUrl(pathname), keepalive
+        ? { method: 'POST', body, keepalive: true }
+        : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+}
+
+/** The focused text field of the control panel; its value may be half-typed. */
+function focusedPanelTextField(): HTMLElement | null {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement) || !isTextEntryElement(active)) return null;
+    return active.closest('.admin-widget-root') ? active : null;
+}
+
+/**
+ * NumberField commits its draft on blur, and closing the window (Alt+F4, the
+ * title bar ✕) does not blur it. Blurring first commits a valid draft
+ * synchronously, so the saves that follow include it; an invalid one keeps
+ * its error and stays unsaved.
+ */
+function commitFocusedDraft(): void {
+    focusedPanelTextField()?.blur();
+}
+
 // ==========================================
 // 1. 类型定义
 // ==========================================
@@ -66,12 +132,14 @@ interface Theme {
 }
 
 interface SongInfo {
+    RequestId?: string;
     Id: string;
     SongName: string;
     ArtistName: string;
     OrderedByUid: string;
     OrderedByAvatar: string;
     CoverUrl?: string;
+    DynamicCoverUrl?: string;
     OrderedBy: string;
     GuardLevel?: number;
 }
@@ -91,10 +159,8 @@ function getArtworkCandidates(
     const primaryUrl = source === 'cover'
         ? song.CoverUrl || ''
         : song.OrderedByAvatar || '';
-    const avatarFallback = source === 'avatar' && song.OrderedByUid
-        ? `https://api.dicebear.com/7.x/identicon/svg?seed=${encodeURIComponent(song.OrderedByUid)}`
-        : '';
-    const candidates = [primaryUrl, avatarFallback].filter(Boolean);
+    // A missing avatar shows the local placeholder; viewer UIDs never go to a third-party service.
+    const candidates = primaryUrl ? [primaryUrl] : [];
 
     if (source === 'cover' && primaryUrl) {
         try {
@@ -115,26 +181,78 @@ function getArtworkCandidates(
     return [...new Set(candidates)];
 }
 
+/** Local stand-in for missing artwork: the person's initial, or a music note for covers. */
+const ArtworkPlaceholder: React.FC<{ name?: string; label?: string; className?: string }> = ({ name = '', label, className = '' }) => {
+    const initial = Array.from(name.trim())[0]?.toUpperCase() || '';
+    return (
+        <span className={`artwork-placeholder ${className}`} role={label ? 'img' : undefined} aria-label={label} aria-hidden={label ? undefined : true}>
+            {initial ? (
+                <svg className="artwork-initial" viewBox="0 0 40 40" aria-hidden="true">
+                    <text x="20" y="20" textAnchor="middle" dominantBaseline="central" fontSize="19" fill="currentColor">{initial}</text>
+                </svg>
+            ) : <UiIcon name="music" />}
+        </span>
+    );
+};
+
 const SongArtworkImage: React.FC<SongArtworkImageProps> = ({ song, source, className = '' }) => {
     const candidates = getArtworkCandidates(song, source);
     const candidateKey = candidates.join('\n');
     const [candidateIndex, setCandidateIndex] = useState(0);
     const imageUrl = candidates[candidateIndex] || '';
+    const label = source === 'cover' ? `${song.SongName} 封面` : `${song.OrderedBy} 头像`;
 
     useEffect(() => {
         setCandidateIndex(0);
     }, [candidateKey]);
 
-    if (!imageUrl) return <span className="w-full h-full flex items-center justify-center text-lg" aria-label="暂无歌曲封面">🎵</span>;
+    if (!imageUrl) return <ArtworkPlaceholder name={source === 'avatar' ? song.OrderedBy : ''} label={label} className={className} />;
 
     return (
         <img
             src={imageUrl}
-            alt={source === 'cover' ? `${song.SongName} 封面` : `${song.OrderedBy} 头像`}
+            alt={label}
             referrerPolicy="no-referrer"
             className={`w-full h-full object-cover ${className}`}
             onError={() => setCandidateIndex(index => index + 1)}
         />
+    );
+};
+
+/** A Bilibili avatar without hotlink headers; a failed load shows the local placeholder. */
+const AvatarImage: React.FC<{ src: string; name: string; alt?: string; className?: string }> = ({ src, name, alt = '', className = '' }) => {
+    const [failedSrc, setFailedSrc] = useState('');
+    if (!src || failedSrc === src) return <ArtworkPlaceholder name={name} label={alt || undefined} />;
+    return (
+        <img
+            src={src}
+            alt={alt}
+            referrerPolicy="no-referrer"
+            className={`w-full h-full object-cover ${className}`}
+            onError={() => setFailedSrc(src)}
+        />
+    );
+};
+
+interface CurrentSongArtworkProps extends SongArtworkImageProps {
+    /** Autoplay is paused: the motion cover holds its frame. */
+    paused?: boolean;
+}
+
+const CurrentSongArtwork: React.FC<CurrentSongArtworkProps> = ({ song, source, className = '', paused = false }) => {
+    if (source !== 'cover') return <SongArtworkImage song={song} source={source} className={className} />;
+
+    // Covers always sit in the motion cover's wrapper, which also carries the
+    // dimming, so a motion cover that arrives later never remounts the image.
+    return (
+        <DynamicCover
+            key={`${song.Id}\n${song.SongName}\n${song.ArtistName}`}
+            url={song.DynamicCoverUrl}
+            paused={paused}
+            wrapperClassName={className}
+        >
+            <SongArtworkImage song={song} source="cover" />
+        </DynamicCover>
     );
 };
 
@@ -159,17 +277,6 @@ interface WidgetStyle {
     y: number;
 }
 
-interface SysLog {
-    Time: string;
-    Color: string;
-    Message: string;
-}
-
-interface UpdateInfo {
-    checking: boolean;
-    info: any;
-}
-
 type AppUpdateDownloadState =
     | 'idle'
     | 'checking'
@@ -183,8 +290,15 @@ interface AppUpdateDownloadStatus {
     progress: number | null;
     version: string | null;
     message: string;
-    updatedAt: string;
+    /** Package size, when the server reports it. */
+    sizeBytes?: number | null;
+    updatedAt?: string;
 }
+
+const CORE_UPDATE_POLL_MS = 450;
+const CORE_UPDATE_RETRY_MS = 700;
+const CONNECTOR_PROGRESS_POLL_MS = 1000;
+const NETEASE_CONNECTOR_RESTART_CONFIRM = '更新网易云连接器时会临时关闭并重新打开网易云，正在播放的歌曲会中断。是否继续？';
 
 interface QrState {
     loading: boolean;
@@ -193,6 +307,27 @@ interface QrState {
 }
 
 type NativeConnectorId = 'netease' | 'kugou' | 'qqmusic' | 'folia';
+
+const PLAYER_TYPE_BY_CONNECTOR: Record<NativeConnectorId, string> = {
+    netease: 'NCM',
+    kugou: 'Kugou',
+    qqmusic: 'QQMusic',
+    folia: 'Folia'
+};
+
+interface ConfigSaveOptions {
+    /** Show the autosave confirmation. */
+    announce?: boolean;
+    /** Retry a failed save with backoff, then report the failure. */
+    retry?: boolean;
+    /** Send with fetch keepalive because the window is closing. */
+    keepalive?: boolean;
+}
+
+interface ConfigSaveOutcome {
+    ok: boolean;
+    result: any;
+}
 
 type GiftRequestTier = 'Normal' | 'Captain' | 'Admiral' | 'Governor';
 
@@ -298,6 +433,13 @@ interface ConnectorStatus {
     updateKind: 'none' | 'install' | 'patch' | 'player' | 'major';
     supportedPlayerVersion: string | null;
     updating: boolean;
+    /** Present while an install or update runs. */
+    progress?: ConnectorUpdateProgress | null;
+    /** The versions come from the cached catalog because the network check failed. */
+    stale?: boolean;
+    staleMessage?: string;
+    /** The newest version was rolled back and is excluded from automatic updates. */
+    quarantined?: boolean;
     checkedAt: string;
     error: string | null;
 }
@@ -465,12 +607,15 @@ const OverlaySettingControl: React.FC<{
                 {description}
                 <span className="mt-2 flex items-center gap-2">
                     <input aria-label={definition.label} type="range" min={definition.min} max={definition.max} step={definition.step} value={numericValue} onChange={event => onChange(Number(event.target.value))} className="min-w-0 flex-1 accent-cyan-500" />
-                    <input aria-label={`${definition.label}数值`} type="number" min={definition.min} max={definition.max} step={definition.step} value={numericValue} onChange={event => {
-                        const next = Number(event.target.value);
-                        if (Number.isFinite(next)) {
-                            onChange(Math.min(Number(definition.max), Math.max(Number(definition.min), next)));
-                        }
-                    }} className="w-16 rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-right text-[10px] text-gray-300 outline-none focus:border-cyan-400" />
+                    <NumberField
+                        ariaLabel={`${definition.label}数值`}
+                        value={numericValue}
+                        min={definition.min}
+                        max={definition.max}
+                        onCommit={onChange}
+                        wrapperClassName="w-16 shrink-0"
+                        className="w-full rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-right text-[10px] text-gray-300 outline-none focus:border-cyan-400"
+                    />
                 </span>
             </div>
         );
@@ -504,32 +649,29 @@ const OverlaySettingControl: React.FC<{
 // ==========================================
 // 2. 全局样式
 // ==========================================
-const GlobalStyles: React.FC = () => (
+// Animations live in tailwind.config.js. The overlay page (pinned window and OBS
+// capture) hides every scrollbar, the document's included, except the thin
+// custom ones; the control panel keeps its themed scrollbars (admin-ui.css).
+const GlobalStyles: React.FC<{ hideScrollbars?: boolean }> = ({ hideScrollbars = false }) => (
     <style>{`
-    @keyframes slideInUp { from { opacity: 0; transform: translateY(15px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
-    @keyframes slideInRight { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: translateX(0); } }
-    @keyframes fadeIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
-    @keyframes toastSlideIn { from { opacity: 0; transform: translate(-50%, -20px); } to { opacity: 1; transform: translate(-50%, 0); } }
-    
-    html, body, #root { 
-        background: transparent !important; 
-        margin: 0; padding: 0; 
+    html, body, #root {
+        background: transparent !important;
+        margin: 0; padding: 0;
         width: 100%; height: 100%;
-        overflow: visible !important; 
+        overflow: visible !important;
     }
-    
+    ${hideScrollbars ? `
     ::-webkit-scrollbar { display: none; }
-    
+    ` : ''}
     .custom-scrollbar::-webkit-scrollbar { display: block; width: 4px; }
     .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
     .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 4px; }
     .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
-    
-    .glass-panel-base { 
-        backdrop-filter: blur(20px); 
-        -webkit-backdrop-filter: blur(20px); 
-        border: 1px solid rgba(255, 255, 255, 0.12); 
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3); 
+
+    /* The overlay window is transparent, so a backdrop blur would have nothing to blur. */
+    .glass-panel-base {
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
     }
     .glass-card { background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.08); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1); }
     img { user-drag: none; -webkit-user-drag: none; }
@@ -549,17 +691,6 @@ const hexToRgba = (hex: string, alpha: number): string => {
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 };
 
-const mapConsoleColor = (color: string, mode: ColorMode): string => {
-    const map: Record<string, string> = mode === 'dark' ? {
-        Cyan: '#65d5ff', Yellow: '#f3cb70', Green: '#6ab9ff',
-        Red: '#ff929f', DarkGray: '#97acc5', Magenta: '#c7adff'
-    } : {
-        Cyan: '#007dad', Yellow: '#9c6700', Green: '#1477c6',
-        Red: '#c43d59', DarkGray: '#667d96', Magenta: '#8452b7'
-    };
-    return map[color] || (mode === 'dark' ? '#d9e8f8' : '#36516c');
-};
-
 const getGuardStyle = (level?: number) => {
     switch(level) {
         case 1: return { border: 'border-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]', tag: 'bg-gradient-to-r from-red-600 to-red-400 text-white shadow-sm', label: '总督' };
@@ -574,6 +705,8 @@ const defaultTheme: Theme = {
     showTitleBar: true, syncTitleBarWithBg: false, titleBarBgColor: '#000000', titleBarOpacity: 0.2,
     compactQueue: false
 };
+
+const NO_NEW_QUEUE_ITEMS: ReadonlySet<string> = new Set();
 
 // ==========================================
 // 3. 核心组件: Overlay 悬浮窗面板
@@ -592,8 +725,10 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [autoplayPauseConfirmed, setAutoplayPauseConfirmed] = useState<boolean>(true);
 
     const [rejects, setRejects] = useState<any[]>([]);
-    const [, setPrevQueue] = useState<SongInfo[]>([]);
-    const [newItemsIds, setNewItemsIds] = useState<Set<string>>(new Set());
+    const [newItemsIds, setNewItemsIds] = useState<ReadonlySet<string>>(NO_NEW_QUEUE_ITEMS);
+    // Queue identities of the last applied snapshot; a request missing from it is new.
+    const previousQueueIdsRef = useRef<ReadonlySet<string>>(NO_NEW_QUEUE_ITEMS);
+    const newItemsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const [dragInfo, setDragInfo] = useState<DragInfo | null>(null);
     const [alwaysOnTop, setAlwaysOnTop] = useState<boolean>(() => {
@@ -629,6 +764,8 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
     const [toasts, setToasts] = useState<ToastInfo[]>([]);
     const lastToastTimeRef = useRef<number>(0);
     const lastSyncTimeRef = useRef<number>(0);
+    const dataRequestSequenceRef = useRef(0);
+    const appliedDataSequenceRef = useRef(0);
 
     const triggerToast = (msg: string) => {
         const id = Date.now() + Math.random();
@@ -690,7 +827,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             if (!shouldShow || cancelled) return;
             welcomeTimer = setTimeout(() => {
                 if (cancelled) return;
-                triggerToast("🎉 欢迎使用！已自动为您打开控制面板。如果您关闭了它，可随时点击右上角的 ⚙️ 按钮呼出！");
+                triggerToast("🎉 欢迎使用！已自动为您打开控制面板。如果您关闭了它，可随时点击右上角的「控制面板」按钮呼出！");
                 electronAPI?.openAdmin();
             }, 1000);
         };
@@ -702,33 +839,16 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         };
     }, []);
 
-    // 外观设置自动保存机制 (防抖 0.5s)
+    // The control panel owns the theme and the overlay-resize IPC stores the window
+    // size. Echoing a received theme back with a fresh timestamp overwrote newer
+    // colour edits, so the overlay only caches what it receives.
     useEffect(() => {
-        localStorage.setItem('bili-widget-theme', JSON.stringify(theme));
-
-        const syncTimer = setTimeout(() => {
-            const timestamp = Date.now();
-            let currentW = widgetStyle.w; let currentH = widgetStyle.h;
-
-            if (isElectron) {
-                currentW = window.innerWidth; currentH = window.innerHeight;
-            }
-
-            const widgetStyleToSave = {
-                theme,
-                size: { w: Math.max(240, currentW), h: Math.max(300, currentH) },
-                timestamp
-            };
-
-            lastSyncTimeRef.current = timestamp;
-            fetch(internalApiUrl('/api/config'), {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ widgetStyle: widgetStyleToSave })
-            }).catch(()=>{});
-        }, 500);
-
-        return () => clearTimeout(syncTimer);
-    }, [theme, widgetStyle]);
+        try {
+            localStorage.setItem('bili-widget-theme', JSON.stringify(theme));
+        } catch {
+            // The next poll still delivers the saved theme.
+        }
+    }, [theme]);
 
     useEffect(() => {
         if (isElectron) return;
@@ -742,80 +862,103 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         }
     }, [widgetStyle]);
 
-    useEffect(() => {
-        const fetchData = async () => {
-            try {
-                const res = await fetch(internalApiUrl('/data'));
-                if (!res.ok) throw new Error("Network response was not ok");
-                const json: any = await res.json();
+    // Shared by the poll and the refresh after a queue action. Unchanged
+    // snapshots keep the previous state objects, so a quiet second does not re-render.
+    const fetchData = async (signal?: AbortSignal) => {
+        const requestSequence = ++dataRequestSequenceRef.current;
+        try {
+            const res = await fetch(internalApiUrl('/data'), { signal });
+            if (!res.ok) throw new Error("Network response was not ok");
+            const json: any = await res.json();
+            // The refresh after a queue action can overtake an older poll; keep the newest snapshot.
+            if (requestSequence < appliedDataSequenceRef.current) return;
+            appliedDataSequenceRef.current = requestSequence;
 
-                if (json.uiConfig && json.uiConfig.timestamp) {
-                    if (json.uiConfig.timestamp > lastSyncTimeRef.current) {
-                        const { theme: bTheme, timestamp, size: bSize } = json.uiConfig;
-                        if (bTheme) setTheme({ ...defaultTheme, ...bTheme });
-
-                        if (!isElectron) {
-                            setWidgetStyle(prev => {
-                                const next = { ...prev };
-                                let changed = false;
-                                if (bSize && typeof bSize.w === 'number') {
-                                    next.w = Math.max(240, bSize.w);
-                                    next.h = Math.max(300, bSize.h);
-                                    localStorage.setItem('bili-widget-size', JSON.stringify({ w: next.w, h: next.h }));
-                                    changed = true;
-                                }
-                                return changed ? next : prev;
-                            });
-                        }
-                        lastSyncTimeRef.current = timestamp;
+            if (json.uiConfig && json.uiConfig.timestamp) {
+                if (json.uiConfig.timestamp > lastSyncTimeRef.current) {
+                    // Browser captures keep their own size and position in localStorage.
+                    const { theme: bTheme, timestamp } = json.uiConfig;
+                    if (bTheme) {
+                        const nextTheme = { ...defaultTheme, ...bTheme };
+                        setTheme(previous => sameJson(previous, nextTheme) ? previous : nextTheme);
                     }
+                    lastSyncTimeRef.current = timestamp;
                 }
+            }
 
-                if (json.toast && json.toast.time > lastToastTimeRef.current) {
-                    lastToastTimeRef.current = json.toast.time;
-                    triggerToast(json.toast.msg);
-                }
+            if (json.toast && json.toast.time > lastToastTimeRef.current) {
+                lastToastTimeRef.current = json.toast.time;
+                triggerToast(json.toast.msg);
+            }
 
-                setRejects(json.rejects || []);
+            const nextRejects: any[] = Array.isArray(json.rejects) ? json.rejects : [];
+            setRejects(previous => sameJson(previous, nextRejects) ? previous : nextRejects);
 
-                const safeQueue: SongInfo[] = Array.isArray(json.queue) ? json.queue : [];
-                setPrevQueue(prev => {
-                    const prevIds = new Set(prev.map(s => `${s.Id}-${s.OrderedByUid}`));
-                    const currentIds = safeQueue.map(s => `${s.Id}-${s.OrderedByUid}`);
-                    const newIds = new Set<string>();
-                    currentIds.forEach(id => { if (!prevIds.has(id)) newIds.add(id); });
-                    if (newIds.size > 0) { setNewItemsIds(newIds); setTimeout(() => setNewItemsIds(new Set()), 1000); }
-                    return safeQueue;
-                });
+            const safeQueue: SongInfo[] = Array.isArray(json.queue) ? json.queue : [];
+            // Compared outside any state updater, so StrictMode's double calls cannot repeat it.
+            const queueIds = safeQueue.map(s => `${s.Id}-${s.OrderedByUid}`);
+            const previousIds = previousQueueIdsRef.current;
+            previousQueueIdsRef.current = new Set(queueIds);
+            const newIds = queueIds.filter(id => !previousIds.has(id));
+            if (newIds.length > 0) {
+                setNewItemsIds(new Set(newIds));
+                if (newItemsTimerRef.current) clearTimeout(newItemsTimerRef.current);
+                newItemsTimerRef.current = setTimeout(() => {
+                    newItemsTimerRef.current = null;
+                    setNewItemsIds(NO_NEW_QUEUE_ITEMS);
+                }, 1000);
+            }
 
-                setData({ current: json.current || null, currentIsRequested: json.currentIsRequested === true, playerPausedAfterRequests: json.playerPausedAfterRequests === true, requestedSongArtwork: json.requestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar', queue: safeQueue, status: json.status || '' });
-                setAccepting(json.accepting ?? true);
-                setPlaying(json.playing ?? true);
-                setAutoplayPauseConfirmed(json.autoplayPauseConfirmed !== false);
-                setIsConnected(true);
+            const nextData: typeof data = { current: json.current || null, currentIsRequested: json.currentIsRequested === true, playerPausedAfterRequests: json.playerPausedAfterRequests === true, requestedSongArtwork: json.requestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar', queue: safeQueue, status: json.status || '' };
+            setData(previous => sameJson(previous, nextData) ? previous : nextData);
+            setAccepting(json.accepting ?? true);
+            setPlaying(json.playing ?? true);
+            setAutoplayPauseConfirmed(json.autoplayPauseConfirmed !== false);
+            setIsConnected(true);
 
-                if (typeof json.cdpConnected === 'boolean') {
-                    setIsCdpConnected(json.cdpConnected);
-                }
+            if (typeof json.cdpConnected === 'boolean') {
+                setIsCdpConnected(json.cdpConnected);
+            }
 
-            } catch { setIsConnected(false); }
-        };
-        fetchData();
-        const timer = setInterval(fetchData, 1000);
-        return () => clearInterval(timer);
+        } catch {
+            if (!signal?.aborted && requestSequence >= appliedDataSequenceRef.current) setIsConnected(false);
+        }
+    };
+
+    // OBS captures report document.hidden as false, but the overlay must never stall, so it polls even while hidden.
+    usePolling(fetchData, { intervalMs: 1000, pauseWhenHidden: false });
+
+    useEffect(() => () => {
+        if (newItemsTimerRef.current) clearTimeout(newItemsTimerRef.current);
     }, []);
 
-    const handleQueueAction = async (action: string, payload: any) => {
+    // Every action names the request it was clicked on, so a queue that shifted in
+    // the meantime makes the server refuse instead of hitting another viewer's song.
+    const handleQueueAction = async (body: QueueActionBody) => {
         // ⭐ 防抖保护
         if (!isElectron || actionLock) return;
         triggerActionLock();
         try {
-            await fetch(internalApiUrl('/api/queue/action'), {
+            const response = await fetch(internalApiUrl('/api/queue/action'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action, ...payload })
+                body: JSON.stringify(body)
             });
-        } catch(err) { console.error("操作失败", err); }
+            const result = await response.json().catch(() => null);
+            // Older servers always answer success: true; newer ones explain a refusal.
+            if (result?.success === false) {
+                triggerToast(typeof result.message === 'string' && result.message ? result.message : '⚠️ 操作未完成，请刷新后重试');
+            } else if (!response.ok) {
+                triggerToast('⚠️ 操作未完成，请稍后重试');
+            } else if (typeof result?.message === 'string' && result.message.trim()) {
+                // Done, with a caveat such as a skip the player has not confirmed yet.
+                triggerToast(`⚠️ ${result.message.trim()}`);
+            }
+        } catch(err) {
+            console.error("操作失败", err);
+            triggerToast('⚠️ 无法连接点歌机服务，操作未完成');
+        }
+        void fetchData();
     };
 
     const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>, type: 'current' | 'queue', index: number, item: SongInfo) => {
@@ -885,12 +1028,12 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
             triggerActionLock();
 
             if (currentActionType === 'delete') {
-                if (type === 'queue') handleQueueAction('delete', { index });
-                if (type === 'current') handleQueueAction('skip_current', {});
+                if (type === 'queue') handleQueueAction(buildQueueActionBody('delete', index, item));
+                if (type === 'current') handleQueueAction(buildCurrentActionBody('skip_current', item));
             } else if (currentActionType === 'play') {
-                if (type === 'queue') handleQueueAction('play_now', { index });
+                if (type === 'queue') handleQueueAction(buildQueueActionBody('play_now', index, item));
             } else if (currentActionType === 'push') {
-                if (type === 'current') handleQueueAction('push_current_to_queue', {});
+                if (type === 'current') handleQueueAction(buildCurrentActionBody('push_current_to_queue', item));
             } else {
                 if (type === 'queue') {
                     const items = Array.from(document.querySelectorAll('.queue-item'));
@@ -900,7 +1043,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                         if (ev.clientY < rect.top + rect.height / 2) { targetIndex = i; break; }
                     }
                     targetIndex = Math.max(0, targetIndex);
-                    if (targetIndex !== index) handleQueueAction('reorder', { from: index, to: targetIndex });
+                    if (targetIndex !== index) handleQueueAction(buildReorderBody(index, targetIndex, item));
                 }
             }
         };
@@ -1005,8 +1148,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         const onPointerMove = (ev: PointerEvent) => {
             if (animationFrameId) cancelAnimationFrame(animationFrameId);
             animationFrameId = requestAnimationFrame(() => {
-                target.style.width = `${Math.max(240, initialW + (ev.clientX - startX))}px`;
-                target.style.height = `${Math.max(300, initialH + (ev.clientY - startY))}px`;
+                const size = clampOverlaySize(initialW + (ev.clientX - startX), initialH + (ev.clientY - startY));
+                target.style.width = `${size.width}px`;
+                target.style.height = `${size.height}px`;
             });
         };
         const onPointerUp = (ev: PointerEvent) => {
@@ -1031,15 +1175,14 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
         const startX = e.screenX; const startY = e.screenY;
         const initialW = window.outerWidth; const initialH = window.outerHeight;
-        let lastW = initialW; let lastH = initialH;
         let animationFrameId: number;
 
         const onPointerMove = (ev: PointerEvent) => {
             if (animationFrameId) cancelAnimationFrame(animationFrameId);
             animationFrameId = requestAnimationFrame(() => {
-                lastW = Math.max(300, initialW + (ev.screenX - startX));
-                lastH = Math.max(400, initialH + (ev.screenY - startY));
-                electronAPI?.resizeOverlay(lastW, lastH);
+                // The same minimum as the native window, so the handle never asks for a refused size.
+                const size = clampOverlaySize(initialW + (ev.screenX - startX), initialH + (ev.screenY - startY));
+                electronAPI?.resizeOverlay(size.width, size.height);
             });
         };
 
@@ -1064,13 +1207,14 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         }
     }
 
+    // Theme tokens from overlay-polish.css keep the 10px status line readable in both modes.
     const getStatusColor = (status: string | undefined) => {
         if (!status) return displayTheme.subTextColor;
-        if (status.includes('❌') || status.includes('🔴')) return '#f87171';
-        if (status.includes('✅') || status.includes('🟢')) return colorMode === 'dark' ? '#6ab9ff' : '#1477c6';
-        if (status.includes('⚠️') || status.includes('拦截')) return '#facc15';
-        if (status.includes('⬆️') || status.includes('⏭️') || status.includes('🔙') || status.includes('🔄') || status.includes('▶️') || status.includes('⚡')) return '#c084fc';
-        if (status.includes('test') || status.includes('测试')) return '#22d3ee';
+        if (status.includes('❌') || status.includes('🔴')) return 'var(--overlay-danger)';
+        if (status.includes('✅') || status.includes('🟢')) return 'var(--overlay-success)';
+        if (status.includes('⚠️') || status.includes('拦截')) return 'var(--overlay-warning)';
+        if (status.includes('⬆️') || status.includes('⏭️') || status.includes('🔙') || status.includes('🔄') || status.includes('▶️') || status.includes('⚡')) return 'var(--overlay-info)';
+        if (status.includes('test') || status.includes('测试')) return 'var(--overlay-info)';
         return displayTheme.subTextColor;
     };
 
@@ -1080,14 +1224,17 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
         return '';
     };
 
+    const queueKeys = queueRowKeys(data.queue || []);
+
     return (
         <div data-color-mode={colorMode} data-pinned={alwaysOnTop} className={isElectron
             ? "awoo-overlay w-full h-screen p-5 flex flex-col font-sans select-none group box-border overflow-hidden bg-transparent pointer-events-none no-drag"
             : "awoo-overlay react-widget-root absolute p-4 flex flex-col font-sans select-none z-[50] group cursor-grab active:cursor-grabbing"
         }>
             <div className="fixed top-14 left-1/2 z-[9999] flex w-[calc(100%-2rem)] max-w-[430px] -translate-x-1/2 flex-col gap-2 pointer-events-none">
+                {/* overlay-polish.css paints the toast in the overlay palette (.animate-toast). */}
                 {toasts.map(t => (
-                    <div key={t.id} className="animate-toast flex w-full min-w-0 items-start gap-2.5 rounded-2xl border border-cyan-400/50 bg-gradient-to-r from-blue-600 to-cyan-500 px-4 py-3 text-sm font-bold leading-relaxed text-white shadow-[0_10px_30px_rgba(6,182,212,0.4)]">
+                    <div key={t.id} className="animate-toast flex w-full min-w-0 items-start gap-2.5 border px-4 py-3 leading-relaxed">
                         <span className="shrink-0 text-xl leading-5">🔔</span>
                         <span className="min-w-0 flex-1 whitespace-normal break-words">{t.msg}</span>
                     </div>
@@ -1105,14 +1252,13 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                         width: '260px',
                         background: dragInfo.actionType === 'delete' ? 'rgba(239, 68, 68, 0.95)' :
                             dragInfo.actionType === 'play' ? 'rgba(22, 140, 230, 0.95)' :
-                                dragInfo.actionType === 'push' ? 'rgba(59, 130, 246, 0.95)' : 'rgba(20,20,20,0.7)',
+                                dragInfo.actionType === 'push' ? 'rgba(59, 130, 246, 0.95)' : 'rgba(20,20,20,0.88)',
                         border: dragInfo.actionType === 'delete' ? '2px solid #ef4444' :
                             dragInfo.actionType === 'play' ? '2px solid #43cfff' :
                                 dragInfo.actionType === 'push' ? '2px solid #3b82f6' : '1px solid rgba(255,255,255,0.08)',
                         boxShadow: dragInfo.actionType === 'delete' ? '0 10px 30px rgba(239,68,68,0.6)' :
                             dragInfo.actionType === 'play' ? '0 10px 30px rgba(22,140,230,0.3)' :
-                                dragInfo.actionType === 'push' ? '0 10px 30px rgba(59,130,246,0.6)' : '0 20px 50px rgba(0,0,0,0.6)',
-                        backdropFilter: 'blur(16px)'
+                                dragInfo.actionType === 'push' ? '0 10px 30px rgba(59,130,246,0.6)' : '0 20px 50px rgba(0,0,0,0.6)'
                     }}
                 >
                     {dragInfo.actionType === 'delete' ? (
@@ -1149,9 +1295,6 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                     ...(isElectron ? { WebkitAppRegion: 'drag' } : {})
                 } as React.CSSProperties}
             >
-                <div className="absolute -top-20 -left-20 w-48 h-48 bg-blue-500 rounded-full mix-blend-screen filter blur-[80px] opacity-20 pointer-events-none"></div>
-                <div className="absolute -bottom-20 -right-20 w-48 h-48 bg-purple-500 rounded-full mix-blend-screen filter blur-[80px] opacity-20 pointer-events-none"></div>
-
                 {isElectron && (
                     <div
                         onPointerDown={handleElectronResizeStart}
@@ -1197,16 +1340,16 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                             <div className="absolute right-[-10px] top-[-10px] opacity-5 text-7xl select-none pointer-events-none">{data.currentIsRequested ? '✨' : '🎵'}</div>
                             {data.currentIsRequested ? (
                                 <div className={`w-12 h-12 ${data.requestedSongArtwork === 'song_cover' ? 'rounded-lg' : 'rounded-full'} overflow-hidden border-[3px] ${playing ? (data.requestedSongArtwork === 'song_cover' ? 'border-sky-400/60 shadow-[0_0_15px_rgba(56,169,255,0.25)]' : getGuardStyle(data.current.GuardLevel).border || 'border-sky-400/60 shadow-[0_0_15px_rgba(56,169,255,0.2)]') : 'border-yellow-400/60 shadow-[0_0_15px_rgba(250,204,21,0.2)]'} bg-slate-800 flex items-center justify-center shrink-0 relative pointer-events-none`}>
-                                    <SongArtworkImage song={data.current} source={data.requestedSongArtwork === 'song_cover' ? 'cover' : 'avatar'} className={!playing ? 'grayscale opacity-80' : ''} />
+                                    <CurrentSongArtwork song={data.current} source={data.requestedSongArtwork === 'song_cover' ? 'cover' : 'avatar'} paused={!playing} className={!playing ? 'grayscale opacity-80' : ''} />
                                 </div>
                             ) : (
                                 <div className="w-12 h-12 rounded-lg overflow-hidden border-[3px] border-sky-300/35 bg-sky-950/60 shadow-[0_0_14px_rgba(125,211,252,0.16)] flex items-center justify-center text-sky-200 shrink-0 relative pointer-events-none">
-                                    <SongArtworkImage song={data.current} source="cover" />
+                                    <CurrentSongArtwork song={data.current} source="cover" />
                                 </div>
                             )}
                             <div className="flex flex-col min-w-0 pointer-events-none">
                                 {!playing ? (
-                                    <div className="text-yellow-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-yellow-400 rounded-full"></span> {autoplayPauseConfirmed ? '自动播放已暂停' : 'QQ 兜底取消待确认'}</div>
+                                    <div className="text-yellow-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-yellow-400 rounded-full"></span> {autoplayPauseConfirmed ? '自动播放已暂停' : 'QQ 音乐暂停待确认'}</div>
                                 ) : data.currentIsRequested ? (
                                     <div className="text-sky-400 text-[10px] font-bold mb-1 tracking-wider flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-sky-400 rounded-full animate-pulse shadow-[0_0_8px_rgba(56,169,255,0.9)]"></span> 点歌播放中</div>
                                 ) : data.playerPausedAfterRequests ? (
@@ -1232,7 +1375,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                                 <>
                                     <div className="absolute inset-0 bg-yellow-500/10 animate-[pulse_3s_infinite] pointer-events-none"></div>
                                     <div className="text-4xl mb-2 opacity-90 drop-shadow-[0_0_15px_rgba(250,204,21,0.6)] pointer-events-none z-10 animate-bounce"><UiIcon name="pause" /></div>
-                                    <div className="text-sm font-bold tracking-wide pointer-events-none z-10 text-yellow-400 drop-shadow-md">{autoplayPauseConfirmed ? '自动播放已暂停' : 'QQ 兜底取消待确认'}</div>
+                                    <div className="text-sm font-bold tracking-wide pointer-events-none z-10 text-yellow-400 drop-shadow-md">{autoplayPauseConfirmed ? '自动播放已暂停' : 'QQ 音乐暂停待确认'}</div>
                                     <div className="text-[10px] mt-1 font-medium pointer-events-none z-10 opacity-70" style={{ color: displayTheme.subTextColor }}>待播队列保留，自动播放已暂停</div>
                                 </>
                             ) : !isCdpConnected ? (
@@ -1259,7 +1402,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
                         {!accepting && (
                             <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-2.5 flex items-center justify-center gap-2 animate-fade-in mb-1 relative overflow-hidden shrink-0 mx-1">
-                                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-red-500/10 to-transparent -translate-x-full animate-[shimmer_2s_infinite]"></div>
+                                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-red-500/10 to-transparent -translate-x-full animate-shimmer"></div>
                                 <span className="text-lg relative z-10 animate-pulse">⏸️</span>
                                 <span className="text-xs font-bold text-red-400 tracking-wide relative z-10">已暂停接收新点歌</span>
                             </div>
@@ -1267,9 +1410,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
                         {rejects.map((rej) => (
                             <div key={rej.id} className="animate-slide-in glass-card rounded-lg p-2 flex items-center gap-3 border border-red-500/30 bg-red-500/10 mb-1 relative overflow-hidden shrink-0">
-                                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-red-500/5 to-transparent -translate-x-full animate-[shimmer_2s_infinite]"></div>
+                                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-red-500/5 to-transparent -translate-x-full animate-shimmer"></div>
                                 <div className="w-8 h-8 rounded-full overflow-hidden shrink-0 border border-red-500/50 shadow-[0_0_8px_rgba(239,68,68,0.3)]">
-                                    <img src={rej.user.avatar} className="w-full h-full object-cover" />
+                                    <AvatarImage src={rej.user?.avatar || ''} name={rej.user?.name || ''} />
                                 </div>
                                 <div className="flex flex-col min-w-0 z-10">
                                     <div className="text-[12px] font-bold text-red-400 truncate drop-shadow-md flex items-center gap-1.5"><span>⚠️</span> <span>{rej.user.name} 点歌失败</span></div>
@@ -1286,7 +1429,7 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
                         )}
 
                         {data.queue?.map((song, index) => {
-                            const uniqueKey = `${song.Id}-${song.OrderedByUid}-${index}`;
+                            const uniqueKey = queueKeys[index];
                             const isNew = newItemsIds.has(`${song.Id}-${song.OrderedByUid}`);
                             const itemGuardStyle = getGuardStyle(song.GuardLevel);
 
@@ -1328,9 +1471,9 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 
                                     {isElectron && (
                                         <div className="overlay-queue-actions no-drag">
-                                            <button onPointerDown={e => e.stopPropagation()} onClick={() => handleQueueAction('top', { index })} disabled={actionLock} aria-label="置顶/优先播放" title="置顶/优先播放"><UiIcon name="top" /></button>
-                                            <button onPointerDown={e => e.stopPropagation()} onClick={() => handleQueueAction('play_now', { index })} disabled={actionLock} aria-label="立即切歌播放" title="立即切歌播放"><UiIcon name="play" /></button>
-                                            <button onPointerDown={e => e.stopPropagation()} onClick={() => handleQueueAction('delete', { index })} disabled={actionLock} className="overlay-delete" aria-label="移出点歌队列" title="移出点歌队列"><UiIcon name="trash" /></button>
+                                            <button onPointerDown={e => e.stopPropagation()} onClick={() => handleQueueAction(buildQueueActionBody('top', index, song))} disabled={actionLock} aria-label="置顶/优先播放" title="置顶/优先播放"><UiIcon name="top" /></button>
+                                            <button onPointerDown={e => e.stopPropagation()} onClick={() => handleQueueAction(buildQueueActionBody('play_now', index, song))} disabled={actionLock} aria-label="立即切歌播放" title="立即切歌播放"><UiIcon name="play" /></button>
+                                            <button onPointerDown={e => e.stopPropagation()} onClick={() => handleQueueAction(buildQueueActionBody('delete', index, song))} disabled={actionLock} className="overlay-delete" aria-label="移出点歌队列" title="移出点歌队列"><UiIcon name="trash" /></button>
                                         </div>
                                     )}
                                 </div>
@@ -1348,17 +1491,267 @@ const OverlayWidget: React.FC<OverlayWidgetProps> = ({ onToggleAdmin }) => {
 // 4. 核心组件: 后台管理控制面板
 // ==========================================
 
+// Static control panel data, built once instead of on every render.
+const PERMISSION_TYPES = [
+    { key: 'OrderPermission', label: '点歌权限' },
+    { key: 'SkipPermission', label: '切歌权限' },
+    { key: 'PriorityPermission', label: '置顶权限 (放到队列第一首)' },
+    { key: 'CancelPermission', label: '撤回权限 (撤回自己点的最近一首)' },
+    { key: 'ToggleAcceptPermission', label: '开关接单权限 (开启/关闭)' },
+    { key: 'ForceControlPermission', label: '强控队列权限 (立即/插队/撤回他人)' },
+] as const;
+
+const PLAYER_OPTIONS: ReadonlyArray<{
+    type: string;
+    name: string;
+    method: string;
+    detail: string;
+    connectorId: NativeConnectorId;
+}> = [
+    { type: 'NCM', name: '网易云音乐', method: '原生 IPC', detail: '不重启客户端，不需要调试端口', connectorId: 'netease' },
+    { type: 'Kugou', name: '酷狗音乐', method: '窗口消息 + IPC', detail: '原生控制与安全下一首守卫', connectorId: 'kugou' },
+    { type: 'QQMusic', name: 'QQ 音乐', method: '单实例命令 + 静音守卫', detail: '错误下一首静音、暂停后接管', connectorId: 'qqmusic' },
+    { type: 'Folia', name: 'Folia', method: '独立 Stage 连接器', detail: 'HTTP + WebSocket；支持 ID 校验与封面', connectorId: 'folia' }
+];
+
+const ROOM_CONNECTION_STATUS_META: Record<string, {
+    label: string;
+    className: string;
+    icon: string;
+}> = {
+    connecting: {
+        label: '正在连接',
+        className: 'text-amber-300 border-amber-400/30 bg-amber-500/10',
+        icon: '⏳'
+    },
+    connected: {
+        label: '弹幕已连接',
+        className: 'text-green-300 border-green-500/30 bg-green-500/10',
+        icon: '●'
+    },
+    error: {
+        label: '连接失败',
+        className: 'text-red-300 border-red-500/30 bg-red-500/10',
+        icon: '⚠️'
+    },
+    disconnected: {
+        label: '已断开连接',
+        className: 'text-gray-300 border-white/15 bg-white/5',
+        icon: '○'
+    }
+};
+
+const PAGE_TITLES: Record<string, string> = {
+    status: '运行状态',
+    appearance: '外观设置',
+    settings: '基础设置',
+    login: '扫码登录',
+    update: '版本升级',
+    diagnostics: '诊断与修复',
+    faq: '常见问题',
+    feedback: '问题反馈',
+    logs: '运行日志',
+    debug: '调试测试',
+};
+
+const PRIMARY_NAV_ITEMS: ReadonlyArray<{ id: UiIconName; label: string }> = [
+    { id: 'status', label: '运行状态' },
+    { id: 'appearance', label: '外观设置' },
+    { id: 'settings', label: '基础设置' },
+    { id: 'login', label: '扫码登录' },
+    { id: 'update', label: '版本升级' }
+];
+
+const SUPPORT_NAV_ITEMS: ReadonlyArray<{ id: string; label: string; icon: UiIconName }> = [
+    { id: 'diagnostics', label: '诊断与修复', icon: 'shield' },
+    { id: 'faq', label: '常见问题', icon: 'faq' },
+    { id: 'feedback', label: '问题反馈', icon: 'feedback' },
+    { id: 'logs', label: '运行日志', icon: 'logs' },
+    { id: 'debug', label: '调试测试', icon: 'debug' }
+];
+
+const SUPPORT_TABS: readonly string[] = SUPPORT_NAV_ITEMS.map(item => item.id);
+
+const STATUS_WAVEFORM_HEIGHTS = [12, 21, 14, 32, 24, 42, 29, 18, 36, 22, 46, 27, 16, 33, 23, 14];
+
+const OVERLAY_PREVIEW_BACKGROUNDS: Record<'checker' | 'dark' | 'light', React.CSSProperties> = {
+    dark: { backgroundColor: '#111827' },
+    light: { backgroundColor: '#eef3f8' },
+    checker: {
+        backgroundColor: '#20242d',
+        backgroundImage: 'linear-gradient(45deg, #2c3340 25%, transparent 25%), linear-gradient(-45deg, #2c3340 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #2c3340 75%), linear-gradient(-45deg, transparent 75%, #2c3340 75%)',
+        backgroundSize: '24px 24px',
+        backgroundPosition: '0 0, 0 12px, 12px -12px, -12px 0'
+    }
+};
+
+type OnboardingTab = 'login' | 'status' | 'appearance' | 'settings';
+type OnboardingTarget = 'room' | 'mod-ui' | 'player' | 'permission';
+
+const ONBOARDING_STEPS = [
+    {
+        icon: '📱',
+        kicker: '账号与权限',
+        title: '扫码登录 B站账号',
+        description: '游客模式也能普通点歌；扫码登录后，可以设置超级用户白名单和更细的观众权限。'
+    },
+    {
+        icon: '🏠',
+        kicker: '直播间连接',
+        title: '连接你的直播间',
+        description: '填写直播间网址末尾的数字房间号，让点歌机开始接收这间直播间的弹幕。'
+    },
+    {
+        icon: '📺',
+        kicker: '直播画面',
+        title: '添加 OBS 浏览器捕捉',
+        description: '复制固定的 Mod UI 地址到 OBS 或直播姬。以后切换 UI 模组时，不需要修改捕捉地址。'
+    },
+    {
+        icon: '🎵',
+        kicker: '播放器与观众',
+        title: '选择播放器并配置权限',
+        description: '选择你实际使用的音乐播放器，再按需要设置观众点歌、切歌、置顶和撤回等权限。'
+    }
+] as const;
+
+const ONBOARDING_STORAGE_KEY = 'awoo-admin-onboarding-v1';
+
+function readOnboardingPending(): boolean {
+    try {
+        return localStorage.getItem(ONBOARDING_STORAGE_KEY) !== 'completed';
+    } catch {
+        return true;
+    }
+}
+
+/** Polls while mounted, so a tab owns its poll by rendering this inside its content. */
+const TabPoller: React.FC<{ poll: (signal: AbortSignal) => Promise<void>; intervalMs: number }> = ({ poll, intervalMs }) => {
+    usePolling(poll, { intervalMs });
+    return null;
+};
+
+interface OnboardingDialogProps {
+    step: number;
+    onStepChange: (step: number) => void;
+    onOpenDestination: (tab: OnboardingTab, target: OnboardingTarget | null, advance: boolean) => void;
+    onFinish: () => void;
+}
+
+/**
+ * The first-run guide as a modal dialog, opened with showModal() like the update
+ * dialog: the page behind it is inert, Escape finishes the guide, and focus
+ * returns to where it was when the guide closes.
+ */
+const OnboardingDialog: React.FC<OnboardingDialogProps> = ({ step, onStepChange, onOpenDestination, onFinish }) => {
+    const dialogRef = useRef<HTMLDialogElement>(null);
+    const currentStep = ONBOARDING_STEPS[step] || ONBOARDING_STEPS[0];
+
+    useEffect(() => {
+        const dialog = dialogRef.current;
+        if (!dialog) return;
+        const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        if (!dialog.open) dialog.showModal();
+        dialog.querySelector<HTMLElement>('[data-initial-focus]')?.focus();
+        return () => {
+            const focusInDialog = !document.activeElement || document.activeElement === document.body || dialog.contains(document.activeElement);
+            if (dialog.open) dialog.close();
+            if (focusInDialog && previousFocus?.isConnected) previousFocus.focus();
+        };
+    }, []);
+
+    return (
+        <dialog
+            ref={dialogRef}
+            aria-labelledby="onboarding-title"
+            aria-describedby="onboarding-description"
+            aria-modal="true"
+            onCancel={event => {
+                event.preventDefault();
+                onFinish();
+            }}
+            onKeyDown={event => {
+                if (event.key !== 'Tab') return;
+                const focusable = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled)')].filter(element => element.getClientRects().length > 0);
+                const first = focusable[0];
+                const last = focusable[focusable.length - 1];
+                if (!first) { event.preventDefault(); return; }
+                if (event.shiftKey && (document.activeElement === first || !focusable.includes(document.activeElement as HTMLElement))) { event.preventDefault(); last.focus(); }
+                else if (!event.shiftKey && (document.activeElement === last || !focusable.includes(document.activeElement as HTMLElement))) { event.preventDefault(); first.focus(); }
+            }}
+            className="studio-onboarding w-[calc(100%-40px)] max-w-xl max-h-[calc(100dvh-40px)] overflow-y-auto rounded-3xl border border-cyan-400/25 bg-[#151922] p-0 shadow-[0_24px_100px_rgba(0,0,0,0.65)]"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+        >
+            <div className="border-b border-white/10 bg-gradient-to-r from-cyan-500/10 to-violet-500/10 px-6 py-5">
+                <div className="flex items-start justify-between gap-4">
+                    <div>
+                        <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-cyan-300">首次使用向导</div>
+                        <h2 id="onboarding-title" tabIndex={-1} data-initial-focus className="mt-1 text-xl font-bold text-white outline-none">用 4 步完成点歌机配置</h2>
+                        <p id="onboarding-description" className="mt-1 text-xs text-gray-400">点击“前往设置”会打开对应页面，并自动滚动到需要操作的位置。</p>
+                    </div>
+                    <button onClick={onFinish} aria-label="关闭新手引导" title="关闭并不再自动显示" className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-lg text-gray-500 hover:bg-white/10 hover:text-white">×</button>
+                </div>
+
+                <div className="mt-5 grid grid-cols-4 gap-2">
+                    {ONBOARDING_STEPS.map((item, index) => (
+                        <button key={item.title} onClick={() => onStepChange(index)} className={`h-1.5 rounded-full transition-colors ${index === step ? 'bg-cyan-400' : index < step ? 'bg-cyan-700' : 'bg-white/10'}`} aria-label={`查看第 ${index + 1} 步`} />
+                    ))}
+                </div>
+            </div>
+
+            <div className="px-6 py-6">
+                <div className="flex items-start gap-4">
+                    <div className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl border border-white/10 bg-white/5 text-3xl">{currentStep.icon}</div>
+                    <div className="min-w-0">
+                        <div className="text-[11px] font-bold text-cyan-300">第 {step + 1} 步 · {currentStep.kicker}</div>
+                        <h3 className="mt-1 text-xl font-bold text-white">{currentStep.title}</h3>
+                        <p className="mt-2 text-sm leading-relaxed text-gray-400">{currentStep.description}</p>
+                    </div>
+                </div>
+
+                <div className="mt-6">
+                    {step === 0 && (
+                        <button onClick={() => onOpenDestination('login', null, true)} className="w-full rounded-xl bg-gradient-to-r from-pink-600 to-violet-600 px-5 py-3 text-sm font-bold text-white shadow-lg hover:brightness-110">前往扫码登录 →</button>
+                    )}
+                    {step === 1 && (
+                        <button onClick={() => onOpenDestination('status', 'room', true)} className="w-full rounded-xl bg-gradient-to-r from-blue-600 to-cyan-600 px-5 py-3 text-sm font-bold text-white shadow-lg hover:brightness-110">前往连接直播间 →</button>
+                    )}
+                    {step === 2 && (
+                        <button onClick={() => onOpenDestination('appearance', 'mod-ui', true)} className="w-full rounded-xl bg-gradient-to-r from-cyan-600 to-violet-600 px-5 py-3 text-sm font-bold text-white shadow-lg hover:brightness-110">前往设置 Mod UI 捕捉 →</button>
+                    )}
+                    {step === 3 && (
+                        <div className="grid gap-3 sm:grid-cols-2">
+                            <button onClick={() => onOpenDestination('settings', 'player', false)} className="rounded-xl border border-purple-400/30 bg-purple-500/15 px-4 py-3 text-sm font-bold text-purple-100 hover:bg-purple-500/25">选择连接的播放器 →</button>
+                            <button onClick={() => onOpenDestination('settings', 'permission', false)} className="rounded-xl border border-green-400/30 bg-green-500/15 px-4 py-3 text-sm font-bold text-green-100 hover:bg-green-500/25">配置观众权限 →</button>
+                        </div>
+                    )}
+                </div>
+
+                <div className="mt-5 flex items-center justify-between border-t border-white/10 pt-4">
+                    <button disabled={step === 0} onClick={() => onStepChange(Math.max(0, step - 1))} className="text-xs font-bold text-gray-500 hover:text-gray-300 disabled:invisible">← 上一步</button>
+                    {step === 3 ? (
+                        <button onClick={onFinish} className="rounded-lg bg-white/10 px-4 py-2 text-xs font-bold text-white hover:bg-white/15">完成引导</button>
+                    ) : (
+                        <button onClick={onFinish} className="text-xs text-gray-500 hover:text-gray-300">跳过，以后不再自动显示</button>
+                    )}
+                </div>
+            </div>
+        </dialog>
+    );
+};
+
 const AdminWidget: React.FC = () => {
     const { colorMode, toggleColorMode } = useColorMode();
     useEffect(() => { electronAPI?.setWindowColorMode?.(colorMode); }, [colorMode]);
     const [config, setConfig] = useState<any>(null);
     const [activeTab, setActiveTab] = useState<string>(() => {
         const tab = new URLSearchParams(window.location.search).get('tab');
-        return tab === 'appearance' ? 'appearance' : tab === 'updates' || tab === 'update' ? 'update' : 'status';
+        return tab === 'diagnostics' ? 'diagnostics' : tab === 'appearance' ? 'appearance' : tab === 'updates' || tab === 'update' ? 'update' : 'status';
     });
-    const [announcementOpenRequest, setAnnouncementOpenRequest] = useState(() => (
-        new URLSearchParams(window.location.search).get('tab') === 'updates' ? 1 : 0
-    ));
+    // A window opened for updates follows the dialog's auto-open policy; only the user's click forces it open.
+    const [announcementOpenRequest, setAnnouncementOpenRequest] = useState(0);
+    const [updateBadgeCount, setUpdateBadgeCount] = useState(0);
+    const [updateChecking, setUpdateChecking] = useState(false);
     const [supportMenuOpen, setSupportMenuOpen] = useState(false);
     const mainContentRef = useRef<HTMLElement>(null);
 
@@ -1366,26 +1759,25 @@ const AdminWidget: React.FC = () => {
         mainContentRef.current?.scrollTo({ top: 0 });
     }, [activeTab]);
 
-    const [updateInfo, setUpdateInfo] = useState<UpdateInfo>({ checking: false, info: null });
     const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
     const [updateDownloadStatus, setUpdateDownloadStatus] = useState<AppUpdateDownloadStatus | null>(null);
+    const [coreUpdateStalled, setCoreUpdateStalled] = useState(false);
+    const [coreUpdateConfirmation, setCoreUpdateConfirmation] = useState<CoreUpdateConfirmation | null>(null);
     const updateStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // Advanced for every poll loop, so an older loop stops at its next step.
+    const updateStatusPollGenerationRef = useRef(0);
+    const coreProgressMarkRef = useRef<CoreProgressMark | null>(null);
+    const coreUpdateConfirmResolveRef = useRef<((confirmed: boolean) => void) | null>(null);
     const updateApplyRequestInFlightRef = useRef(false);
 
     const [qrState, setQrState] = useState<QrState>({ loading: false, base64: '', message: '' });
     const [roomIdInput, setRoomIdInput] = useState<string>('');
-    const [sysLogs, setSysLogs] = useState<SysLog[]>([]);
-    const logsEndRef = useRef<HTMLDivElement>(null);
-
-    // ⭐ 新增: 自动滚动日志锁定与日志容器引用
-    const [autoScroll, setAutoScroll] = useState<boolean>(true);
-    const logContainerRef = useRef<HTMLDivElement>(null);
 
     const [superUserInput, setSuperUserInput] = useState<string>('');
     const [debugInput, setDebugInput] = useState<string>('');
     const [giftLearningNow, setGiftLearningNow] = useState(Date.now());
 
-    const [adminToast, setAdminToast] = useState<string>('');
+    const { toast: adminToast, showToast: showAdminToast } = useAdminToast();
     const [connectorStatuses, setConnectorStatuses] = useState<
         Partial<Record<NativeConnectorId, ConnectorStatus>>
     >({});
@@ -1398,6 +1790,10 @@ const AdminWidget: React.FC = () => {
         NativeConnectorId | null
     >(null);
     const connectorUpdateInFlightRef = useRef(false);
+    // Bumped by every authoritative status change; a progress poll that started earlier is stale.
+    const connectorStatusRevisionRef = useRef(0);
+    const connectorProgressInFlightRef = useRef(false);
+    const playerSwitchInFlightRef = useRef(false);
     const [connectorStatusError, setConnectorStatusError] = useState('');
     const [feedbackForm, setFeedbackForm] = useState({
         category: 'bug',
@@ -1427,7 +1823,6 @@ const AdminWidget: React.FC = () => {
     const [feedbackHistoryRefreshing, setFeedbackHistoryRefreshing] = useState(false);
     const feedbackHistoryRef = useRef(feedbackHistory);
     const feedbackRefreshInFlightRef = useRef(false);
-    const activeTabRef = useRef<string>(activeTab);
     const [overlayMods, setOverlayMods] = useState<OverlayModState | null>(null);
     const [overlayUrl, setOverlayUrl] = useState(
         'https://app.enkianss.us/mods/v1/retro-cmd/manifest.json'
@@ -1443,33 +1838,28 @@ const AdminWidget: React.FC = () => {
         id: string;
         values: Record<string, OverlaySettingValue>;
     } | null>(null);
+    const overlaySettingsSaveRef = useRef<Promise<void>>(Promise.resolve());
+    const overlaySettingsInFlightRef = useRef(0);
+    // Bumped by every local Mod UI change; a poll that started earlier is stale.
+    const overlayModsRevisionRef = useRef(0);
     const roomSetupRef = useRef<HTMLDivElement>(null);
     const modUiSetupRef = useRef<HTMLElement>(null);
     const playerSetupRef = useRef<HTMLDivElement>(null);
     const permissionSetupRef = useRef<HTMLDivElement>(null);
-    const firstRunGuidePending = (() => {
-        try {
-            return localStorage.getItem('awoo-admin-onboarding-v1') !== 'completed';
-        } catch {
-            return true;
-        }
-    })();
-    const [onboardingActive, setOnboardingActive] = useState(firstRunGuidePending);
-    const [onboardingOpen, setOnboardingOpen] = useState(firstRunGuidePending);
+    // Storage is read once on mount, not on every render.
+    const [onboardingActive, setOnboardingActive] = useState(readOnboardingPending);
+    const [onboardingOpen, setOnboardingOpen] = useState(onboardingActive);
     const [onboardingStep, setOnboardingStep] = useState(0);
-    const [pendingOnboardingTarget, setPendingOnboardingTarget] = useState<'room' | 'mod-ui' | 'player' | 'permission' | null>(null);
+    const [pendingOnboardingTarget, setPendingOnboardingTarget] = useState<OnboardingTarget | null>(null);
 
     useEffect(() => {
         return electronAPI?.onAdminNavigate(tab => {
+            if (tab === 'diagnostics') setActiveTab('diagnostics');
             if (tab === 'appearance') setActiveTab('appearance');
             if (tab === 'update' || tab === 'updates') setActiveTab('update');
-            if (tab === 'updates') setAnnouncementOpenRequest(value => value + 1);
+            // A new receipt or update reopens the dialog through its auto-open policy.
+            if (tab === 'updates') window.dispatchEvent(new Event('awoo-updates-changed'));
         });
-    }, []);
-
-    const showAdminToast = useCallback((msg: string) => {
-        setAdminToast(msg);
-        setTimeout(() => setAdminToast(''), 3000);
     }, []);
 
     const persistFeedbackHistory = useCallback((items: LocalFeedbackHistoryItem[]) => {
@@ -1543,7 +1933,7 @@ const AdminWidget: React.FC = () => {
 
     const finishOnboarding = useCallback(() => {
         try {
-            localStorage.setItem('awoo-admin-onboarding-v1', 'completed');
+            localStorage.setItem(ONBOARDING_STORAGE_KEY, 'completed');
         } catch {
             // 本地存储不可用时仍允许用户关闭引导。
         }
@@ -1558,8 +1948,8 @@ const AdminWidget: React.FC = () => {
     }, []);
 
     const openOnboardingDestination = useCallback((
-        tab: 'login' | 'status' | 'appearance' | 'settings',
-        target: 'room' | 'mod-ui' | 'player' | 'permission' | null,
+        tab: OnboardingTab,
+        target: OnboardingTarget | null,
         advance: boolean
     ) => {
         setActiveTab(tab);
@@ -1587,63 +1977,349 @@ const AdminWidget: React.FC = () => {
         return () => clearTimeout(timer);
     }, [activeTab, pendingOnboardingTarget]);
 
-    const updateControlTheme = useCallback((nextTheme: Theme) => {
-        if (!config) return;
-        const nextWidgetStyle = {
-            ...(config.widgetStyle || {}),
-            theme: nextTheme,
-            timestamp: Date.now()
+    // Settings sync: every local edit bumps a revision, and a poll may replace the
+    // settings only once the server has confirmed the latest revision. Saves run
+    // one at a time, so an older request can never land after a newer one.
+    const sysConfigRef = useRef<any>(null);
+    const lastConfigString = useRef('');
+    const configRevisionRef = useRef(0);
+    const savedConfigRevisionRef = useRef(0);
+    const keepaliveConfigRevisionRef = useRef(0);
+    const configSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const configSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+    const configSaveFailuresRef = useRef(0);
+    const persistSysConfigRef = useRef<(options?: ConfigSaveOptions) => Promise<ConfigSaveOutcome>>(
+        () => Promise.resolve({ ok: false, result: null })
+    );
+
+    const scheduleConfigSave = useCallback((delayMs = CONFIG_SAVE_DEBOUNCE_MS) => {
+        if (configSaveTimerRef.current) clearTimeout(configSaveTimerRef.current);
+        configSaveTimerRef.current = setTimeout(() => {
+            configSaveTimerRef.current = null;
+            void persistSysConfigRef.current({ announce: true, retry: true });
+        }, delayMs);
+    }, []);
+
+    const persistSysConfig = useCallback((options: ConfigSaveOptions = {}): Promise<ConfigSaveOutcome> => {
+        if (configSaveTimerRef.current) {
+            clearTimeout(configSaveTimerRef.current);
+            configSaveTimerRef.current = null;
+        }
+        const save = async (): Promise<ConfigSaveOutcome> => {
+            const revision = configRevisionRef.current;
+            const sysConfig = sysConfigRef.current;
+            if (!sysConfig || revision === savedConfigRevisionRef.current) return { ok: true, result: null };
+            const serialized = JSON.stringify(sysConfig);
+            if (serialized === lastConfigString.current) {
+                // The edits ended where the server already is.
+                savedConfigRevisionRef.current = revision;
+                return { ok: true, result: null };
+            }
+            if (options.keepalive) {
+                if (keepaliveConfigRevisionRef.current === revision) return { ok: true, result: null };
+                keepaliveConfigRevisionRef.current = revision;
+            }
+            let result: any = null;
+            let accepted = false;
+            try {
+                const response = await postInternalJson('/api/config', { sysConfig }, options.keepalive);
+                result = await response.json().catch(() => null);
+                accepted = isConfigSaveAccepted(response.ok, result);
+            } catch {
+                accepted = false;
+            }
+            if (accepted) {
+                if (revision >= savedConfigRevisionRef.current) {
+                    lastConfigString.current = serialized;
+                    savedConfigRevisionRef.current = revision;
+                }
+                configSaveFailuresRef.current = 0;
+                if (options.announce) showAdminToast('✅ 设置已自动保存！', { passive: true });
+                return { ok: true, result };
+            }
+            if (options.retry) {
+                configSaveFailuresRef.current += 1;
+                const decision = shouldRetrySave(configSaveFailuresRef.current);
+                if (!decision.retry) {
+                    // The edit stays unsaved (and unreverted) until the next edit or tab change.
+                    configSaveFailuresRef.current = 0;
+                    showAdminToast('❌ 设置保存失败，请检查后重试');
+                } else if (!configSaveTimerRef.current) {
+                    // A newer edit may already have scheduled the save that carries this one.
+                    scheduleConfigSave(decision.delayMs);
+                }
+            }
+            return { ok: false, result };
         };
+        if (options.keepalive) return save();
+        const run = configSaveQueueRef.current.then(save);
+        configSaveQueueRef.current = run.catch(() => undefined);
+        return run;
+    }, [scheduleConfigSave, showAdminToast]);
+
+    useEffect(() => {
+        persistSysConfigRef.current = persistSysConfig;
+    }, [persistSysConfig]);
+
+    /** The single entry point for settings edits, so each one is tracked and saved. */
+    const updateSysConfig = useCallback((
+        mutator: (current: any) => any,
+        options: { save?: boolean } = {}
+    ): boolean => {
+        const current = sysConfigRef.current;
+        if (!current) return false;
+        const next = mutator(current);
+        if (!next || next === current) return false;
+        sysConfigRef.current = next;
+        configRevisionRef.current += 1;
+        configSaveFailuresRef.current = 0;
+        setConfig((previous: any) => previous ? ({ ...previous, config: next }) : previous);
+        if (options.save !== false) scheduleConfigSave();
+        return true;
+    }, [scheduleConfigSave]);
+
+    const pendingThemeRef = useRef<{ theme: Theme; timestamp: number } | null>(null);
+    const themeRevisionRef = useRef(0);
+    const savedThemeRevisionRef = useRef(0);
+    const keepaliveThemeRevisionRef = useRef(0);
+    const themeSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+
+    const persistControlTheme = useCallback((keepalive = false): Promise<void> => {
+        if (appearanceSaveTimerRef.current) {
+            clearTimeout(appearanceSaveTimerRef.current);
+            appearanceSaveTimerRef.current = null;
+        }
+        const save = async () => {
+            const revision = themeRevisionRef.current;
+            const widgetStyle = pendingThemeRef.current;
+            if (!widgetStyle || revision === savedThemeRevisionRef.current) return;
+            if (keepalive) {
+                if (keepaliveThemeRevisionRef.current === revision) return;
+                keepaliveThemeRevisionRef.current = revision;
+            }
+            try {
+                // Send only the theme: the overlay window size saved by resizing must survive.
+                const response = await postInternalJson('/api/config', { widgetStyle }, keepalive);
+                const result = await response.json().catch(() => null);
+                if (!isConfigSaveAccepted(response.ok, result)) throw new Error('主播控制 UI 外观保存失败');
+                if (revision >= savedThemeRevisionRef.current) savedThemeRevisionRef.current = revision;
+                if (themeRevisionRef.current === revision) pendingThemeRef.current = null;
+            } catch {
+                if (!keepalive) showAdminToast('❌ 主播控制 UI 外观保存失败');
+            }
+        };
+        if (keepalive) return save();
+        const run = themeSaveQueueRef.current.then(save);
+        themeSaveQueueRef.current = run;
+        return run;
+    }, [showAdminToast]);
+
+    const updateControlTheme = useCallback((nextTheme: Theme) => {
+        if (!sysConfigRef.current) return;
+        const timestamp = Date.now();
+        themeRevisionRef.current += 1;
+        pendingThemeRef.current = { theme: nextTheme, timestamp };
         setConfig((previous: any) => previous ? ({
             ...previous,
-            widgetStyle: nextWidgetStyle
+            widgetStyle: { ...(previous.widgetStyle || {}), theme: nextTheme, timestamp }
         }) : previous);
         if (appearanceSaveTimerRef.current) {
             clearTimeout(appearanceSaveTimerRef.current);
         }
         appearanceSaveTimerRef.current = setTimeout(() => {
-            fetch(internalApiUrl('/api/config'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ widgetStyle: nextWidgetStyle })
-            }).catch(() => {
-                showAdminToast('❌ 主播控制 UI 外观保存失败');
-            });
-        }, 300);
-    }, [config, showAdminToast]);
+            appearanceSaveTimerRef.current = null;
+            void persistControlTheme();
+        }, THEME_SAVE_DEBOUNCE_MS);
+    }, [persistControlTheme]);
 
     useEffect(() => () => {
-        if (appearanceSaveTimerRef.current) {
-            clearTimeout(appearanceSaveTimerRef.current);
-        }
-        if (overlaySettingsSaveTimerRef.current) {
-            clearTimeout(overlaySettingsSaveTimerRef.current);
-        }
+        updateStatusPollGenerationRef.current += 1;
         if (updateStatusTimerRef.current) {
             clearTimeout(updateStatusTimerRef.current);
         }
+        coreUpdateConfirmResolveRef.current?.(false);
+        coreUpdateConfirmResolveRef.current = null;
     }, []);
 
-    const loadOverlayMods = useCallback(async () => {
+    /**
+     * Follows the server's core update until it settles, one setTimeout chain at
+     * a time. Both a new update and a window reopened during a download use it.
+     */
+    const pollCoreUpdateStatus = useCallback(() => {
+        if (updateStatusTimerRef.current) {
+            clearTimeout(updateStatusTimerRef.current);
+            updateStatusTimerRef.current = null;
+        }
+        const generation = ++updateStatusPollGenerationRef.current;
+        let consecutiveFailures = 0;
+        let lastState: AppUpdateDownloadState | null = null;
+        const settle = () => {
+            updateApplyRequestInFlightRef.current = false;
+            coreProgressMarkRef.current = null;
+            setDownloadProgress(null);
+            setCoreUpdateStalled(false);
+        };
+        const poll = async (): Promise<void> => {
+            updateStatusTimerRef.current = null;
+            try {
+                const statusResponse = await fetch(
+                    internalApiUrl('/api/update/status'),
+                    { cache: 'no-store' }
+                );
+                const statusResult = await statusResponse.json();
+                if (!statusResponse.ok || !statusResult.success || !statusResult.status) {
+                    throw new Error(statusResult.message || '无法读取更新进度');
+                }
+                if (generation !== updateStatusPollGenerationRef.current) return;
+                consecutiveFailures = 0;
+                const status = statusResult.status as AppUpdateDownloadStatus;
+                lastState = status.state;
+                setUpdateDownloadStatus(status);
+
+                if (status.state === 'error') {
+                    settle();
+                    showAdminToast(`❌ ${status.message || '更新失败'}`);
+                    window.dispatchEvent(new Event('awoo-updates-changed'));
+                    return;
+                }
+                if (status.state === 'no-update') {
+                    settle();
+                    showAdminToast('✅ 当前已经是最新版本');
+                    // The cached announcement may still list the version that just turned out current.
+                    window.dispatchEvent(new CustomEvent('awoo-updates-changed', { detail: { refresh: true } }));
+                    return;
+                }
+                if (!isCoreUpdateActive(status.state)) {
+                    settle();
+                    return;
+                }
+
+                const now = Date.now();
+                coreProgressMarkRef.current = trackCoreUpdateProgress(coreProgressMarkRef.current, status, now);
+                setCoreUpdateStalled(isCoreUpdateStalled(coreProgressMarkRef.current, now));
+                setDownloadProgress(clampPercent(status.progress) ?? 0);
+                updateStatusTimerRef.current = setTimeout(() => void poll(), CORE_UPDATE_POLL_MS);
+            } catch {
+                if (generation !== updateStatusPollGenerationRef.current) return;
+                consecutiveFailures += 1;
+                // The old process exits right after 'applying', so losing the server then is expected.
+                if (lastState === 'applying' || consecutiveFailures < 5) {
+                    updateStatusTimerRef.current = setTimeout(() => void poll(), CORE_UPDATE_RETRY_MS);
+                    return;
+                }
+                const message = '暂时无法读取更新进度，请稍后在“版本升级”中查看';
+                settle();
+                setUpdateDownloadStatus({
+                    state: 'error', progress: null, version: null,
+                    message, updatedAt: new Date().toISOString()
+                });
+                showAdminToast(`❌ ${message}`);
+                window.dispatchEvent(new Event('awoo-updates-changed'));
+            }
+        };
+        void poll();
+    }, [showAdminToast]);
+
+    /** Shows an update that is already running, e.g. after the admin window was reopened. */
+    const resumeCoreUpdate = useCallback((status: AppUpdateDownloadStatus) => {
+        updateApplyRequestInFlightRef.current = true;
+        coreProgressMarkRef.current = null;
+        setCoreUpdateStalled(false);
+        setDownloadProgress(clampPercent(status.progress) ?? 0);
+        setUpdateDownloadStatus(status);
+        pollCoreUpdateStatus();
+    }, [pollCoreUpdateStatus]);
+
+    useEffect(() => {
+        // The admin window is destroyed on close; a download started earlier keeps running.
+        let cancelled = false;
+        void (async () => {
+            try {
+                const response = await fetch(internalApiUrl('/api/update/status'), { cache: 'no-store' });
+                const result = await response.json();
+                if (cancelled || !response.ok || !result.success) return;
+                const status = result.status as AppUpdateDownloadStatus | undefined;
+                if (status && isCoreUpdateActive(status.state) && !updateApplyRequestInFlightRef.current) {
+                    resumeCoreUpdate(status);
+                }
+            } catch {
+                // Without a status there is nothing to resume; the dialog can start a new update.
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [resumeCoreUpdate]);
+
+    const loadOverlayMods = useCallback(async (signal?: AbortSignal) => {
+        const revisionAtRequest = overlayModsRevisionRef.current;
         try {
-            const response = await fetch(internalApiUrl('/api/overlays'));
+            const response = await fetch(internalApiUrl('/api/overlays'), { signal });
             const result = await response.json();
             if (!response.ok || !result.success) {
                 throw new Error(result.message || '读取 Mod UI 列表失败');
             }
-            setOverlayMods(result);
+            // Values waiting for or in a save, or changed meanwhile, are newer than this snapshot.
+            if (pendingOverlaySettingsRef.current
+                || overlaySettingsInFlightRef.current > 0
+                || overlayModsRevisionRef.current !== revisionAtRequest) return;
+            setOverlayMods(previous => sameJson(previous, result) ? previous : result);
         } catch (error: unknown) {
+            if (signal?.aborted) return;
             console.warn(
                 error instanceof Error ? error.message : '读取 Mod UI 列表失败'
             );
         }
     }, []);
 
+    const applyOverlayModsState = useCallback((state: OverlayModState) => {
+        overlayModsRevisionRef.current += 1;
+        setOverlayMods(state);
+    }, []);
+
+    const persistOverlaySettings = useCallback((keepalive = false): Promise<void> => {
+        if (overlaySettingsSaveTimerRef.current) {
+            clearTimeout(overlaySettingsSaveTimerRef.current);
+            overlaySettingsSaveTimerRef.current = null;
+        }
+        const next = pendingOverlaySettingsRef.current;
+        if (!next) return Promise.resolve();
+        pendingOverlaySettingsRef.current = null;
+        const revision = overlayModsRevisionRef.current;
+        overlaySettingsInFlightRef.current += 1;
+        const save = (async () => {
+            try {
+                const response = await postInternalJson('/api/overlays/settings', next, keepalive);
+                const result = await response.json();
+                if (!response.ok || !result.success) {
+                    throw new Error(result.message || '保存 Mod UI 参数失败');
+                }
+                // A newer edit keeps its local value until its own save answers.
+                if (overlayModsRevisionRef.current === revision && !pendingOverlaySettingsRef.current) {
+                    setOverlayMods(result);
+                }
+            } catch (error: unknown) {
+                if (keepalive) return;
+                showAdminToast(`❌ ${error instanceof Error ? error.message : '保存 Mod UI 参数失败'}`);
+                void loadOverlayMods();
+            } finally {
+                overlaySettingsInFlightRef.current -= 1;
+            }
+        })();
+        overlaySettingsSaveRef.current = save;
+        return save;
+    }, [loadOverlayMods, showAdminToast]);
+
     const updateOverlaySetting = useCallback((
         id: string,
         key: string,
         value: OverlaySettingValue
     ) => {
+        // Unsaved values of another Mod UI go out first instead of being replaced.
+        if (pendingOverlaySettingsRef.current && pendingOverlaySettingsRef.current.id !== id) {
+            void persistOverlaySettings();
+        }
+        overlayModsRevisionRef.current += 1;
         setOverlayMods(previous => {
             if (!previous) return previous;
             const updateRecord = (record: OverlayModRecord) => record.id === id
@@ -1659,40 +2335,67 @@ const AdminWidget: React.FC = () => {
         const pending = pendingOverlaySettingsRef.current;
         pendingOverlaySettingsRef.current = {
             id,
-            values: pending?.id === id
-                ? { ...pending.values, [key]: value }
-                : { [key]: value }
+            values: { ...(pending?.values || {}), [key]: value }
         };
         if (overlaySettingsSaveTimerRef.current) {
             clearTimeout(overlaySettingsSaveTimerRef.current);
         }
-        overlaySettingsSaveTimerRef.current = setTimeout(async () => {
-            const next = pendingOverlaySettingsRef.current;
-            pendingOverlaySettingsRef.current = null;
-            if (!next) return;
-            try {
-                const response = await fetch(internalApiUrl('/api/overlays/settings'), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(next)
-                });
-                const result = await response.json();
-                if (!response.ok || !result.success) {
-                    throw new Error(result.message || '保存 Mod UI 参数失败');
-                }
-                setOverlayMods(result);
-            } catch (error: unknown) {
-                showAdminToast(`❌ ${error instanceof Error ? error.message : '保存 Mod UI 参数失败'}`);
-                void loadOverlayMods();
-            }
-        }, 220);
-    }, [loadOverlayMods, showAdminToast]);
+        overlaySettingsSaveTimerRef.current = setTimeout(() => {
+            overlaySettingsSaveTimerRef.current = null;
+            void persistOverlaySettings();
+        }, OVERLAY_SETTINGS_SAVE_DEBOUNCE_MS);
+    }, [persistOverlaySettings]);
+
+    useEffect(() => {
+        // Leaving a tab sends pending edits at once instead of after the debounce.
+        // Clicking a tab already blurs a field of the old tab; a focused field
+        // that is still on screen commits its draft here first.
+        commitFocusedDraft();
+        void persistSysConfig({ announce: true, retry: true });
+        void persistControlTheme();
+        void persistOverlaySettings();
+    }, [activeTab, persistSysConfig, persistControlTheme, persistOverlaySettings]);
+
+    // Closing the window waits for this flush; the keepalive path below is only a fallback.
+    useEffect(() => window.electronAPI?.onFlushPendingSaves?.(() => {
+        commitFocusedDraft();
+        return Promise.allSettled([
+            persistSysConfig(),
+            persistControlTheme(),
+            persistOverlaySettings()
+        ]);
+    }), [persistSysConfig, persistControlTheme, persistOverlaySettings]);
+
+    useEffect(() => {
+        const flushWithKeepalive = () => {
+            commitFocusedDraft();
+            void persistSysConfig({ keepalive: true });
+            void persistControlTheme(true);
+            void persistOverlaySettings(true);
+        };
+        window.addEventListener('pagehide', flushWithKeepalive);
+        window.addEventListener('beforeunload', flushWithKeepalive);
+        return () => {
+            window.removeEventListener('pagehide', flushWithKeepalive);
+            window.removeEventListener('beforeunload', flushWithKeepalive);
+            // The control panel window is destroyed on close: send pending edits instead of dropping them.
+            flushWithKeepalive();
+        };
+    }, [persistSysConfig, persistControlTheme, persistOverlaySettings]);
 
     const resetOverlaySettings = useCallback(async (id: string) => {
-        if (overlaySettingsSaveTimerRef.current) {
-            clearTimeout(overlaySettingsSaveTimerRef.current);
+        if (pendingOverlaySettingsRef.current?.id === id) {
+            if (overlaySettingsSaveTimerRef.current) {
+                clearTimeout(overlaySettingsSaveTimerRef.current);
+                overlaySettingsSaveTimerRef.current = null;
+            }
+            pendingOverlaySettingsRef.current = null;
+        } else {
+            void persistOverlaySettings();
         }
-        pendingOverlaySettingsRef.current = null;
+        overlayModsRevisionRef.current += 1;
+        // A save still in flight must not land after the reset.
+        await overlaySettingsSaveRef.current;
         try {
             const response = await fetch(internalApiUrl('/api/overlays/settings'), {
                 method: 'POST',
@@ -1703,12 +2406,12 @@ const AdminWidget: React.FC = () => {
             if (!response.ok || !result.success) {
                 throw new Error(result.message || '恢复 Mod UI 默认参数失败');
             }
-            setOverlayMods(result);
+            applyOverlayModsState(result);
             showAdminToast(`✅ 已恢复 ${result.overlays?.find((item: OverlayModRecord) => item.id === id)?.name || 'Mod UI'} 的默认参数`);
         } catch (error: unknown) {
             showAdminToast(`❌ ${error instanceof Error ? error.message : '恢复 Mod UI 默认参数失败'}`);
         }
-    }, [showAdminToast]);
+    }, [applyOverlayModsState, persistOverlaySettings, showAdminToast]);
 
     const loadConnectorStatuses = useCallback(async (forceRefresh = false, connectorId?: NativeConnectorId) => {
         if (connectorCheckInFlightRef.current
@@ -1744,6 +2447,7 @@ const AdminWidget: React.FC = () => {
             if (connectorId && !nextStatuses[connectorId]) {
                 throw new Error('更新服务未返回该连接器的版本信息');
             }
+            connectorStatusRevisionRef.current += 1;
             setConnectorStatuses(previous => connectorId ? { ...previous, ...nextStatuses } : nextStatuses);
             if (!connectorId) setConnectorCheckErrors({});
             if (connectorId) {
@@ -1794,8 +2498,6 @@ const AdminWidget: React.FC = () => {
         }
     }, [showAdminToast]);
 
-    useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
-
     useEffect(() => {
         void refreshFeedbackHistory(false);
         const timer = setInterval(
@@ -1817,7 +2519,7 @@ const AdminWidget: React.FC = () => {
     }, [refreshFeedbackHistory]);
 
     useEffect(() => {
-        setSupportMenuOpen(['faq', 'feedback', 'logs', 'debug'].includes(activeTab));
+        setSupportMenuOpen(SUPPORT_TABS.includes(activeTab));
     }, [activeTab]);
 
     useEffect(() => {
@@ -1829,13 +2531,6 @@ const AdminWidget: React.FC = () => {
         );
         return () => clearInterval(timer);
     }, [activeTab, loadConnectorStatuses]);
-
-    useEffect(() => {
-        if (activeTab !== 'appearance') return;
-        void loadOverlayMods();
-        const timer = setInterval(() => void loadOverlayMods(), 5000);
-        return () => clearInterval(timer);
-    }, [activeTab, loadOverlayMods]);
 
     const installOverlayFromUrl = useCallback(async () => {
         const url = overlayUrl.trim();
@@ -1857,7 +2552,7 @@ const AdminWidget: React.FC = () => {
             if (!response.ok || !result.success) {
                 throw new Error(result.message || '安装 Mod UI 失败');
             }
-            setOverlayMods(result);
+            applyOverlayModsState(result);
             showAdminToast(`✅ 已安装并启用 ${result.active.name} ${result.active.version}`);
         } catch (error: unknown) {
             showAdminToast(
@@ -1866,7 +2561,7 @@ const AdminWidget: React.FC = () => {
         } finally {
             setOverlayBusy(false);
         }
-    }, [overlayUrl, showAdminToast]);
+    }, [applyOverlayModsState, overlayUrl, showAdminToast]);
 
     const openSkinMarketplace = useCallback(async () => {
         try {
@@ -1877,6 +2572,16 @@ const AdminWidget: React.FC = () => {
             }
         } catch (error: unknown) {
             showAdminToast(`❌ ${error instanceof Error ? error.message : '无法打开嗷呜皮肤站'}`);
+        }
+    }, [showAdminToast]);
+
+    // The clipboard can refuse (unfocused window, no permission), so only a confirmed copy says so.
+    const copyAddress = useCallback(async (address: string, successMessage: string) => {
+        try {
+            await navigator.clipboard.writeText(address);
+            showAdminToast(successMessage);
+        } catch {
+            showAdminToast('⚠️ 复制失败，请手动选择地址复制');
         }
     }, [showAdminToast]);
 
@@ -1906,7 +2611,7 @@ const AdminWidget: React.FC = () => {
             if (!response.ok || !result.success) {
                 throw new Error(result.message || '安装 ZIP 失败');
             }
-            setOverlayMods(result);
+            applyOverlayModsState(result);
             showAdminToast(`✅ 已安装并启用 ${result.active.name} ${result.active.version}`);
         } catch (error: unknown) {
             showAdminToast(
@@ -1918,7 +2623,7 @@ const AdminWidget: React.FC = () => {
                 overlayFileInputRef.current.value = '';
             }
         }
-    }, [showAdminToast]);
+    }, [applyOverlayModsState, showAdminToast]);
 
     const activateOverlay = useCallback(async (id: string) => {
         setOverlayBusy(true);
@@ -1935,7 +2640,7 @@ const AdminWidget: React.FC = () => {
             if (!response.ok || !result.success) {
                 throw new Error(result.message || '切换 Mod UI 失败');
             }
-            setOverlayMods(result);
+            applyOverlayModsState(result);
             showAdminToast(`🎨 已切换到 ${result.active.name}`);
         } catch (error: unknown) {
             showAdminToast(
@@ -1944,7 +2649,7 @@ const AdminWidget: React.FC = () => {
         } finally {
             setOverlayBusy(false);
         }
-    }, [showAdminToast]);
+    }, [applyOverlayModsState, showAdminToast]);
 
     const removeOverlay = useCallback(async (id: string) => {
         setOverlayBusy(true);
@@ -1961,7 +2666,7 @@ const AdminWidget: React.FC = () => {
             if (!response.ok || !result.success) {
                 throw new Error(result.message || '删除 Mod UI 失败');
             }
-            setOverlayMods(result);
+            applyOverlayModsState(result);
             showAdminToast('🗑️ 已删除 Mod UI；若它正在使用，已切回内置 UI');
         } catch (error: unknown) {
             showAdminToast(
@@ -1970,74 +2675,67 @@ const AdminWidget: React.FC = () => {
         } finally {
             setOverlayBusy(false);
         }
-    }, [showAdminToast]);
+    }, [applyOverlayModsState, showAdminToast]);
 
     const enableOverlayApi = useCallback(async () => {
-        if (!config?.config) return;
-        const nextSysConfig = {
-            ...config.config,
-            ExternalHttpEnabled: true,
-            ExternalWebSocketEnabled: true
-        };
-        try {
-            const response = await fetch(internalApiUrl('/api/config'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sysConfig: nextSysConfig })
-            });
-            if (!response.ok) throw new Error('启动只读接口失败');
-            setConfig((previous: any) => previous ? ({
-                ...previous,
-                config: nextSysConfig,
-                externalApi: {
-                    ...(previous.externalApi || {}),
-                    running: true,
-                    httpEnabled: true,
-                    webSocketEnabled: true
-                }
-            }) : previous);
-            showAdminToast('✅ Mod UI 只读接口已启动');
-        } catch (error: unknown) {
-            showAdminToast(
-                `❌ ${error instanceof Error ? error.message : '启动只读接口失败'}`
-            );
+        if (!sysConfigRef.current) return;
+        updateSysConfig(current => current.ExternalHttpEnabled === true && current.ExternalWebSocketEnabled === true
+            ? current
+            : { ...current, ExternalHttpEnabled: true, ExternalWebSocketEnabled: true }, { save: false });
+        // A failure keeps the change pending and the regular retries continue saving it.
+        const saved = await persistSysConfig({ retry: true });
+        if (!saved.ok) {
+            showAdminToast('❌ 启动只读接口失败');
+            return;
         }
-    }, [config, showAdminToast]);
+        setConfig((previous: any) => previous ? ({
+            ...previous,
+            externalApi: {
+                ...(previous.externalApi || {}),
+                running: true,
+                httpEnabled: true,
+                webSocketEnabled: true
+            }
+        }) : previous);
+        showAdminToast('✅ Mod UI 只读接口已启动');
+    }, [persistSysConfig, showAdminToast, updateSysConfig]);
 
-    const isInitialConfigLoad = useRef(true);
-    const lastConfigString = useRef('');
+    const fetchConfig = useCallback(async (signal: AbortSignal) => {
+        const configSavedAtRequest = savedConfigRevisionRef.current;
+        const themeSavedAtRequest = savedThemeRevisionRef.current;
+        try {
+            const res = await fetch(internalApiUrl('/api/config'), { signal });
+            const json = await res.json();
+            if (!res.ok || !json || typeof json !== 'object') return;
 
-    useEffect(() => {
-        const fetchConfig = async () => {
-            try {
-                const res = await fetch(internalApiUrl('/api/config'));
-                const json = await res.json();
+            // Pending or unconfirmed edits win; so does a save confirmed while this poll was in flight.
+            const configDirty = configRevisionRef.current !== savedConfigRevisionRef.current
+                || savedConfigRevisionRef.current !== configSavedAtRequest;
+            const widgetStyleDirty = themeRevisionRef.current !== savedThemeRevisionRef.current
+                || savedThemeRevisionRef.current !== themeSavedAtRequest;
+            // So does a field being typed in: the server's trimmed copy would rewrite it mid-word.
+            const editing = focusedPanelTextField() !== null;
+            if (json.config && (!(configDirty || editing) || !sysConfigRef.current)) {
+                const adopted = adoptPolledSysConfig(sysConfigRef.current, json.config);
+                sysConfigRef.current = adopted;
+                lastConfigString.current = JSON.stringify(adopted);
+            }
+            // An unchanged result keeps the previous object, so a quiet poll does not re-render the panel.
+            setConfig((prev: any) => {
+                const next = mergePolledConfig(prev, json, { configDirty, widgetStyleDirty, editing });
+                return sameJson(prev, next) ? prev : next;
+            });
 
-                setConfig((prev: any) => {
-                    if (!prev) return json;
-                    return {
-                        ...json,
-                        config: activeTabRef.current === 'settings' || activeTabRef.current === 'appearance'
-                            ? prev.config
-                            : json.config,
-                        widgetStyle: activeTabRef.current === 'appearance'
-                            ? prev.widgetStyle
-                            : json.widgetStyle
-                    };
-                });
+            setRoomIdInput(prev => {
+                const requestedRoomId = Number(json.requestedRoomId || json.roomId || 0);
+                if (prev === '' && requestedRoomId !== 0 && requestedRoomId !== json.uid) return requestedRoomId.toString();
+                return prev;
+            });
 
-                setRoomIdInput(prev => {
-                    const requestedRoomId = Number(json.requestedRoomId || json.roomId || 0);
-                    if (prev === '' && requestedRoomId !== 0 && requestedRoomId !== json.uid) return requestedRoomId.toString();
-                    return prev;
-                });
-
-            } catch { }
-        };
-        fetchConfig();
-        const timer = setInterval(fetchConfig, 2000);
-        return () => clearInterval(timer);
+        } catch { }
     }, []);
+
+    usePolling(fetchConfig, { intervalMs: 2000 });
 
     useEffect(() => {
         const expiresAt = Number(config?.giftLearning?.expiresAt || 0);
@@ -2047,91 +2745,21 @@ const AdminWidget: React.FC = () => {
         return () => clearInterval(timer);
     }, [config?.giftLearning?.active, config?.giftLearning?.expiresAt]);
 
-    useEffect(() => {
-        if (!config || !config.config) return;
-
-        const currentStr = JSON.stringify(config.config);
-
-        if (isInitialConfigLoad.current) {
-            isInitialConfigLoad.current = false;
-            lastConfigString.current = currentStr;
-            return;
-        }
-
-        if (currentStr === lastConfigString.current) return;
-
-        const timer = setTimeout(() => {
-            lastConfigString.current = currentStr;
-            fetch(internalApiUrl('/api/config'), {
-                method: 'POST',
-                headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ sysConfig: config.config })
-            }).then(res => {
-                if (res.ok) showAdminToast("✅ 设置已自动保存！");
-            }).catch(() => {});
-        }, 800);
-
-        return () => clearTimeout(timer);
-    }, [config, showAdminToast]);
-
-    useEffect(() => {
-        if (activeTab !== 'login') return;
-        const fetchQr = async () => {
-            try {
-                const res = await fetch(internalApiUrl('/api/bili/qrstatus'));
-                const json = await res.json();
-                setQrState({ loading: false, base64: json.qrBase64, message: json.status });
-                if (json.isLogin) {
-                    setConfig((prev: any) => prev ? ({
-                        ...prev,
-                        biliLogin: true,
-                        uid: json.uid,
-                        currentUser: json.currentUser
-                    }) : prev);
-                }
-            } catch {}
-        };
-        fetchQr();
-        const timer = setInterval(fetchQr, 2000);
-        return () => clearInterval(timer);
-    }, [activeTab]);
-
-    // ⭐ 改动：不管处于哪个 Tab 都会在后台静默轮询日志进行环境检测（如果是 logs tab 轮询频率调至 1秒，其他 tab 为 2.5秒）
-    useEffect(() => {
-        const fetchLogs = async () => {
-            try {
-                const res = await fetch(internalApiUrl('/api/logs'));
-                const json = await res.json();
-                setSysLogs(json);
-            } catch {}
-        };
-        fetchLogs();
-        const intervalTime = activeTab === 'logs' ? 1000 : 2500;
-        const timer = setInterval(fetchLogs, intervalTime);
-        return () => clearInterval(timer);
-    }, [activeTab]);
-
-    // ⭐ 新增: 处理日志自适应滚动和手动阅读判定
-    const handleLogScroll = () => {
-        const el = logContainerRef.current;
-        if (!el) return;
-
-        // 判定用户是否已经滚动到最下方 (误差距离 45px)
-        const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 45;
-
-        if (isAtBottom && !autoScroll) {
-            setAutoScroll(true); // 恢复自动滚动
-        } else if (!isAtBottom && autoScroll) {
-            setAutoScroll(false); // 锁定滚动，支持用户自由阅读
-        }
-    };
-
-    // ⭐ 改动: 仅当 autoScroll 为开启状态时执行平滑置底滚动
-    useEffect(() => {
-        if (activeTab === 'logs' && autoScroll && logContainerRef.current) {
-            logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-        }
-    }, [sysLogs, activeTab, autoScroll]);
+    const pollQrStatus = useCallback(async (signal: AbortSignal) => {
+        try {
+            const res = await fetch(internalApiUrl('/api/bili/qrstatus'), { signal });
+            const json = await res.json();
+            const next: QrState = { loading: false, base64: json.qrBase64, message: json.status };
+            setQrState(previous => sameJson(previous, next) ? previous : next);
+            if (json.isLogin) {
+                setConfig((prev: any) => {
+                    if (!prev) return prev;
+                    const loggedIn = { ...prev, biliLogin: true, uid: json.uid, currentUser: json.currentUser };
+                    return sameJson(prev, loggedIn) ? prev : loggedIn;
+                });
+            }
+        } catch {}
+    }, []);
 
     const handleConnectRoom = async () => {
         const rid = Number(roomIdInput.trim());
@@ -2236,43 +2864,119 @@ const AdminWidget: React.FC = () => {
         }
     };
 
+    /** Pending requests in the queue, or null when it cannot be read. */
+    const readPendingRequestCount = async (): Promise<number | null> => {
+        try {
+            const response = await fetch(internalApiUrl('/data'), { cache: 'no-store' });
+            const snapshot = await response.json();
+            return response.ok && Array.isArray(snapshot?.queue) ? snapshot.queue.length : null;
+        } catch {
+            return null;
+        }
+    };
+
+    const settleCoreUpdateConfirmation = useCallback((confirmed: boolean) => {
+        const resolve = coreUpdateConfirmResolveRef.current;
+        coreUpdateConfirmResolveRef.current = null;
+        setCoreUpdateConfirmation(null);
+        resolve?.(confirmed);
+    }, []);
+
+    /** Shows the restart confirmation in the update dialog and waits for the answer. */
+    const confirmCoreUpdate = (details: CoreUpdateConfirmation): Promise<boolean> => new Promise(resolve => {
+        coreUpdateConfirmResolveRef.current?.(false);
+        coreUpdateConfirmResolveRef.current = resolve;
+        setCoreUpdateConfirmation(details);
+    });
+
+    /** Reads statuses without the check indicators, for the progress of a running update. */
+    const refreshConnectorProgress = useCallback(async () => {
+        if (connectorProgressInFlightRef.current) return;
+        connectorProgressInFlightRef.current = true;
+        const revision = connectorStatusRevisionRef.current;
+        try {
+            const response = await fetch(internalApiUrl('/api/connectors/status'), { cache: 'no-store' });
+            const result = await response.json();
+            if (!response.ok || !result.success || !Array.isArray(result.connectors)) return;
+            if (revision !== connectorStatusRevisionRef.current) return;
+            setConnectorStatuses(previous => {
+                const next = { ...previous };
+                for (const status of result.connectors as ConnectorStatus[]) next[status.id] = status;
+                return next;
+            });
+        } catch {
+            // The next tick tries again.
+        } finally {
+            connectorProgressInFlightRef.current = false;
+        }
+    }, []);
+
+    const connectorProgressActive = connectorUpdating !== null
+        || (activeTab === 'settings' && Object.values(connectorStatuses).some(status => status?.updating === true));
+
+    useEffect(() => {
+        if (!connectorProgressActive) return;
+        void refreshConnectorProgress();
+        const timer = setInterval(() => void refreshConnectorProgress(), CONNECTOR_PROGRESS_POLL_MS);
+        return () => clearInterval(timer);
+    }, [connectorProgressActive, refreshConnectorProgress]);
+
     const handleConnectorUpdate = async (
         connectorId: NativeConnectorId,
         announcement?: UpdateAnnouncement
     ) => {
-        if (connectorUpdateInFlightRef.current || updateApplyRequestInFlightRef.current) return;
+        if (connectorUpdateInFlightRef.current || updateApplyRequestInFlightRef.current) {
+            const reason = updateApplyRequestInFlightRef.current
+                ? '点歌机正在更新，请等待更新完成后再更新连接器。'
+                : '请等待当前连接器更新完成。';
+            // The update dialog shows the reason next to its button.
+            if (announcement) throw new Error(reason);
+            showAdminToast(`⚠️ ${reason}`);
+            return;
+        }
         const status = announcement ? {
-            name: announcement.name,
+            name: announcement.name.replace(/连接器$/, ''),
             currentVersion: announcement.currentVersion,
             latestVersion: announcement.version,
             updateAvailable: announcement.canUpdate,
             manualUpdateAvailable: announcement.manualUpdate,
-            supportedPlayerVersion: announcement.supportedPlayerVersion
+            supportedPlayerVersion: announcement.supportedPlayerVersion,
+            quarantined: announcement.quarantined === true
         } : connectorStatuses[connectorId];
         if (!status?.updateAvailable) {
+            if (announcement) throw new Error('当前连接器没有可安装的更新。');
             showAdminToast('当前连接器没有可安装的更新。');
             return;
         }
 
-        if (status.manualUpdateAvailable) {
+        if (status.quarantined) {
+            // A retry, not a player-branch decision: this version failed to connect here and was rolled back.
+            const confirmed = window.confirm(
+                `${status.name}连接器将从 v${status.currentVersion || '未安装'} `
+                + `更新到 v${status.latestVersion || '未知'}。\n\n`
+                + '这个版本此前在本机无法连接播放器并已自动回退。'
+                + (connectorId === 'netease'
+                    ? NETEASE_CONNECTOR_RESTART_CONFIRM
+                    : '仍要重新安装并重试吗？')
+            );
+            if (!confirmed) return;
+        } else if (status.manualUpdateAvailable) {
             const confirmed = window.confirm(
                 `${status.name}连接器将从 v${status.currentVersion || '未安装'} `
                 + `更新到 v${status.latestVersion || '未知'}。\n\n`
                 + '该版本属于不同的播放器兼容分支，不会自动安装。\n'
                 + `目标连接器支持的播放器版本：${status.supportedPlayerVersion || '清单未注明'}\n\n`
-                + '请确认你正在使用对应的播放器版本。是否继续手动更新？'
+                + (connectorId === 'netease'
+                    ? `请确认你正在使用对应的播放器版本。${NETEASE_CONNECTOR_RESTART_CONFIRM}`
+                    : '请确认你正在使用对应的播放器版本。是否继续手动更新？')
             );
             if (!confirmed) return;
+        } else if (connectorId === 'netease' && !window.confirm(NETEASE_CONNECTOR_RESTART_CONFIRM)) {
+            return;
         }
 
-        const playerTypeByConnector: Record<NativeConnectorId, string> = {
-            netease: 'NCM',
-            kugou: 'Kugou',
-            qqmusic: 'QQMusic',
-            folia: 'Folia'
-        };
         const updatesSelectedPlayer =
-            config?.config?.PlayerType === playerTypeByConnector[connectorId];
+            config?.config?.PlayerType === PLAYER_TYPE_BY_CONNECTOR[connectorId];
         connectorUpdateInFlightRef.current = true;
         setConnectorUpdating(connectorId);
         if (updatesSelectedPlayer) {
@@ -2296,6 +3000,7 @@ const AdminWidget: React.FC = () => {
                 throw new Error(result.message || '连接器更新失败');
             }
             if (result.status) {
+                connectorStatusRevisionRef.current += 1;
                 setConnectorStatuses(previous => ({
                     ...previous,
                     [connectorId]: result.status
@@ -2347,15 +3052,15 @@ const AdminWidget: React.FC = () => {
     const handleConnectorReinstall = async (
         connectorId: NativeConnectorId
     ) => {
-        if (connectorUpdateInFlightRef.current || updateApplyRequestInFlightRef.current) return;
-        const playerTypeByConnector: Record<NativeConnectorId, string> = {
-            netease: 'NCM',
-            kugou: 'Kugou',
-            qqmusic: 'QQMusic',
-            folia: 'Folia'
-        };
+        if (connectorUpdateInFlightRef.current || updateApplyRequestInFlightRef.current) {
+            showAdminToast(updateApplyRequestInFlightRef.current
+                ? '⚠️ 点歌机正在更新，请等待更新完成后再重新安装连接器。'
+                : '⚠️ 请等待当前连接器更新完成。');
+            return;
+        }
+        if (connectorId === 'netease' && !window.confirm(NETEASE_CONNECTOR_RESTART_CONFIRM)) return;
         const reinstallsSelectedPlayer =
-            config?.config?.PlayerType === playerTypeByConnector[connectorId];
+            config?.config?.PlayerType === PLAYER_TYPE_BY_CONNECTOR[connectorId];
         connectorUpdateInFlightRef.current = true;
         setConnectorUpdating(connectorId);
         if (reinstallsSelectedPlayer) {
@@ -2380,6 +3085,7 @@ const AdminWidget: React.FC = () => {
             }
 
             if (result.status) {
+                connectorStatusRevisionRef.current += 1;
                 setConnectorStatuses(previous => ({
                     ...previous,
                     [connectorId]: result.status
@@ -2402,20 +3108,9 @@ const AdminWidget: React.FC = () => {
             }
             await loadConnectorStatuses(false);
             if (!reinstallsSelectedPlayer) {
-                showAdminToast('✅ 连接器重新安装完成，正在切换播放器...');
-                await handleSetPlayerType(
-                    playerTypeByConnector[connectorId],
-                    connectorId === 'netease'
-                        && !shouldWaitForConnectorPlayer(connectorId, result)
-                        ? {
-                            waitForConnection: false,
-                            disconnectedMessage: buildNeteaseConnectorSuccessMessage(
-                                'reinstall',
-                                result
-                            )
-                        }
-                        : undefined
-                );
+                // Switching players clears every pending request, so repairing an
+                // unused connector never switches on its own.
+                showAdminToast('✅ 连接器已重新安装，可在需要时切换播放器');
             } else {
                 showAdminToast(
                     selectedConnected
@@ -2446,44 +3141,60 @@ const AdminWidget: React.FC = () => {
         }
     };
 
-    const handleUpdateCheck = async () => {
-        setUpdateInfo({ checking: true, info: null });
-        try {
-            const res = await fetch(internalApiUrl('/api/update/check'));
-            const json = await res.json();
-            setUpdateInfo({ checking: false, info: json });
-
-            if (!json.hasUpdate && !json.error) {
-                showAdminToast("✅ 当前已经是最新版本，无需更新！");
-            } else if (json.error) {
-                showAdminToast(`❌ 检查失败: ${json.error}`);
-            }
-        } catch {
-            setUpdateInfo({ checking: false, info: { error: '检查失败，请重试' } });
-            showAdminToast("❌ 网络请求失败，请检查网络！");
-        }
-    };
-
-    const handleApplyUpdate = async () => {
+    /**
+     * Started from the update dialog. Early exits throw their reason so the
+     * dialog shows it next to the button.
+     */
+    const handleApplyUpdate = async (targetVersion?: string | null, targetSizeBytes?: number) => {
         if (connectorUpdateInFlightRef.current) {
-            showAdminToast('请等待连接器更新完成后再更新点歌机。');
-            return;
+            throw new Error('请等待连接器更新完成后再更新点歌机。');
         }
         if (updateApplyRequestInFlightRef.current) {
-            showAdminToast('更新任务已在进行，请等待唯一一次最终重启。');
+            throw new Error('更新任务已在进行，请等待唯一一次最终重启。');
+        }
+
+        // A download started before this window opened is followed instead of asked about again.
+        let current: AppUpdateDownloadStatus | null = null;
+        try {
+            const response = await fetch(
+                internalApiUrl('/api/update/status'),
+                { cache: 'no-store' }
+            );
+            const result = await response.json();
+            if (response.ok && result.success && result.status) {
+                current = result.status as AppUpdateDownloadStatus;
+            }
+        } catch {
+            current = null;
+        }
+        if (current && isCoreUpdateActive(current.state)) {
+            if (!updateApplyRequestInFlightRef.current) resumeCoreUpdate(current);
+            showAdminToast('已继续显示正在进行的点歌机更新。');
             return;
         }
-        if(!confirm("确定要开始更新吗？程序将会自动下载并重启。")) return;
-        updateApplyRequestInFlightRef.current = true;
-        if (updateStatusTimerRef.current) {
-            clearTimeout(updateStatusTimerRef.current);
-            updateStatusTimerRef.current = null;
+
+        const confirmed = await confirmCoreUpdate({
+            version: targetVersion || null,
+            sizeBytes: targetSizeBytes ?? (typeof current?.sizeBytes === 'number' ? current.sizeBytes : null),
+            pendingCount: await readPendingRequestCount()
+        });
+        if (!confirmed) return;
+        // The answer may have taken a while; another update could have started meanwhile.
+        if (connectorUpdateInFlightRef.current) {
+            throw new Error('请等待连接器更新完成后再更新点歌机。');
         }
+        if (updateApplyRequestInFlightRef.current) {
+            throw new Error('更新任务已在进行，请等待唯一一次最终重启。');
+        }
+
+        updateApplyRequestInFlightRef.current = true;
+        coreProgressMarkRef.current = null;
+        setCoreUpdateStalled(false);
         setDownloadProgress(0);
         setUpdateDownloadStatus({
             state: 'checking',
             progress: 0,
-            version: updateInfo.info?.version || null,
+            version: targetVersion || null,
             message: '正在确认更新版本',
             updatedAt: new Date().toISOString()
         });
@@ -2502,95 +3213,18 @@ const AdminWidget: React.FC = () => {
                     ? '已继续监视当前更新任务，不会重复启动安装器。'
                     : '正在后台下载更新，完成后只会进行一次最终重启。'
             );
-
-            let consecutiveFailures = 0;
-            const pollUpdateStatus = async (): Promise<void> => {
-                try {
-                    const statusResponse = await fetch(
-                        internalApiUrl('/api/update/status'),
-                        { cache: 'no-store' }
-                    );
-                    const statusResult = await statusResponse.json();
-                    if (!statusResponse.ok || !statusResult.success) {
-                        throw new Error(
-                            statusResult.message || '无法读取更新进度'
-                        );
-                    }
-                    consecutiveFailures = 0;
-                    const status = statusResult.status as AppUpdateDownloadStatus;
-                    setUpdateDownloadStatus(status);
-
-                    if (status.state === 'error') {
-                        updateApplyRequestInFlightRef.current = false;
-                        setDownloadProgress(null);
-                        setUpdateInfo({
-                            checking: false,
-                            info: { error: status.message || '更新失败' }
-                        });
-                        showAdminToast(`❌ ${status.message || '更新失败'}`);
-                        window.dispatchEvent(new Event('awoo-updates-changed'));
-                        return;
-                    }
-                    if (status.state === 'no-update') {
-                        updateApplyRequestInFlightRef.current = false;
-                        setDownloadProgress(null);
-                        setUpdateInfo({
-                            checking: false,
-                            info: { hasUpdate: false }
-                        });
-                        showAdminToast('✅ 当前已经是最新版本');
-                        window.dispatchEvent(new Event('awoo-updates-changed'));
-                        return;
-                    }
-
-                    const numericProgress = Number(status.progress);
-                    setDownloadProgress(
-                        Number.isFinite(numericProgress)
-                            ? Math.max(0, Math.min(100, numericProgress))
-                            : 0
-                    );
-                    updateStatusTimerRef.current = setTimeout(
-                        () => void pollUpdateStatus(),
-                        450
-                    );
-                } catch (error: unknown) {
-                    consecutiveFailures += 1;
-                    if (consecutiveFailures < 5) {
-                        updateStatusTimerRef.current = setTimeout(
-                            () => void pollUpdateStatus(),
-                            700
-                        );
-                        return;
-                    }
-                    const message = error instanceof Error
-                        ? error.message
-                        : '读取更新进度失败';
-                    updateApplyRequestInFlightRef.current = false;
-                    setDownloadProgress(null);
-                    setUpdateDownloadStatus({
-                        state: 'error', progress: null, version: null,
-                        message, updatedAt: new Date().toISOString()
-                    });
-                    setUpdateInfo({
-                        checking: false,
-                        info: { error: message }
-                    });
-                    showAdminToast(`❌ ${message}`);
-                    window.dispatchEvent(new Event('awoo-updates-changed'));
-                }
-            };
-            void pollUpdateStatus();
+            pollCoreUpdateStatus();
         } catch (error: unknown) {
             updateApplyRequestInFlightRef.current = false;
             setDownloadProgress(null);
             const message = error instanceof Error
                 ? error.message
                 : '更新请求失败，请检查网络连接';
+            // The dialog and the 版本升级 page show this failure in the progress panel.
             setUpdateDownloadStatus({
                 state: 'error', progress: null, version: null,
                 message, updatedAt: new Date().toISOString()
             });
-            setUpdateInfo({ checking: false, info: { error: message } });
             showAdminToast(`❌ ${message}`);
             window.dispatchEvent(new Event('awoo-updates-changed'));
         }
@@ -2821,28 +3455,21 @@ const AdminWidget: React.FC = () => {
     };
 
     const updatePermission = (permKey: string, field: string, value: any) => {
-        setConfig((prev: any) => ({
-            ...prev,
-            config: {
-                ...prev.config,
-                [permKey]: {
-                    ...(prev.config[permKey] || { AllowManager: true, MinGuardType: (permKey === 'ForceControlPermission' ? -1 : 0), MinMedalLevel: 0 }),
-                    [field]: value
-                }
+        updateSysConfig(current => ({
+            ...current,
+            [permKey]: {
+                ...(current[permKey] || { AllowManager: true, MinGuardType: (permKey === 'ForceControlPermission' ? -1 : 0), MinMedalLevel: 0 }),
+                [field]: value
             }
         }));
     };
 
-    const updateCooldown = (tier: string, value: string) => {
-        const val = parseInt(value) || 0;
-        setConfig((prev: any) => ({
-            ...prev,
-            config: {
-                ...prev.config,
-                Cooldowns: {
-                    ...(prev.config.Cooldowns || { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }),
-                    [tier]: val
-                }
+    const updateCooldown = (tier: string, value: number) => {
+        updateSysConfig(current => ({
+            ...current,
+            Cooldowns: {
+                ...(current.Cooldowns || { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }),
+                [tier]: value
             }
         }));
     };
@@ -2852,35 +3479,29 @@ const AdminWidget: React.FC = () => {
         field: 'giftName' | 'giftId',
         value: string
     ) => {
-        setConfig((prev: any) => ({
-            ...prev,
-            config: {
-                ...prev.config,
-                GiftRequestRequirements: {
-                    ...(prev.config.GiftRequestRequirements || {}),
-                    [tier]: {
-                        ...(prev.config.GiftRequestRequirements?.[tier] || {
-                            giftName: '',
-                            giftId: ''
-                        }),
-                        [field]: value
-                    }
+        updateSysConfig(current => ({
+            ...current,
+            GiftRequestRequirements: {
+                ...(current.GiftRequestRequirements || {}),
+                [tier]: {
+                    ...(current.GiftRequestRequirements?.[tier] || {
+                        giftName: '',
+                        giftId: ''
+                    }),
+                    [field]: value
                 }
             }
         }));
     };
 
     const assignLearnedGift = (tier: GiftRequestTier, gift: LearnedGift) => {
-        setConfig((prev: any) => ({
-            ...prev,
-            config: {
-                ...prev.config,
-                GiftRequestRequirements: {
-                    ...(prev.config.GiftRequestRequirements || {}),
-                    [tier]: {
-                        giftName: gift.giftName || '',
-                        giftId: gift.giftId || ''
-                    }
+        updateSysConfig(current => ({
+            ...current,
+            GiftRequestRequirements: {
+                ...(current.GiftRequestRequirements || {}),
+                [tier]: {
+                    giftName: gift.giftName || '',
+                    giftId: gift.giftId || ''
                 }
             }
         }));
@@ -2889,14 +3510,11 @@ const AdminWidget: React.FC = () => {
     };
 
     const clearGiftRequestRequirement = (tier: GiftRequestTier) => {
-        setConfig((prev: any) => ({
-            ...prev,
-            config: {
-                ...prev.config,
-                GiftRequestRequirements: {
-                    ...(prev.config.GiftRequestRequirements || {}),
-                    [tier]: { giftName: '', giftId: '' }
-                }
+        updateSysConfig(current => ({
+            ...current,
+            GiftRequestRequirements: {
+                ...(current.GiftRequestRequirements || {}),
+                [tier]: { giftName: '', giftId: '' }
             }
         }));
     };
@@ -2936,63 +3554,57 @@ const AdminWidget: React.FC = () => {
     };
 
     const addSuperUser = () => {
-        if(!superUserInput.trim()) return;
-        const currentSu = config.config.SuperUsers || [];
-        if(currentSu.includes(superUserInput.trim())) { setSuperUserInput(''); return; }
-        setConfig((prev: any) => ({...prev, config: {...prev.config, SuperUsers: [...currentSu, superUserInput.trim()]}}));
+        const name = superUserInput.trim();
+        if (!name) return;
+        updateSysConfig(current => {
+            const superUsers: string[] = current.SuperUsers || [];
+            return superUsers.includes(name) ? current : { ...current, SuperUsers: [...superUsers, name] };
+        });
         setSuperUserInput('');
     };
 
     const removeSuperUser = (name: string) => {
-        const currentSu: string[] = config.config.SuperUsers || [];
-        setConfig((prev: any) => ({...prev, config: {...prev.config, SuperUsers: currentSu.filter(n => n !== name)}}));
+        updateSysConfig(current => ({
+            ...current,
+            SuperUsers: (current.SuperUsers || []).filter((superUser: string) => superUser !== name)
+        }));
     };
 
-    const handleSetPlayerType = async (
-        type: string,
-        options?: {
-            waitForConnection?: boolean;
-            disconnectedMessage?: string;
-        }
-    ) => {
-        if (!config?.config || config.config.PlayerType === type) return;
-        const nextSysConfig = { ...config.config, PlayerType: type };
-        lastConfigString.current = JSON.stringify(nextSysConfig);
-        setConfig((prev: any) => ({
-            ...prev,
-            playerConnected: false,
-            cdpConnected: false,
-            playerConnecting: true,
-            playerSnapshot: null,
-            config: nextSysConfig
-        }));
-        showAdminToast("正在切换并自动连接播放器...");
+    /** The server clears the whole request queue on a player change, so ask first. */
+    const confirmPlayerSwitch = async (): Promise<boolean> => {
+        const pendingCount = await readPendingRequestCount();
+        if (pendingCount === 0) return true;
+        return window.confirm(pendingCount === null
+            ? '暂时无法读取待播队列。切换播放器会清空所有待播歌曲，是否继续？'
+            : `切换播放器会清空 ${pendingCount} 首待播歌曲，是否继续？`);
+    };
 
+    const handleSetPlayerType = async (type: string) => {
+        const previousType = sysConfigRef.current?.PlayerType;
+        if (!sysConfigRef.current || previousType === type || playerSwitchInFlightRef.current) return;
+        playerSwitchInFlightRef.current = true;
+        let saved: ConfigSaveOutcome | null = null;
         try {
-            const res = await fetch(internalApiUrl('/api/config'), {
-                method: 'POST',
-                headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ sysConfig: nextSysConfig })
-            });
-            const json = await res.json();
-            const connected = json.playerConnected === true
-                || (options?.waitForConnection === false
-                    ? false
-                    : await waitForPlayerConnection());
-            setConfig((prev: any) => prev ? ({
-                ...prev,
-                playerConnected: connected,
-                cdpConnected: connected,
-                playerConnecting: connected
-                    ? false
-                    : json.playerConnecting === true
-            }) : prev);
-            if (connected) showAdminToast("✅ 已切换并自动连接播放器！");
-            else showAdminToast(
-                options?.disconnectedMessage
-                    || "⚠️ 已切换播放器，后台正在等待连接。"
-            );
-        } catch {
+            if (await confirmPlayerSwitch()
+                && updateSysConfig(current => current.PlayerType === type ? current : { ...current, PlayerType: type }, { save: false })) {
+                setConfig((prev: any) => prev ? ({
+                    ...prev,
+                    playerConnected: false,
+                    cdpConnected: false,
+                    playerConnecting: true,
+                    playerSnapshot: null
+                }) : prev);
+                showAdminToast("正在切换并自动连接播放器...");
+                saved = await persistSysConfig();
+            }
+        } finally {
+            // Waiting for the connection below must not block choosing another player.
+            playerSwitchInFlightRef.current = false;
+        }
+        if (!saved) return;
+        if (!saved.ok) {
+            // Unconfirmed: show the player the server still uses instead of retrying a queue-clearing switch.
+            updateSysConfig(current => current.PlayerType === type ? { ...current, PlayerType: previousType } : current);
             setConfig((prev: any) => prev ? ({
                 ...prev,
                 playerConnected: false,
@@ -3000,39 +3612,35 @@ const AdminWidget: React.FC = () => {
                 playerConnecting: false
             }) : prev);
             showAdminToast("❌ 切换播放器失败，请查看运行日志。");
+            return;
         }
+        const json = saved.result || {};
+        const connected = json.playerConnected === true || await waitForPlayerConnection();
+        setConfig((prev: any) => prev ? ({
+            ...prev,
+            playerConnected: connected,
+            cdpConnected: connected,
+            playerConnecting: connected
+                ? false
+                : json.playerConnecting === true
+        }) : prev);
+        if (connected) showAdminToast("✅ 已切换并自动连接播放器！");
+        else showAdminToast("⚠️ 已切换播放器，后台正在等待连接。");
     };
 
-    const permTypes = [
-        { key: 'OrderPermission', label: '点歌权限' },
-        { key: 'SkipPermission', label: '切歌权限' },
-        { key: 'PriorityPermission', label: '置顶权限 (放到队列第一首)' },
-        { key: 'CancelPermission', label: '撤回权限 (撤回自己点的最近一首)' },
-        { key: 'ToggleAcceptPermission', label: '开关接单权限 (开启/关闭)' },
-        { key: 'ForceControlPermission', label: '强控队列权限 (立即/插队/撤回他人)' },
-    ];
-
-    const playerOptions: Array<{
-        type: string;
-        name: string;
-        method: string;
-        detail: string;
-        connectorId: NativeConnectorId;
-    }> = [
-        { type: 'NCM', name: '网易云音乐', method: '原生 IPC', detail: '不重启客户端，不需要调试端口', connectorId: 'netease' },
-        { type: 'Kugou', name: '酷狗音乐', method: '窗口消息 + IPC', detail: '原生控制与安全下一首守卫', connectorId: 'kugou' },
-        { type: 'QQMusic', name: 'QQ 音乐', method: '单实例命令 + 静音守卫', detail: '错误下一首静音、暂停后接管', connectorId: 'qqmusic' },
-        { type: 'Folia', name: 'Folia', method: '独立 Stage 连接器', detail: 'HTTP + WebSocket；支持 ID 校验与封面', connectorId: 'folia' }
-    ];
     const classicObsUrl = internalApiUrl('/');
     const internalApiInfo = config?.internalApi || {};
-    const internalApiRequestedPort = Number(
-        internalApiInfo.configuredPort || config?.config?.InternalApiPort || internalApiInfo.requestedPort || 5555
+    // The port fields show the committed local value; the server copy matches it once saved.
+    const internalApiRequestedPort = finiteNumberOr(
+        config?.config?.InternalApiPort,
+        Number(internalApiInfo.configuredPort || internalApiInfo.requestedPort || 5555)
     );
     const internalApiActualPort = Number(internalApiInfo.actualPort || 0);
     const externalApiPort = Number(
         config?.externalApi?.port || config?.config?.ExternalApiPort || 5556
     );
+    const configuredExternalApiPort = finiteNumberOr(config?.config?.ExternalApiPort, 5556);
+    const internalApiPortsInUse = [internalApiRequestedPort, internalApiActualPort].filter(port => port > 0);
     const modObsUrl = `http://127.0.0.1:${externalApiPort}/overlay/`;
     const currentStatusSong = config?.current as SongInfo | null | undefined;
     const roomConnection = config?.roomConnection || {
@@ -3042,34 +3650,8 @@ const AdminWidget: React.FC = () => {
         message: config?.roomConnectionMessage || '已断开连接',
         enabled: config?.roomConnectionEnabled === true
     };
-    const roomConnectionStatusMeta: Record<string, {
-        label: string;
-        className: string;
-        icon: string;
-    }> = {
-        connecting: {
-            label: '正在连接',
-            className: 'text-amber-300 border-amber-400/30 bg-amber-500/10',
-            icon: '⏳'
-        },
-        connected: {
-            label: '弹幕已连接',
-            className: 'text-green-300 border-green-500/30 bg-green-500/10',
-            icon: '●'
-        },
-        error: {
-            label: '连接失败',
-            className: 'text-red-300 border-red-500/30 bg-red-500/10',
-            icon: '⚠️'
-        },
-        disconnected: {
-            label: '已断开连接',
-            className: 'text-gray-300 border-white/15 bg-white/5',
-            icon: '○'
-        }
-    };
-    const roomStatusMeta = roomConnectionStatusMeta[roomConnection.status]
-        || roomConnectionStatusMeta.disconnected;
+    const roomStatusMeta = ROOM_CONNECTION_STATUS_META[roomConnection.status]
+        || ROOM_CONNECTION_STATUS_META.disconnected;
     const currentControlTheme: Theme = {
         ...defaultTheme,
         ...(config?.widgetStyle?.theme || {})
@@ -3084,44 +3666,21 @@ const AdminWidget: React.FC = () => {
             return groups;
         }, new Map<string, OverlaySettingDefinition[]>())
     );
-    const overlayPreviewStyle: React.CSSProperties = overlayPreviewBackground === 'dark'
-        ? { backgroundColor: '#111827' }
-        : overlayPreviewBackground === 'light'
-            ? { backgroundColor: '#eef3f8' }
-            : {
-                backgroundColor: '#20242d',
-                backgroundImage: 'linear-gradient(45deg, #2c3340 25%, transparent 25%), linear-gradient(-45deg, #2c3340 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #2c3340 75%), linear-gradient(-45deg, transparent 75%, #2c3340 75%)',
-                backgroundSize: '24px 24px',
-                backgroundPosition: '0 0, 0 12px, 12px -12px, -12px 0'
-            };
-    const onboardingSteps = [
-        {
-            icon: '📱',
-            kicker: '账号与权限',
-            title: '扫码登录 B站账号',
-            description: '游客模式也能普通点歌；扫码登录后，可以设置超级用户白名单和更细的观众权限。'
-        },
-        {
-            icon: '🏠',
-            kicker: '直播间连接',
-            title: '连接你的直播间',
-            description: '填写直播间网址末尾的数字房间号，让点歌机开始接收这间直播间的弹幕。'
-        },
-        {
-            icon: '📺',
-            kicker: '直播画面',
-            title: '添加 OBS 浏览器捕捉',
-            description: '复制固定的 Mod UI 地址到 OBS 或直播姬。以后切换 UI 模组时，不需要修改捕捉地址。'
-        },
-        {
-            icon: '🎵',
-            kicker: '播放器与观众',
-            title: '选择播放器并配置权限',
-            description: '选择你实际使用的音乐播放器，再按需要设置观众点歌、切歌、置顶和撤回等权限。'
-        }
-    ] as const;
-    const currentOnboardingStep = onboardingSteps[onboardingStep] || onboardingSteps[0];
+    const overlayPreviewStyle = OVERLAY_PREVIEW_BACKGROUNDS[overlayPreviewBackground];
     const feedbackUnreadCount = countUnreadFeedbackReplies(feedbackHistory);
+    // Only rebuilt when new diagnostics arrive, not on every render of the panel.
+    const feedbackDiagnosticsPreview = useMemo(
+        () => JSON.stringify(feedbackDiagnostics?.diagnostics || {}, null, 2),
+        [feedbackDiagnostics]
+    );
+    const coreUpdateView = updateDownloadStatus
+        ? { ...updateDownloadStatus, stalled: coreUpdateStalled }
+        : null;
+    const connectorProgress: Partial<Record<NativeConnectorId, ConnectorUpdateProgress>> = {};
+    for (const status of Object.values(connectorStatuses)) {
+        if (status?.updating && status.progress) connectorProgress[status.id] = status.progress;
+    }
+    const updateBadgeLabel = `${updateBadgeCount} 项更新待处理`;
     const playerControlNotice = (config?.playerControlNotice || null) as PlayerControlNotice | null;
     const playerUpgradeTargetVersion = playerControlNotice?.kind === 'upgrade'
         ? connectorStatuses[playerControlNotice.playerKey]?.supportedPlayerVersion
@@ -3154,19 +3713,8 @@ const AdminWidget: React.FC = () => {
             .map(gift => gift.giftId ? `id:${gift.giftId}` : `name:${gift.giftName}`)
     );
 
-    const pages: Record<string, string> = {
-        status: '运行状态',
-        appearance: '外观设置',
-        settings: '基础设置',
-        login: '扫码登录',
-        update: '版本升级',
-        faq: '常见问题',
-        feedback: '问题反馈',
-        logs: '运行日志',
-        debug: '调试测试',
-    };
-    const currentPage = pages[activeTab] || pages.status;
-    const selectedPlayerName = playerOptions.find(player => player.type === config?.config?.PlayerType)?.name || '音乐播放器';
+    const currentPage = PAGE_TITLES[activeTab] || PAGE_TITLES.status;
+    const selectedPlayerName = PLAYER_OPTIONS.find(player => player.type === config?.config?.PlayerType)?.name || '音乐播放器';
 
     return (
         <div data-color-mode={colorMode} className="admin-widget-root animate-fade-in flex flex-col font-sans select-none w-full h-screen overflow-hidden">
@@ -3174,79 +3722,29 @@ const AdminWidget: React.FC = () => {
             <UpdateAnnouncements
                 suspended={onboardingOpen}
                 openRequest={announcementOpenRequest}
-                busy={connectorUpdating !== null || downloadProgress !== null}
-                coreProgress={updateDownloadStatus}
-                onCoreUpdate={handleApplyUpdate}
+                // A core download continues in the background, so only these keep the dialog open.
+                busy={connectorUpdating !== null || updateDownloadStatus?.state === 'applying'}
+                coreProgress={coreUpdateView}
+                connectorProgress={connectorProgress}
+                coreConfirmation={coreUpdateConfirmation}
+                onCoreConfirmation={settleCoreUpdateConfirmation}
+                onSnapshot={setUpdateBadgeCount}
+                onCheckingChange={setUpdateChecking}
+                onCoreUpdate={item => handleApplyUpdate(item.version, item.sizeBytes)}
                 onConnectorUpdate={async item => {
                     if (item.id !== 'core') await handleConnectorUpdate(item.id, item);
                 }}
             />
 
-            {adminToast && (
-                <div className="fixed top-8 left-1/2 transform -translate-x-1/2 z-[99999] bg-blue-600 text-white px-6 py-3 rounded-full shadow-2xl font-bold animate-slide-in flex items-center gap-2">
-                    {adminToast}
-                </div>
-            )}
+            <AdminToast toast={adminToast} />
 
             {onboardingOpen && (
-                <div className="fixed inset-0 z-[99990] grid place-items-center bg-black/70 p-5 backdrop-blur-sm">
-                    <div className="w-full max-w-xl overflow-hidden rounded-3xl border border-cyan-400/25 bg-[#151922] shadow-[0_24px_100px_rgba(0,0,0,0.65)]" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-                        <div className="border-b border-white/10 bg-gradient-to-r from-cyan-500/10 to-violet-500/10 px-6 py-5">
-                            <div className="flex items-start justify-between gap-4">
-                                <div>
-                                    <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-cyan-300">首次使用向导</div>
-                                    <h2 className="mt-1 text-xl font-bold text-white">用 4 步完成点歌机配置</h2>
-                                    <p className="mt-1 text-xs text-gray-400">点击“前往设置”会打开对应页面，并自动滚动到需要操作的位置。</p>
-                                </div>
-                                <button onClick={finishOnboarding} title="关闭并不再自动显示" className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-lg text-gray-500 hover:bg-white/10 hover:text-white">×</button>
-                            </div>
-
-                            <div className="mt-5 grid grid-cols-4 gap-2">
-                                {onboardingSteps.map((step, index) => (
-                                    <button key={step.title} onClick={() => setOnboardingStep(index)} className={`h-1.5 rounded-full transition-colors ${index === onboardingStep ? 'bg-cyan-400' : index < onboardingStep ? 'bg-cyan-700' : 'bg-white/10'}`} aria-label={`查看第 ${index + 1} 步`} />
-                                ))}
-                            </div>
-                        </div>
-
-                        <div className="px-6 py-6">
-                            <div className="flex items-start gap-4">
-                                <div className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl border border-white/10 bg-white/5 text-3xl">{currentOnboardingStep.icon}</div>
-                                <div className="min-w-0">
-                                    <div className="text-[11px] font-bold text-cyan-300">第 {onboardingStep + 1} 步 · {currentOnboardingStep.kicker}</div>
-                                    <h3 className="mt-1 text-xl font-bold text-white">{currentOnboardingStep.title}</h3>
-                                    <p className="mt-2 text-sm leading-relaxed text-gray-400">{currentOnboardingStep.description}</p>
-                                </div>
-                            </div>
-
-                            <div className="mt-6">
-                                {onboardingStep === 0 && (
-                                    <button onClick={() => openOnboardingDestination('login', null, true)} className="w-full rounded-xl bg-gradient-to-r from-pink-600 to-violet-600 px-5 py-3 text-sm font-bold text-white shadow-lg hover:brightness-110">前往扫码登录 →</button>
-                                )}
-                                {onboardingStep === 1 && (
-                                    <button onClick={() => openOnboardingDestination('status', 'room', true)} className="w-full rounded-xl bg-gradient-to-r from-blue-600 to-cyan-600 px-5 py-3 text-sm font-bold text-white shadow-lg hover:brightness-110">前往连接直播间 →</button>
-                                )}
-                                {onboardingStep === 2 && (
-                                    <button onClick={() => openOnboardingDestination('appearance', 'mod-ui', true)} className="w-full rounded-xl bg-gradient-to-r from-cyan-600 to-violet-600 px-5 py-3 text-sm font-bold text-white shadow-lg hover:brightness-110">前往设置 Mod UI 捕捉 →</button>
-                                )}
-                                {onboardingStep === 3 && (
-                                    <div className="grid gap-3 sm:grid-cols-2">
-                                        <button onClick={() => openOnboardingDestination('settings', 'player', false)} className="rounded-xl border border-purple-400/30 bg-purple-500/15 px-4 py-3 text-sm font-bold text-purple-100 hover:bg-purple-500/25">选择连接的播放器 →</button>
-                                        <button onClick={() => openOnboardingDestination('settings', 'permission', false)} className="rounded-xl border border-green-400/30 bg-green-500/15 px-4 py-3 text-sm font-bold text-green-100 hover:bg-green-500/25">配置观众权限 →</button>
-                                    </div>
-                                )}
-                            </div>
-
-                            <div className="mt-5 flex items-center justify-between border-t border-white/10 pt-4">
-                                <button disabled={onboardingStep === 0} onClick={() => setOnboardingStep(previous => Math.max(0, previous - 1))} className="text-xs font-bold text-gray-500 hover:text-gray-300 disabled:invisible">← 上一步</button>
-                                {onboardingStep === 3 ? (
-                                    <button onClick={finishOnboarding} className="rounded-lg bg-white/10 px-4 py-2 text-xs font-bold text-white hover:bg-white/15">完成引导</button>
-                                ) : (
-                                    <button onClick={finishOnboarding} className="text-xs text-gray-500 hover:text-gray-300">跳过，以后不再自动显示</button>
-                                )}
-                            </div>
-                        </div>
-                    </div>
-                </div>
+                <OnboardingDialog
+                    step={onboardingStep}
+                    onStepChange={setOnboardingStep}
+                    onOpenDestination={openOnboardingDestination}
+                    onFinish={finishOnboarding}
+                />
             )}
 
             {onboardingActive && !onboardingOpen && (
@@ -3264,15 +3762,13 @@ const AdminWidget: React.FC = () => {
             <div className="studio-body flex-1 flex overflow-hidden relative">
                 <nav aria-label="主导航" className="studio-sidebar custom-scrollbar">
                     <div className="studio-brand"><span className="studio-brand-mark"><AwooMark /></span><strong>嗷呜点歌机</strong></div>
-                    {[
-                        { id: 'status', label: '运行状态' },
-                        { id: 'appearance', label: '外观设置' },
-                        { id: 'settings', label: '基础设置' },
-                        { id: 'login', label: '扫码登录' },
-                        { id: 'update', label: '版本升级' }
-                    ].map(t => (
-                        <button key={t.id} title={t.label} aria-current={activeTab === t.id ? 'page' : undefined} onClick={() => { setActiveTab(t.id); setSupportMenuOpen(false); }} className={`studio-nav-item ${activeTab === t.id ? 'is-active' : ''}`}>
-                            <UiIcon name={t.id as UiIconName} /> <span>{t.label}</span><span className="studio-nav-indicator" />
+                    {PRIMARY_NAV_ITEMS.map(t => (
+                        <button key={t.id} title={t.id === 'update' && updateBadgeCount > 0 ? `${t.label}（${updateBadgeLabel}）` : t.label} aria-current={activeTab === t.id ? 'page' : undefined} onClick={() => { setActiveTab(t.id); setSupportMenuOpen(false); }} className={`studio-nav-item ${activeTab === t.id ? 'is-active' : ''}`}>
+                            <UiIcon name={t.id} /> <span>{t.label}</span>
+                            {t.id === 'update' && updateBadgeCount > 0 && (
+                                <span className="studio-count-badge studio-nav-badge"><span aria-hidden="true">{updateBadgeCount}</span><span className="sr-only">{updateBadgeLabel}</span></span>
+                            )}
+                            <span className="studio-nav-indicator" />
                         </button>
                     ))}
                     <details
@@ -3280,7 +3776,7 @@ const AdminWidget: React.FC = () => {
                         onToggle={event => setSupportMenuOpen(event.currentTarget.open)}
                         className="studio-support group"
                     >
-                        <summary className={`flex cursor-pointer list-none items-center gap-2 rounded-lg px-2.5 py-2 text-xs transition-colors [&::-webkit-details-marker]:hidden ${['faq', 'feedback', 'logs', 'debug'].includes(activeTab) ? 'text-cyan-200' : 'text-gray-500 hover:bg-white/5 hover:text-gray-300'}`}>
+                        <summary className={`flex cursor-pointer list-none items-center gap-2 rounded-lg px-2.5 py-2 text-xs transition-colors [&::-webkit-details-marker]:hidden ${SUPPORT_TABS.includes(activeTab) ? 'text-cyan-200' : 'text-gray-500 hover:bg-white/5 hover:text-gray-300'}`}>
                             <UiIcon name="faq" />
                             <span className="font-bold">帮助与调试</span>
                             {feedbackUnreadCount > 0 && (
@@ -3289,14 +3785,9 @@ const AdminWidget: React.FC = () => {
                             <span className={`${feedbackUnreadCount > 0 ? '' : 'ml-auto'} text-[10px] transition-transform group-open:rotate-90`}>›</span>
                         </summary>
                         <div className="space-y-0.5 px-1.5 pb-1.5">
-                            {[
-                                { id: 'faq', icon: '❓', label: '常见问题' },
-                                { id: 'feedback', icon: '💬', label: '问题反馈' },
-                                { id: 'logs', icon: '📝', label: '运行日志' },
-                                { id: 'debug', icon: '🐞', label: '调试测试' }
-                            ].map(t => (
+                            {SUPPORT_NAV_ITEMS.map(t => (
                                 <button key={t.id} title={t.label} aria-current={activeTab === t.id ? 'page' : undefined} onClick={() => setActiveTab(t.id)} className={`studio-nav-item studio-nav-subitem ${activeTab === t.id ? 'is-active' : ''}`}>
-                                    <UiIcon name={t.id as UiIconName} /> <span className="truncate">{t.label}</span>
+                                    <UiIcon name={t.icon} /> <span className="truncate">{t.label}</span>
                                     {t.id === 'feedback' && feedbackUnreadCount > 0 && (
                                         <span className="ml-auto h-2 w-2 shrink-0 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]" title={`${feedbackUnreadCount} 条新回复`}></span>
                                     )}
@@ -3384,8 +3875,8 @@ const AdminWidget: React.FC = () => {
                                     <div>
                                         <div className={`studio-now-playing ${playerControlNotice ? 'has-notice' : ''}`}>
                                             <div className="studio-album">
-                                                {currentStatusSong?.CoverUrl ? (
-                                                    <SongArtworkImage song={currentStatusSong} source="cover" />
+                                                {currentStatusSong?.CoverUrl || currentStatusSong?.DynamicCoverUrl ? (
+                                                    <CurrentSongArtwork song={currentStatusSong} source="cover" />
                                                 ) : <div className="studio-record"><span /><UiIcon name="music" /></div>}
                                             </div>
                                             <div className="studio-track-info min-w-0 flex-1">
@@ -3399,7 +3890,7 @@ const AdminWidget: React.FC = () => {
                                             <span className={`studio-player-badge text-xs px-2.5 py-1 rounded-full border ${playerAccessBlocked ? 'text-red-300 border-red-400/30 bg-red-500/10' : playerControlNotice ? 'text-orange-300 border-orange-400/30 bg-orange-500/10' : config.playerConnected ? 'text-green-300 border-green-500/25 bg-green-500/10' : 'text-gray-400 border-white/10 bg-white/5'}`}>
                                                 {playerAccessBlocked ? '已连接 · 权限被阻止' : playerControlNotice ? '已连接 · 版本不兼容' : config.playerConnected ? '播放器已连接' : '播放器未连接'}
                                             </span>
-                                            <div className="studio-waveform" aria-hidden="true">{[12, 21, 14, 32, 24, 42, 29, 18, 36, 22, 46, 27, 16, 33, 23, 14].map((height, index) => <i key={index} style={{ height }} />)}</div>
+                                            <div className="studio-waveform" aria-hidden="true">{STATUS_WAVEFORM_HEIGHTS.map((height, index) => <i key={index} style={{ height }} />)}</div>
                                         </div>
 
                                         <div className="studio-control-grid grid grid-cols-2 gap-4 mb-5">
@@ -3444,11 +3935,11 @@ const AdminWidget: React.FC = () => {
                                                     type="text"
                                                     value={roomIdInput}
                                                     onChange={e => setRoomIdInput(e.target.value)}
-                                                    className="flex-1 min-w-[220px] bg-black/30 border border-white/10 rounded-lg p-3 text-md text-white focus:border-blue-500 outline-none"
+                                                    className="flex-1 min-w-[220px] bg-black/30 border border-white/10 rounded-lg p-3 text-sm text-white focus:border-blue-500 outline-none"
                                                     placeholder="输入直播间数字房间号（不是 UID）"
                                                 />
-                                                <button onClick={handleConnectRoom} className="studio-primary px-5 py-3 bg-blue-600 hover:bg-blue-500 text-white text-md rounded-lg font-bold shadow-lg transition-colors">连接 / 切换房间 <UiIcon name="arrow" /></button>
-                                                <button onClick={handleDisconnectRoom} className="px-5 py-3 bg-white/10 hover:bg-red-500/20 text-gray-300 hover:text-red-200 border border-white/10 hover:border-red-400/30 text-md rounded-lg font-bold transition-colors">断开连接</button>
+                                                <button onClick={handleConnectRoom} className="studio-primary px-5 py-3 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg font-bold shadow-lg transition-colors">连接 / 切换房间 <UiIcon name="arrow" /></button>
+                                                <button onClick={handleDisconnectRoom} className="px-5 py-3 bg-white/10 hover:bg-red-500/20 text-gray-300 hover:text-red-200 border border-white/10 hover:border-red-400/30 text-sm rounded-lg font-bold transition-colors">断开连接</button>
                                             </div>
                                             <details className="studio-room-details" open={roomConnection.status === 'error'}>
                                                 <summary>连接详情<span>房间 {roomConnection.requestedRoomId || '未设置'}</span></summary>
@@ -3463,6 +3954,7 @@ const AdminWidget: React.FC = () => {
                                         </div>
 
                                         <div className="studio-shortcuts">
+                                            <button onClick={() => setActiveTab('diagnostics')}><UiIcon name="shield" /><span><strong>诊断与修复</strong><small>测试弹幕、点歌与连接器更新</small></span><UiIcon name="arrow" /></button>
                                             <button onClick={() => setActiveTab('appearance')}><UiIcon name="monitor" /><span><strong>悬浮窗与 OBS 设置</strong><small>窗口样式与浏览器捕捉</small></span><UiIcon name="arrow" /></button>
                                             <button onClick={() => setActiveTab('settings')}><UiIcon name="settings" /><span><strong>调整点歌规则</strong><small>播放器、冷却与观众权限</small></span><UiIcon name="arrow" /></button>
                                         </div>
@@ -3472,6 +3964,7 @@ const AdminWidget: React.FC = () => {
 
                             {activeTab === 'appearance' && (
                                 <div className="space-y-5 animate-slide-in-right pb-6">
+                                    <TabPoller poll={loadOverlayMods} intervalMs={5000} />
                                     <div className="flex flex-wrap items-center justify-between gap-3">
                                         <div>
                                             <p className="text-sm text-gray-500">直播画面与主播控制窗口，可分别定制。</p>
@@ -3497,12 +3990,12 @@ const AdminWidget: React.FC = () => {
                                                 <a href="https://github.com/Enkianssus/AwooMusicBot-Overlay-Default" target="_blank" rel="noreferrer" className="shrink-0 rounded-lg border border-cyan-400/25 bg-cyan-500/10 px-3 py-2 text-[11px] font-bold text-cyan-300 hover:bg-cyan-500/20">查看 UI 模组开发示例 ↗</a>
                                             </div>
 
-                                            <div className="mt-4 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(200px,0.42fr)]">
+                                            <div className="studio-mod-address-grid mt-4 grid gap-3">
                                                 <div className="rounded-xl border border-cyan-400/20 bg-black/20 p-3">
                                                     <div className="mb-1 text-[10px] font-bold text-cyan-300/80">Mod UI 浏览器捕捉地址</div>
                                                     <div className="flex items-center gap-2">
                                                         <div className="min-w-0 flex-1 truncate font-mono text-sm text-cyan-200 select-all">{modObsUrl}</div>
-                                                        <button onClick={() => { void navigator.clipboard.writeText(modObsUrl); showAdminToast('✅ 已复制 Mod UI 浏览器捕捉地址'); }} className="shrink-0 rounded-lg border border-cyan-400/25 bg-cyan-500/15 px-3 py-2 text-xs font-bold text-cyan-200 hover:bg-cyan-500/25">复制地址</button>
+                                                        <button onClick={() => void copyAddress(modObsUrl, '✅ 已复制 Mod UI 浏览器捕捉地址')} className="shrink-0 rounded-lg border border-cyan-400/25 bg-cyan-500/15 px-3 py-2 text-xs font-bold text-cyan-200 hover:bg-cyan-500/25">复制地址</button>
                                                     </div>
                                                 </div>
                                                 <div className="rounded-xl border border-white/10 bg-black/15 p-3">
@@ -3520,7 +4013,7 @@ const AdminWidget: React.FC = () => {
                                                 </div>
                                             )}
 
-                                            <div className="mt-5 grid gap-4 md:grid-cols-[minmax(0,1fr)_280px]">
+                                            <div className="studio-mod-preview-grid mt-5 grid gap-4">
                                                 <div className="overflow-hidden rounded-2xl border border-white/10 bg-black/20">
                                                     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 px-3 py-2.5">
                                                         <div>
@@ -3538,19 +4031,25 @@ const AdminWidget: React.FC = () => {
                                                     </div>
                                                     <div className="relative h-[420px] overflow-hidden transition-colors" style={overlayPreviewStyle}>
                                                         {config.externalApi?.httpEnabled ? (
-                                                            <iframe
-                                                                key={`${overlayMods?.activeId || 'loading'}-${overlayPreviewNonce}`}
-                                                                title="Mod UI 实时预览"
-                                                                src={`${modObsUrl}?preview=${overlayPreviewNonce}`}
-                                                                className="h-full w-full border-0 pointer-events-none"
-                                                            />
+                                                            // Mount once the active Mod UI is known so the preview keeps one key and loads once.
+                                                            overlayMods ? (
+                                                                <iframe
+                                                                    key={`${overlayMods.activeId}-${overlayPreviewNonce}`}
+                                                                    title="Mod UI 实时预览"
+                                                                    src={`${modObsUrl}?preview=${overlayPreviewNonce}`}
+                                                                    className="h-full w-full border-0 pointer-events-none"
+                                                                />
+                                                            ) : (
+                                                                <div className="grid h-full place-items-center p-6 text-center text-xs text-gray-500">正在读取 Mod UI…</div>
+                                                            )
                                                         ) : (
                                                             <div className="grid h-full place-items-center p-6 text-center text-xs text-amber-300">开启只读 HTTP 后即可在这里预览 Mod UI</div>
                                                         )}
                                                     </div>
                                                 </div>
 
-                                                <div className="flex h-[474px] min-h-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-black/20">
+                                                {/* Beside the preview the grid row stretches it to the preview's height; stacked below it, it fits its settings. */}
+                                                <div className="flex max-h-[474px] min-h-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-black/20">
                                                     <div className="flex items-start justify-between gap-2 border-b border-white/10 px-3 py-2.5">
                                                         <div className="min-w-0">
                                                             <div className="truncate text-xs font-bold text-white">{overlayMods?.active?.name || '当前 Mod UI'} 参数</div>
@@ -3657,7 +4156,20 @@ const AdminWidget: React.FC = () => {
                                                             <button disabled={overlayBusy} onClick={() => void activateOverlay(overlay.id)} className="text-xs font-bold text-cyan-300 px-3 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 disabled:opacity-50">切换</button>
                                                         )}
                                                         {!overlay.builtin && (
-                                                            <button disabled={overlayBusy} onClick={() => void removeOverlay(overlay.id)} title="删除这个 Mod UI" className="text-xs text-red-300/70 hover:text-red-300 px-2 py-1.5 disabled:opacity-50">删除</button>
+                                                            <button
+                                                                disabled={overlayBusy}
+                                                                onClick={() => {
+                                                                    // Sits next to 切换, so a slip of the mouse must not delete at once.
+                                                                    const confirmed = window.confirm(overlay.active
+                                                                        ? `删除 Mod UI「${overlay.name}」？OBS 地址不变，会改用内置 UI。`
+                                                                        : `删除 Mod UI「${overlay.name}」？OBS 地址和当前使用的 UI 都不变。`);
+                                                                    if (confirmed) void removeOverlay(overlay.id);
+                                                                }}
+                                                                title="删除这个 Mod UI"
+                                                                className="text-xs text-red-300/70 hover:text-red-300 px-2 py-1.5 disabled:opacity-50"
+                                                            >
+                                                                删除
+                                                            </button>
                                                         )}
                                                     </div>
                                                 ))}
@@ -3730,12 +4242,32 @@ const AdminWidget: React.FC = () => {
                                                         <select
                                                             aria-label="主播控制 UI 点歌歌曲图片"
                                                             value={config.config.RequestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar'}
-                                                            onChange={event => setConfig({ ...config, config: { ...config.config, RequestedSongArtwork: event.target.value } })}
+                                                            onChange={event => updateSysConfig(current => ({ ...current, RequestedSongArtwork: event.target.value }))}
                                                             className="w-full cursor-pointer rounded-lg border border-blue-400/20 bg-black/30 p-2.5 text-sm text-white outline-none focus:border-blue-400"
                                                         >
                                                             <option value="bili_avatar">点歌人的 B 站头像（默认）</option>
                                                             <option value="song_cover">歌曲专辑封面</option>
                                                         </select>
+                                                    </div>
+                                                    <div className="flex items-center justify-between gap-4 border-t border-white/10 pt-3">
+                                                        <div>
+                                                            <div className="text-sm text-gray-200">动态封面</div>
+                                                            <div id="dynamic-cover-help" className="mt-1 text-[10px] leading-relaxed text-gray-500">
+                                                                为当前歌曲匹配 Apple Music 动态封面；未匹配或加载失败时显示静态封面。仅影响歌曲封面，点歌人头像保持原样。
+                                                                <span className="mt-0.5 block">开启后会将当前歌名与歌手发送到 Apple Music 查询动态封面。</span>
+                                                            </div>
+                                                        </div>
+                                                        <button
+                                                            type="button"
+                                                            role="switch"
+                                                            aria-label="动态封面"
+                                                            aria-describedby="dynamic-cover-help"
+                                                            aria-checked={config.config.DynamicCoverEnabled !== false}
+                                                            onClick={() => updateSysConfig(current => ({ ...current, DynamicCoverEnabled: current.DynamicCoverEnabled === false }))}
+                                                            className={`w-10 h-6 rounded-full p-1 transition-colors shrink-0 ${config.config.DynamicCoverEnabled !== false ? 'bg-blue-600' : 'bg-gray-600'}`}
+                                                        >
+                                                            <span className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${config.config.DynamicCoverEnabled !== false ? 'translate-x-4' : ''}`} />
+                                                        </button>
                                                     </div>
                                                 </div>
                                             </div>
@@ -3743,10 +4275,7 @@ const AdminWidget: React.FC = () => {
                                             <div className="flex justify-end">
                                                 <button onClick={() => {
                                                     updateControlTheme(defaultTheme);
-                                                    setConfig((previous: any) => previous ? ({
-                                                        ...previous,
-                                                        config: { ...previous.config, RequestedSongArtwork: 'bili_avatar' }
-                                                    }) : previous);
+                                                    updateSysConfig(current => ({ ...current, RequestedSongArtwork: 'bili_avatar', DynamicCoverEnabled: true }));
                                                     showAdminToast('✅ 已恢复主播控制 UI 默认外观');
                                                 }} className="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-xs font-bold text-gray-300 hover:bg-white/10">恢复默认外观</button>
                                             </div>
@@ -3763,7 +4292,7 @@ const AdminWidget: React.FC = () => {
                                                     <p className="mb-3 text-xs leading-relaxed text-gray-500">仅保留给已经配置好旧版 OBS 场景的用户。新建直播画面时，请优先使用上方的 Mod UI 浏览器捕捉。</p>
                                                     <div className="flex items-center gap-2 rounded-lg border border-white/5 bg-black/15 p-2">
                                                         <div className="min-w-0 flex-1 truncate font-mono text-sm text-gray-400 select-all">{classicObsUrl}</div>
-                                                        <button onClick={() => { void navigator.clipboard.writeText(classicObsUrl); showAdminToast('✅ 已复制经典页面地址'); }} className="shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-bold text-gray-300 hover:bg-white/10">复制旧地址</button>
+                                                        <button onClick={() => void copyAddress(classicObsUrl, '✅ 已复制经典页面地址')} className="shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-bold text-gray-300 hover:bg-white/10">复制旧地址</button>
                                                     </div>
                                                 </div>
                                             </details>
@@ -3772,77 +4301,7 @@ const AdminWidget: React.FC = () => {
                                 </div>
                             )}
 
-                            {activeTab === 'logs' && (
-                                <div className="space-y-4 animate-slide-in-right flex flex-col h-[70vh]">
-                                    <div className="flex justify-between items-center pr-2">
-                                        {/* ⭐ 新增: 精致的滚动模式控制开关，让用户在阅读日志时可手动锁定 */}
-                                        <div className="flex items-center gap-3 bg-black/40 px-3 py-1.5 rounded-lg border border-white/5">
-                                            <label className="text-xs text-gray-400 flex items-center gap-1.5 cursor-pointer select-none">
-                                                <input
-                                                    type="checkbox"
-                                                    checked={autoScroll}
-                                                    onChange={e => {
-                                                        setAutoScroll(e.target.checked);
-                                                        if (e.target.checked && logContainerRef.current) {
-                                                            logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-                                                        }
-                                                    }}
-                                                    className="w-3.5 h-3.5 rounded border-white/20 bg-black/50 text-blue-500 focus:ring-0 cursor-pointer"
-                                                />
-                                                <span>自动滚动</span>
-                                            </label>
-                                            <div className="w-[1px] h-3 bg-white/10"></div>
-                                            <button
-                                                onClick={() => {
-                                                    setAutoScroll(true);
-                                                    if (logContainerRef.current) {
-                                                        logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-                                                    }
-                                                }}
-                                                className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors"
-                                            >
-                                                ⬇️ 滚到底部
-                                            </button>
-                                        </div>
-                                    </div>
-
-                                    {/* ⭐ 改动: 日志容器加入 ref 监听和 scroll 回调事件，检测用户向上翻页操作并智能关闭 autoScroll */}
-                                    <div className="flex-1 relative min-h-0">
-                                        <div
-                                            ref={logContainerRef}
-                                            onScroll={handleLogScroll}
-                                            className="w-full h-full bg-[#090b0f] rounded-xl border border-white/10 p-4 font-mono text-[13px] overflow-y-auto custom-scrollbar flex flex-col gap-2 shadow-inner"
-                                        >
-                                            {sysLogs.length === 0 ? (
-                                                <div className="text-gray-500 text-center mt-10">暂无日志...</div>
-                                            ) : (
-                                                sysLogs.map((log, i) => (
-                                                    <div key={i} className="flex gap-4 leading-relaxed">
-                                                        <span className="text-gray-600 shrink-0">[{log.Time}]</span>
-                                                        <span style={{color: mapConsoleColor(log.Color, colorMode)}} className="break-all whitespace-pre-wrap">{log.Message}</span>
-                                                    </div>
-                                                ))
-                                            )}
-                                            <div ref={logsEndRef} className="h-[2px]" />
-                                        </div>
-
-                                        {/* ⭐ 新增: 当 autoScroll 在用户查阅日志时被锁定，显示极为好看和友好的动态按钮，一键恢复置底滚动 */}
-                                        {!autoScroll && (
-                                            <button
-                                                onClick={() => {
-                                                    setAutoScroll(true);
-                                                    if (logContainerRef.current) {
-                                                        logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-                                                    }
-                                                }}
-                                                className="absolute bottom-4 right-4 bg-blue-600 hover:bg-blue-500 text-white px-3 py-2 rounded-full shadow-lg text-xs font-bold transition-all flex items-center gap-1.5 animate-bounce select-none border border-blue-400/30"
-                                            >
-                                                <span>⬇️</span> 自动滚动已暂停 (点击恢复)
-                                            </button>
-                                        )}
-                                    </div>
-                                </div>
-                            )}
+                            {activeTab === 'logs' && <LogsPanel colorMode={colorMode} />}
 
                             {/* ⭐ 新增: 常见问题异常排查 FAQ 界面 */}
                             {activeTab === 'faq' && (
@@ -3864,7 +4323,7 @@ const AdminWidget: React.FC = () => {
 
                                     {/* FAQ CARD 1: 播放器无法控制 */}
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-4 shadow-inner">
-                                        <h3 className="text-md font-bold text-red-400 flex items-center gap-2 pb-2 border-b border-white/5">
+                                        <h3 className="studio-faq-question text-sm font-bold flex items-center gap-2 pb-2 border-b border-white/5">
                                             <span>🎵</span> 问题 1：当前播放器显示“未连接”或无法控制？
                                         </h3>
 
@@ -3896,7 +4355,7 @@ const AdminWidget: React.FC = () => {
 
                                     {/* FAQ CARD 2: B站弹幕无法监控 */}
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-4 shadow-inner">
-                                        <h3 className="text-md font-bold text-yellow-400 flex items-center gap-2 pb-2 border-b border-white/5">
+                                        <h3 className="studio-faq-question text-sm font-bold flex items-center gap-2 pb-2 border-b border-white/5">
                                             <span>💬</span> 问题 2：在直播间里发送弹幕点歌，点歌机完全没有反应？
                                         </h3>
 
@@ -3921,9 +4380,7 @@ const AdminWidget: React.FC = () => {
                                                 <strong className="text-white block mb-1.5">第二步：依次进行网络、凭证和房间号校准排查</strong>
                                                 <ul className="list-decimal pl-5 space-y-2.5 text-xs text-gray-400">
                                                     <li>
-                                                        <strong className="text-white">美国/海外 IP 在 v1.1.1 中应该可以使用</strong>
-                                                        新版已经加入海外网络兼容处理，不再把境外 IP 视为必然不可用。若当前线路仍触发 B站风控并反复断线，请先重新连接一次；仍不行时，再尝试规则/PAC 分流并让 B站直播域名直连，或临时关闭代理、切换国内节点。<br/>
-                                                        <strong className="text-green-400">建议：</strong> 先保持当前美国 IP 直接测试，只有实际失败时才使用上述替代方法。
+                                                        <strong className="text-white">使用海外网络时：</strong>先直接测试；若反复断线，再尝试让 B站直播域名直连或切换国内节点。
                                                     </li>
                                                     <li>
                                                         <strong className="text-white">重新建立游客或账号连接</strong>
@@ -3940,6 +4397,8 @@ const AdminWidget: React.FC = () => {
                                     </div>
                                 </div>
                             )}
+
+                            {activeTab === 'diagnostics' && <DiagnosticsPanel onNavigate={setActiveTab} />}
 
                             {activeTab === 'debug' && (
                                 <div className="space-y-6 animate-slide-in-right flex flex-col h-full">
@@ -3974,13 +4433,13 @@ const AdminWidget: React.FC = () => {
                                     {/* 登录账号信息卡 */}
                                     {config.biliLogin && config.currentUser?.uid ? (
                                         <div className="bg-white/5 p-5 rounded-xl border border-white/10 mb-6 shadow-inner flex items-center gap-5">
-                                            <img
-                                                src={config.currentUser.face ? `${config.currentUser.face}@160w_160h.webp` : `https://api.dicebear.com/7.x/identicon/svg?seed=${config.currentUser.uid}`}
-                                                referrerPolicy="no-referrer"
-                                                alt="avatar"
-                                                onError={(e) => { (e.target as HTMLImageElement).src = `https://api.dicebear.com/7.x/identicon/svg?seed=${config.currentUser.uid}`; }}
-                                                className="w-16 h-16 rounded-full border-2 border-pink-400/60 object-cover shrink-0 shadow-lg"
-                                            />
+                                            <div className="w-16 h-16 rounded-full overflow-hidden border-2 border-pink-400/60 shrink-0 shadow-lg">
+                                                <AvatarImage
+                                                    src={config.currentUser.face ? `${config.currentUser.face}@160w_160h.webp` : ''}
+                                                    name={config.currentUser.uname || ''}
+                                                    alt={`${config.currentUser.uname || 'B站账号'} 头像`}
+                                                />
+                                            </div>
                                             <div className="flex-1 min-w-0">
                                                 <div className="flex items-center gap-2 mb-1.5">
                                                     <span className="text-lg font-bold text-white truncate">{config.currentUser.uname || '未知用户'}</span>
@@ -4072,7 +4531,7 @@ const AdminWidget: React.FC = () => {
                                         </div>
 
                                         <div className="flex flex-col gap-3 mt-2">
-                                            {playerOptions.map(player => {
+                                            {PLAYER_OPTIONS.map(player => {
                                                 const selected = config.config.PlayerType === player.type;
                                                 const connected = config.playerConnected ?? config.cdpConnected;
                                                 const connecting = selected && config.playerConnecting === true;
@@ -4082,6 +4541,9 @@ const AdminWidget: React.FC = () => {
                                                     player.connectorId === connectorUpdating;
                                                 const automaticallyUpdating =
                                                     connectorStatus?.updating === true;
+                                                const updateProgress = automaticallyUpdating
+                                                    ? describeConnectorProgress(connectorStatus?.progress)
+                                                    : null;
                                                 const controlBlocked = Boolean(
                                                     selected
                                                     && playerControlNotice?.playerKey === player.connectorId
@@ -4090,7 +4552,7 @@ const AdminWidget: React.FC = () => {
                                                 return (
                                                     <div key={player.type} data-connector-id={player.connectorId} data-selected={selected} className={`studio-player-table-row grid grid-cols-1 md:grid-cols-12 gap-4 items-center bg-black/40 border ${selected ? 'border-purple-500/50 shadow-inner' : 'border-white/10'} rounded-lg p-3 transition-colors hover:bg-white/5`}>
                                                         <div className="md:col-span-2 flex items-center gap-3">
-                                                            <button aria-label={`选择${player.name}`} aria-pressed={selected} onClick={() => handleSetPlayerType(player.type)} className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${selected ? 'border-purple-500' : 'border-gray-500'}`}>
+                                                            <button aria-label={`选择${player.name}`} aria-pressed={selected} onClick={() => void handleSetPlayerType(player.type)} className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${selected ? 'border-purple-500' : 'border-gray-500'}`}>
                                                                 {selected && <div className="w-2.5 h-2.5 bg-purple-500 rounded-full" />}
                                                             </button>
                                                             <span className={`text-sm font-bold tracking-wide ${selected ? 'text-white' : 'text-gray-400'}`}>{player.name}</span>
@@ -4119,7 +4581,8 @@ const AdminWidget: React.FC = () => {
                                                         <div className="md:col-span-3 min-w-0">
                                                             {connectorStatus ? (
                                                                     <div className="space-y-1">
-                                                                        {connectorStatus.manualUpdateAvailable && (
+                                                                        {/* A rolled-back version shows its own chip below, not a branch hint. */}
+                                                                        {connectorStatus.manualUpdateAvailable && !connectorStatus.quarantined && (
                                                                             <div className="text-[10px] text-orange-300 font-bold">
                                                                                 新播放器版本分支：仅手动更新
                                                                                 <span className="block text-orange-200/70 font-normal mt-0.5">
@@ -4127,18 +4590,20 @@ const AdminWidget: React.FC = () => {
                                                                                 </span>
                                                                             </div>
                                                                         )}
-                                                                        {connectorStatus.autoUpdateAvailable && connectorStatus.installed && (
+                                                                        {connectorStatus.autoUpdateAvailable && connectorStatus.installed && !connectorStatus.quarantined && (
                                                                             <div className="text-[10px] text-cyan-300 font-bold">
                                                                                 同播放器版本补丁，将自动更新
                                                                             </div>
                                                                         )}
+                                                                        {connectorStatus.quarantined && (
+                                                                            <div className="text-[10px] text-orange-300 font-bold">
+                                                                                新版本已暂停自动更新（已回退）
+                                                                            </div>
+                                                                        )}
                                                                         <div className="text-[11px] text-gray-300">
-                                                                            当前：
-                                                                            <span className="font-mono text-white">
-                                                                                {connectorStatus.installed
-                                                                                    ? `独立 v${connectorStatus.currentVersion}`
-                                                                                    : '未安装'}
-                                                                            </span>
+                                                                            {connectorStatus.installed ? (
+                                                                                <>已安装 <span className="font-mono text-white">v{connectorStatus.currentVersion}</span></>
+                                                                            ) : '未安装'}
                                                                         </div>
                                                                         <div className="text-[10px] text-gray-500">
                                                                             网站最新：
@@ -4147,6 +4612,14 @@ const AdminWidget: React.FC = () => {
                                                                                     ? `v${connectorStatus.latestVersion}`
                                                                                     : '未知'}
                                                                             </span>
+                                                                            {connectorStatus.stale && (
+                                                                                <span
+                                                                                    title={connectorStatus.staleMessage || '暂时无法连接更新服务，显示的是本机缓存的版本信息'}
+                                                                                    className="ml-1.5 inline-flex px-1.5 py-px rounded border border-amber-400/30 bg-amber-500/10 text-amber-300"
+                                                                                >
+                                                                                    离线缓存
+                                                                                </span>
+                                                                            )}
                                                                         </div>
                                                                         <span
                                                                             title={connectorStatus.error || undefined}
@@ -4163,7 +4636,7 @@ const AdminWidget: React.FC = () => {
                                                                             }`}
                                                                         >
                                                                             {connectorStatus.updating
-                                                                                ? connectorStatus.installed ? '后台更新中' : '自动安装中'
+                                                                                ? reinstalling ? '正在更新' : connectorStatus.installed ? '后台更新中' : '自动安装中'
                                                                                 : connectorStatus.error
                                                                                 ? '检查失败'
                                                                                 : !connectorStatus.compatible
@@ -4172,6 +4645,12 @@ const AdminWidget: React.FC = () => {
                                                                                         ? connectorStatus.installed ? '有新版本可选' : '缺失时自动安装'
                                                                                         : '已是最新'}
                                                                         </span>
+                                                                        {updateProgress && (
+                                                                            <div className="studio-connector-progress">
+                                                                                <div><span role="status">正在{updateProgress.label}</span>{updateProgress.percent !== null && <span>{updateProgress.percent}%</span>}</div>
+                                                                                <progress max={100} value={updateProgress.percent ?? undefined} aria-label={`${player.name}连接器更新进度`} />
+                                                                            </div>
+                                                                        )}
                                                                     </div>
                                                             ) : (
                                                                     <span className="text-[10px] text-gray-500">
@@ -4219,6 +4698,7 @@ const AdminWidget: React.FC = () => {
                                                                     || connectorStatus?.compatible === false
                                                                     || connectorStatus?.manualUpdateAvailable === true
                                                                 }
+                                                                title={connectorStatus?.manualUpdateAvailable === true ? '跨播放器分支更新请使用“手动更新”' : undefined}
                                                                 onClick={() => void handleConnectorReinstall(player.connectorId)}
                                                                 className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-[11px] rounded-lg font-bold shadow transition-colors border border-amber-400/40 disabled:opacity-30 disabled:cursor-not-allowed"
                                                             >
@@ -4253,15 +4733,12 @@ const AdminWidget: React.FC = () => {
                                                 <input
                                                     type="password"
                                                     value={config.config.FoliaToken || ''}
-                                                    onChange={e => setConfig({
-                                                        ...config,
-                                                        config: {
-                                                            ...config.config,
-                                                            FoliaToken: e.target.value
-                                                        }
-                                                    })}
+                                                    onChange={e => updateSysConfig(current => ({
+                                                        ...current,
+                                                        FoliaToken: e.target.value
+                                                    }))}
                                                     placeholder={
-                                                        config.config.FoliaTokenConfigured
+                                                        isFoliaTokenConfigured(config.config)
                                                             ? '已配置；输入新 Token 可替换'
                                                             : 'Bearer Token...'
                                                     }
@@ -4276,7 +4753,7 @@ const AdminWidget: React.FC = () => {
                                         <div className="text-xs text-gray-500 mt-2 italic flex gap-2 leading-relaxed">
                                             <span className="shrink-0">💡</span>
                                             <span>
-                                                本体会自动补齐缺少的连接器，并每 30 分钟检查新版本。同一播放器兼容分支只提高第三位的补丁会自动更新；第二位提高代表播放器兼容版本变化，只会提示并等待手动确认。跨分支手动更新前会显示目标连接器支持的播放器版本。“重新安装”只用于当前兼容分支的手动修复。
+                                                本体会在选择播放器时自动安装对应连接器，并每 30 分钟检查已安装连接器的新版本。仅连接器修订号（版本最后一位）提高时自动更新；前面任一位变化表示播放器兼容分支变化，需要手动确认。网易云正在运行时，自动更新会等待网易云关闭后再应用。
                                             </span>
                                         </div>
                                     </div>
@@ -4285,20 +4762,20 @@ const AdminWidget: React.FC = () => {
                                         <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3"><UiIcon name="clock" /> 点歌冷却设置（秒）</h3>
                                         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                                             <div>
-                                                <label className="block text-xs text-gray-400 mb-2">普通用户</label>
-                                                <input type="number" className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none" value={config.config.Cooldowns?.Normal || 0} onChange={e => updateCooldown('Normal', e.target.value)} />
+                                                <label htmlFor="cooldown-normal" className="block text-xs text-gray-400 mb-2">普通用户</label>
+                                                <NumberField id="cooldown-normal" integer min={0} value={finiteNumberOr(config.config.Cooldowns?.Normal, 0)} onCommit={value => updateCooldown('Normal', value)} className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 outline-none" />
                                             </div>
                                             <div>
-                                                <label className="block text-xs text-blue-400 mb-2 font-bold">舰长</label>
-                                                <input type="number" className="w-full bg-blue-900/30 border border-blue-500/30 rounded-lg p-2.5 text-md text-blue-200 focus:border-blue-500 outline-none" value={config.config.Cooldowns?.Captain || 0} onChange={e => updateCooldown('Captain', e.target.value)} />
+                                                <label htmlFor="cooldown-captain" className="block text-xs text-blue-400 mb-2 font-bold">舰长</label>
+                                                <NumberField id="cooldown-captain" integer min={0} value={finiteNumberOr(config.config.Cooldowns?.Captain, 0)} onCommit={value => updateCooldown('Captain', value)} className="w-full bg-blue-900/30 border border-blue-500/30 rounded-lg p-2.5 text-sm text-blue-200 focus:border-blue-500 outline-none" />
                                             </div>
                                             <div>
-                                                <label className="block text-xs text-purple-400 mb-2 font-bold">提督</label>
-                                                <input type="number" className="w-full bg-purple-900/30 border border-purple-500/30 rounded-lg p-2.5 text-md text-purple-200 focus:border-purple-500 outline-none" value={config.config.Cooldowns?.Admiral || 0} onChange={e => updateCooldown('Admiral', e.target.value)} />
+                                                <label htmlFor="cooldown-admiral" className="block text-xs text-purple-400 mb-2 font-bold">提督</label>
+                                                <NumberField id="cooldown-admiral" integer min={0} value={finiteNumberOr(config.config.Cooldowns?.Admiral, 0)} onCommit={value => updateCooldown('Admiral', value)} className="w-full bg-purple-900/30 border border-purple-500/30 rounded-lg p-2.5 text-sm text-purple-200 focus:border-purple-500 outline-none" />
                                             </div>
                                             <div>
-                                                <label className="block text-xs text-red-400 mb-2 font-bold">总督</label>
-                                                <input type="number" className="w-full bg-red-900/30 border border-red-500/30 rounded-lg p-2.5 text-md text-red-200 focus:border-red-500 outline-none" value={config.config.Cooldowns?.Governor || 0} onChange={e => updateCooldown('Governor', e.target.value)} />
+                                                <label htmlFor="cooldown-governor" className="block text-xs text-red-400 mb-2 font-bold">总督</label>
+                                                <NumberField id="cooldown-governor" integer min={0} value={finiteNumberOr(config.config.Cooldowns?.Governor, 0)} onCommit={value => updateCooldown('Governor', value)} className="w-full bg-red-900/30 border border-red-500/30 rounded-lg p-2.5 text-sm text-red-200 focus:border-red-500 outline-none" />
                                             </div>
                                         </div>
                                     </div>
@@ -4560,8 +5037,8 @@ const AdminWidget: React.FC = () => {
                                                 <label className="block text-xs text-gray-400 mb-2">空闲时点歌行为</label>
                                                 <select
                                                     value={config.config.IdleWaitNext === false ? 'false' : 'true'}
-                                                    onChange={e => setConfig({...config, config: {...config.config, IdleWaitNext: e.target.value === 'true'}})}
-                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none cursor-pointer"
+                                                    onChange={e => updateSysConfig(current => ({...current, IdleWaitNext: e.target.value === 'true'}))}
+                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 outline-none cursor-pointer"
                                                 >
                                                     <option value="true">登记播放器下一首守卫（等当前播完）</option>
                                                     <option value="false">立即强行切歌播放</option>
@@ -4572,8 +5049,8 @@ const AdminWidget: React.FC = () => {
                                                 <label className="block text-xs text-gray-400 mb-2">点歌全部播完后</label>
                                                 <select
                                                     value={config.config.PauseAfterRequests === true ? 'pause' : 'continue'}
-                                                    onChange={e => setConfig({...config, config: {...config.config, PauseAfterRequests: e.target.value === 'pause'}})}
-                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none cursor-pointer"
+                                                    onChange={e => updateSysConfig(current => ({...current, PauseAfterRequests: e.target.value === 'pause'}))}
+                                                    className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 outline-none cursor-pointer"
                                                 >
                                                     <option value="continue">继续播放主播歌单（默认）</option>
                                                     <option
@@ -4596,7 +5073,7 @@ const AdminWidget: React.FC = () => {
                                                         <label className="block text-sm text-white font-medium">显示播放器当前歌曲</label>
                                                         <span className="text-xs text-gray-500 block mt-1">没有点歌时，以淡蓝色卡片显示主播歌单歌曲</span>
                                                     </div>
-                                                    <button onClick={() => setConfig({...config, config: {...config.config, ShowPlayerCurrentTrack: !config.config.ShowPlayerCurrentTrack}})} className={`w-10 h-6 rounded-full p-1 transition-colors shrink-0 ${config.config.ShowPlayerCurrentTrack ? 'bg-blue-600' : 'bg-gray-600'}`}>
+                                                    <button onClick={() => updateSysConfig(current => ({...current, ShowPlayerCurrentTrack: !current.ShowPlayerCurrentTrack}))} className={`w-10 h-6 rounded-full p-1 transition-colors shrink-0 ${config.config.ShowPlayerCurrentTrack ? 'bg-blue-600' : 'bg-gray-600'}`}>
                                                         <div className={`w-4 h-4 rounded-full bg-white transition-transform ${config.config.ShowPlayerCurrentTrack ? 'translate-x-4' : 'translate-x-0'}`}></div>
                                                     </button>
                                                 </div>
@@ -4608,7 +5085,7 @@ const AdminWidget: React.FC = () => {
                                                         <label className="block text-sm text-white font-medium">记录所有弹幕日志</label>
                                                         <span className="text-xs text-gray-500 block mt-1">用于在日志排错抓取</span>
                                                     </div>
-                                                    <button onClick={() => setConfig({...config, config: {...config.config, ShowAllDanmaku: !config.config.ShowAllDanmaku}})} className={`w-10 h-6 rounded-full p-1 transition-colors ${config.config.ShowAllDanmaku ? 'bg-blue-600' : 'bg-gray-600'}`}>
+                                                    <button onClick={() => updateSysConfig(current => ({...current, ShowAllDanmaku: !current.ShowAllDanmaku}))} className={`w-10 h-6 rounded-full p-1 transition-colors ${config.config.ShowAllDanmaku ? 'bg-blue-600' : 'bg-gray-600'}`}>
                                                         <div className={`w-4 h-4 rounded-full bg-white transition-transform ${config.config.ShowAllDanmaku ? 'translate-x-4' : 'translate-x-0'}`}></div>
                                                     </button>
                                                 </div>
@@ -4623,18 +5100,18 @@ const AdminWidget: React.FC = () => {
                                         </div>
                                         <div className="flex flex-wrap items-end gap-3">
                                             <div>
-                                                <label className="block text-xs text-gray-400 mb-2">请求端口</label>
-                                                <input
-                                                    type="number"
-                                                    min="1024"
-                                                    max="65535"
+                                                <label htmlFor="internal-api-port" className="block text-xs text-gray-400 mb-2">请求端口</label>
+                                                <NumberField
+                                                    id="internal-api-port"
+                                                    integer
                                                     value={internalApiRequestedPort}
-                                                    onChange={e => setConfig({...config, config: {...config.config, InternalApiPort: parseInt(e.target.value) || 5555}})}
+                                                    parse={draft => parsePortDraft(draft, { forbid: configuredExternalApiPort, conflictMessage: '与外部只读接口端口冲突' })}
+                                                    onCommit={port => updateSysConfig(current => ({ ...current, InternalApiPort: port }))}
                                                     className="w-32 bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-violet-500 outline-none"
                                                 />
                                             </div>
                                             <button
-                                                onClick={() => setConfig({...config, config: {...config.config, InternalApiPort: 5555}})}
+                                                onClick={() => updateSysConfig(current => ({ ...current, InternalApiPort: 5555 }))}
                                                 className="px-3 py-2.5 bg-white/10 hover:bg-white/20 border border-white/10 rounded-lg text-xs text-gray-200"
                                             >
                                                 恢复默认
@@ -4661,7 +5138,7 @@ const AdminWidget: React.FC = () => {
                                                     <label className="block text-sm text-white font-medium">HTTP API</label>
                                                     <span className="text-xs text-gray-500">GET /api/v1/state</span>
                                                 </div>
-                                                <button onClick={() => setConfig({...config, config: {...config.config, ExternalHttpEnabled: !config.config.ExternalHttpEnabled}})} className={`w-10 h-6 rounded-full p-1 transition-colors ${config.config.ExternalHttpEnabled ? 'bg-cyan-600' : 'bg-gray-600'}`}>
+                                                <button onClick={() => updateSysConfig(current => ({...current, ExternalHttpEnabled: !current.ExternalHttpEnabled}))} className={`w-10 h-6 rounded-full p-1 transition-colors ${config.config.ExternalHttpEnabled ? 'bg-cyan-600' : 'bg-gray-600'}`}>
                                                     <div className={`w-4 h-4 rounded-full bg-white transition-transform ${config.config.ExternalHttpEnabled ? 'translate-x-4' : 'translate-x-0'}`}></div>
                                                 </button>
                                             </div>
@@ -4670,19 +5147,19 @@ const AdminWidget: React.FC = () => {
                                                     <label className="block text-sm text-white font-medium">WebSocket 推送</label>
                                                     <span className="text-xs text-gray-500">状态变化时推送 /ws</span>
                                                 </div>
-                                                <button onClick={() => setConfig({...config, config: {...config.config, ExternalWebSocketEnabled: !config.config.ExternalWebSocketEnabled}})} className={`w-10 h-6 rounded-full p-1 transition-colors ${config.config.ExternalWebSocketEnabled ? 'bg-cyan-600' : 'bg-gray-600'}`}>
+                                                <button onClick={() => updateSysConfig(current => ({...current, ExternalWebSocketEnabled: !current.ExternalWebSocketEnabled}))} className={`w-10 h-6 rounded-full p-1 transition-colors ${config.config.ExternalWebSocketEnabled ? 'bg-cyan-600' : 'bg-gray-600'}`}>
                                                     <div className={`w-4 h-4 rounded-full bg-white transition-transform ${config.config.ExternalWebSocketEnabled ? 'translate-x-4' : 'translate-x-0'}`}></div>
                                                 </button>
                                             </div>
                                         </div>
                                         <div>
-                                            <label className="block text-xs text-gray-400 mb-2">外部只读接口端口（默认 5556）</label>
-                                            <input
-                                                type="number"
-                                                min="1024"
-                                                max="65535"
-                                                value={config.config.ExternalApiPort || 5556}
-                                                onChange={e => setConfig({...config, config: {...config.config, ExternalApiPort: parseInt(e.target.value) || 5556}})}
+                                            <label htmlFor="external-api-port" className="block text-xs text-gray-400 mb-2">外部只读接口端口（默认 5556）</label>
+                                            <NumberField
+                                                id="external-api-port"
+                                                integer
+                                                value={configuredExternalApiPort}
+                                                parse={draft => parsePortDraft(draft, { forbid: internalApiPortsInUse, conflictMessage: '与内部控制服务端口冲突' })}
+                                                onCommit={port => updateSysConfig(current => ({ ...current, ExternalApiPort: port }))}
                                                 className="w-32 bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-cyan-500 outline-none"
                                             />
                                             <div className="text-xs text-gray-500 mt-2 font-mono break-all">
@@ -4705,10 +5182,10 @@ const AdminWidget: React.FC = () => {
                                                 value={superUserInput}
                                                 onChange={e => setSuperUserInput(e.target.value)}
                                                 onKeyDown={e => e.key === 'Enter' && addSuperUser()}
-                                                className="flex-1 bg-black/30 border border-white/10 rounded-lg p-2.5 text-md text-white focus:border-blue-500 outline-none"
+                                                className="flex-1 bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 outline-none"
                                                 placeholder="输入需要特权的 B站完整用户名..."
                                             />
-                                            <button disabled={!config.biliLogin} onClick={addSuperUser} className="px-6 py-2.5 bg-yellow-600 hover:bg-yellow-500 text-white text-md rounded-lg font-bold transition-colors disabled:cursor-not-allowed">添加</button>
+                                            <button disabled={!config.biliLogin} onClick={addSuperUser} className="px-6 py-2.5 bg-yellow-600 hover:bg-yellow-500 text-white text-sm rounded-lg font-bold transition-colors disabled:cursor-not-allowed">添加</button>
                                         </div>
 
                                         <div className="flex flex-wrap gap-3 mt-3">
@@ -4730,12 +5207,12 @@ const AdminWidget: React.FC = () => {
                                         {!config.biliLogin && <div className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3 mb-5">游客模式固定使用基础权限，以下自定义设置暂不可用。</div>}
 
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                                            {permTypes.map(pt => {
+                                            {PERMISSION_TYPES.map(pt => {
                                                 const pData = config.config[pt.key] || { AllowManager: true, MinGuardType: (pt.key === 'ForceControlPermission' ? -1 : 0), MinMedalLevel: 0 };
 
                                                 return (
                                                     <div key={pt.key} className="bg-black/40 border border-white/5 p-4 rounded-xl flex flex-col gap-4">
-                                                        <div className="font-bold text-white text-md border-b border-white/5 pb-2">{pt.label}</div>
+                                                        <div className="font-bold text-white text-sm border-b border-white/5 pb-2">{pt.label}</div>
 
                                                         <div className="flex justify-between items-center">
                                                             <span className="text-sm text-gray-300">允许房管无视限制</span>
@@ -4761,14 +5238,16 @@ const AdminWidget: React.FC = () => {
                                                         </div>
 
                                                         <div>
-                                                            <label className="block text-xs text-gray-500 mb-1.5">最低粉丝牌等级要求 (0为无限制)</label>
-                                                            <input
+                                                            <label htmlFor={`${pt.key}-medal-level`} className="block text-xs text-gray-500 mb-1.5">最低粉丝牌等级要求 (0为无限制)</label>
+                                                            <NumberField
+                                                                id={`${pt.key}-medal-level`}
                                                                 disabled={!config.biliLogin}
-                                                                type="number"
-                                                                value={pData.MinMedalLevel}
-                                                                onChange={e => updatePermission(pt.key, 'MinMedalLevel', parseInt(e.target.value))}
+                                                                integer
+                                                                min={0}
+                                                                max={40}
+                                                                value={finiteNumberOr(pData.MinMedalLevel, 0)}
+                                                                onCommit={level => updatePermission(pt.key, 'MinMedalLevel', level)}
                                                                 className="w-full bg-black border border-white/10 rounded-lg p-2.5 text-sm text-white outline-none"
-                                                                min="0" max="40"
                                                             />
                                                         </div>
                                                     </div>
@@ -5086,7 +5565,7 @@ const AdminWidget: React.FC = () => {
                                                     {feedbackLoading ? '正在刷新诊断…' : '预览将要提交的诊断信息'}
                                                 </summary>
                                                 <pre className="px-4 pb-4 text-[11px] leading-relaxed text-gray-400 overflow-auto max-h-72 whitespace-pre-wrap break-all">
-                                                    {JSON.stringify(feedbackDiagnostics?.diagnostics || {}, null, 2)}
+                                                    {feedbackDiagnosticsPreview}
                                                 </pre>
                                             </details>
                                         )}
@@ -5113,6 +5592,7 @@ const AdminWidget: React.FC = () => {
 
                             {activeTab === 'login' && (
                                 <div className="space-y-6 animate-slide-in-right flex flex-col items-center pt-10">
+                                    <TabPoller poll={pollQrStatus} intervalMs={2000} />
                                     <div className="bg-white/5 p-8 rounded-2xl border border-white/10 flex flex-col items-center justify-center w-full max-w-md text-center shadow-xl">
 
                                         {config.biliLogin ? (
@@ -5126,12 +5606,12 @@ const AdminWidget: React.FC = () => {
                                         )}
 
                                         {qrState.base64 ? (
-                                            <div className="bg-white p-3 rounded-2xl shadow-2xl mb-6"><img src={qrState.base64} alt="Bilibili Login QR" className="w-48 h-48" /></div>
+                                            <div className="bg-white p-3 rounded-2xl shadow-2xl mb-6"><img src={qrState.base64} alt="B站扫码登录二维码" className="w-48 h-48" /></div>
                                         ) : (
                                             <div className="studio-login-placeholder"><UiIcon name="login" /><span>扫码连接你的 B 站账号</span><small>打开哔哩哔哩，使用扫一扫</small></div>
                                         )}
 
-                                        <h3 className="text-md text-white font-bold mb-5">{qrState.message}</h3>
+                                        <h3 className="text-sm text-white font-bold mb-5">{qrState.message}</h3>
                                         <div className={`grid gap-3 w-full ${config.biliLogin ? 'grid-cols-2' : 'grid-cols-1'}`}>
                                             <button onClick={startQrLogin} disabled={qrState.loading} className="px-5 py-3 bg-[#fb7299] hover:bg-[#ff85a8] text-white text-sm rounded-xl font-bold shadow-lg disabled:opacity-50 transition-colors w-full">
                                                 {config.biliLogin ? '扫码更换账号' : (qrState.loading ? '正在获取...' : '点击获取登录二维码')}
@@ -5160,35 +5640,23 @@ const AdminWidget: React.FC = () => {
                                         </div>
 
                                         <p className="text-sm text-gray-400 mb-4 leading-relaxed">查看点歌机和连接器的新版本与修复说明。</p>
-                                        <button onClick={() => setAnnouncementOpenRequest(value => value + 1)} className="mb-6 px-5 py-3 border border-blue-500/30 bg-blue-500/10 text-blue-300 rounded-xl font-bold w-full hover:bg-blue-500/20">
+                                        <button onClick={() => setAnnouncementOpenRequest(value => value + 1)} className="mb-6 inline-flex items-center justify-center gap-2 px-5 py-3 border border-blue-500/30 bg-blue-500/10 text-blue-300 rounded-xl font-bold w-full hover:bg-blue-500/20">
                                             更新与公告
+                                            {updateBadgeCount > 0 && (
+                                                <span className="studio-count-badge"><span aria-hidden="true">{updateBadgeCount}</span><span className="sr-only">{updateBadgeLabel}</span></span>
+                                            )}
                                         </button>
 
-                                        {downloadProgress !== null ? (
-                                            <div className="bg-green-900/30 border border-green-500/30 p-5 rounded-xl w-full text-left">
-                                                <div className="text-green-400 font-bold text-md mb-2 flex justify-between">
-                                                    <span>🚀 {updateDownloadStatus?.message || '正在下载更新'}</span>
-                                                    <span>{Math.floor(downloadProgress)}%</span>
-                                                </div>
-                                                <div className="w-full bg-black/50 h-3 rounded-full overflow-hidden">
-                                                    <div
-                                                        className="bg-green-500 h-full transition-all duration-300 ease-out"
-                                                        style={{ width: `${downloadProgress}%` }}
-                                                    ></div>
-                                                </div>
-                                                <div className="text-xs text-green-400/70 mt-3 text-center">这里显示安装器返回的真实下载进度；安装完成后只会进行一次最终重启</div>
-                                            </div>
-                                        ) : updateInfo.info?.hasUpdate ? (
-                                            <div className="bg-green-900/30 border border-green-500/30 p-5 rounded-xl w-full">
-                                                <div className="text-green-400 font-bold text-md mb-4">🎉 发现新版本: {updateInfo.info.version}</div>
-                                                <button onClick={handleApplyUpdate} disabled={connectorUpdating !== null} className="px-5 py-3 bg-green-600 hover:bg-green-500 text-white text-md rounded-xl font-bold shadow-lg w-full transition-colors disabled:opacity-50">更新并重启</button>
-                                            </div>
-                                        ) : (
-                                            <button onClick={handleUpdateCheck} disabled={updateInfo.checking} className="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white text-md rounded-xl font-bold shadow-lg disabled:opacity-50 transition-colors w-full">
-                                                {updateInfo.checking ? '正在检查 GitHub...' : '检查最新更新'}
-                                            </button>
+                                        {/* The same server status as the dialog, so reopening the window keeps the progress. */}
+                                        <CoreUpdateProgress status={coreUpdateView} className="studio-update-progress" />
+                                        {downloadProgress !== null && (
+                                            <p className="-mt-3 mb-6 text-xs text-gray-500 leading-relaxed">下载在后台进行，可以继续使用控制台；完成后点歌机只会自动重启一次。</p>
                                         )}
-                                        {updateInfo.info?.error && <div className="mt-4 text-red-400 text-sm">{updateInfo.info.error}</div>}
+
+                                        {/* The dialog is the single source of update information; this asks it for a fresh check. */}
+                                        <button onClick={() => window.dispatchEvent(new CustomEvent('awoo-updates-open', { detail: { refresh: true } }))} disabled={updateChecking} className="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-xl font-bold shadow-lg disabled:opacity-50 transition-colors w-full">
+                                            {updateChecking ? '正在检查更新…' : '检查最新更新'}
+                                        </button>
                                     </div>
                                 </div>
                             )}
@@ -5205,19 +5673,18 @@ const App: React.FC = () => {
     const isAdmin = params.get('admin') === 'true';
 
     if (isAdmin) {
+        // .admin-widget-root paints the themed background itself.
         return (
             <>
                 <GlobalStyles />
-                <div style={{ background: '#0d1117', minHeight: '100vh' }}>
-                    <AdminWidget />
-                </div>
+                <AdminWidget />
             </>
         );
     }
 
     return (
         <>
-            <GlobalStyles />
+            <GlobalStyles hideScrollbars />
             <OverlayWidget
                 onToggleAdmin={() => {
                     if (isElectron) electronAPI?.openAdmin();

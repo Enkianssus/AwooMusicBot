@@ -1,13 +1,17 @@
-import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron';
+import {
+  app, BrowserWindow, dialog, ipcMain, powerMonitor, screen, session, shell,
+  type WebContents, type WebFrameMain
+} from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import http from 'http';
 import fs from 'fs';
 import os from 'os';
 import zlib from 'zlib';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { createRequire } from 'module';
-import { WebSocket, WebSocketServer } from 'ws';
+import { WebSocket } from 'ws';
+import { version as HLS_VENDOR_VERSION } from 'hls.js/package.json';
 import QRCode from 'qrcode';
 import {
   planImmediatePlaybackCommand,
@@ -27,15 +31,17 @@ import {
 } from './queue-head-policy';
 import type { NextObservation } from './queue-head-policy';
 import {
-  markAppUpdateApplying,
-  markAppUpdateExitRequested,
-  markAppUpdateRetryable,
-  markAppUpdateStarted,
-  planAppUpdateRequest,
   shouldAllowMultipleInstances,
-  shouldRequestAppQuit,
-  type AppUpdatePhase
+  shouldRequestAppQuit
 } from './app-update-policy';
+import { AppUpdater, createAppUpdateManager, withTimeout } from './app-updater';
+import {
+  createCrashLoopGuard,
+  describeUrlForLog,
+  isAllowedExternalUrl,
+  isAppNavigationUrl,
+  type CrashLoopGuard
+} from './web-contents-policy';
 import {
   CONNECTOR_AUTO_REPAIR_MESSAGES,
   planConnectorAutoRepair
@@ -49,8 +55,31 @@ import type { LocalSongRequestMode } from './local-test-api-policy';
 import {
   getNeteaseSongCover
 } from './players/netease-player';
-import { PlayerManager } from './players/player-manager';
-import type { NativeConnectorId } from './connector-updater';
+import { PlayerManager, type PlayerConnectorUpdateResult } from './players/player-manager';
+import type {
+  ConnectorUpdateResult,
+  ConnectorUpdateStatus,
+  NativeConnectorId
+} from './connector-updater';
+import {
+  describeMaintenanceDelay,
+  describeMaintenanceSkip,
+  earliestRetry,
+  MAINTENANCE_BUSY_RETRY_MS,
+  MAINTENANCE_ERROR_RETRY_MS,
+  MAINTENANCE_NETEASE_RETRY_MS,
+  maintenanceFailureKey,
+  planConnectorMaintenance,
+  recordMaintenanceFailure,
+  recordMaintenanceSuccess,
+  type MaintenanceFailureMemo,
+  type MaintenancePlan,
+  type MaintenanceSkipReason
+} from './connector-maintenance';
+import { inspectPlayerProcess } from './player-process-inspector';
+import { buildDiagnosticChecks, DanmakuReceptionTracker } from './diagnostics-policy';
+import type { DiagnosticInputs } from './diagnostics-policy';
+import type { DiagnosticRepair, DiagnosticsState } from '../src/diagnostics-types';
 import {
   UpdateAnnouncementService,
   UpdateReceiptStore,
@@ -67,11 +96,37 @@ import {
   isTechnicalFeedbackCategory
 } from '../src/feedback-submission-policy';
 import { buildExternalApiState } from './external-api-state';
+import { createExternalApiServer } from './external-api-server';
+import { createObsOverlayHost } from './obs-overlay-host';
+import {
+  classifyInternalRequest,
+  createAppRendererUrlMatcher,
+  INTERNAL_API_TOKEN_HEADER,
+  isLoopbackHostHeader,
+  isSameAppOrigin,
+  isValidInternalToken,
+  mayTriggerNetworkWork,
+  shouldAttachInternalToken,
+  type RequestFrame
+} from './internal-api-trust-policy';
+import { DynamicCoverService, type DynamicCoverDiagnostic } from './dynamic-cover-service';
+import { createLookupDebouncer, withDynamicCover } from './dynamic-cover-state';
+import {
+  parseRequestNotificationCommand,
+  RequestNotificationStore,
+  type RequestNotificationKind
+} from './request-notifications';
+import { AVATAR_PLACEHOLDER, createAvatarCache } from './bili-avatar-cache';
+import {
+  isQueueIndex,
+  matchesCurrentSong,
+  QUEUE_ITEM_MISSING_MESSAGE,
+  resolveQueueActionTarget
+} from './queue-action-policy';
 import {
   addGiftRequestCredits,
   canRequestWithGiftCredits,
   consumeGiftRequestCredit,
-  createEmptyGiftRequestRequirements,
   describeGiftRequestRequirement,
   giftRequestTierFromGuardLevel,
   giftRequestTierLabel,
@@ -136,10 +191,28 @@ import {
 import {
   BILI_ROOM_CONNECTION_MESSAGES,
   createBiliRoomConnectionState,
+  nextRoomRefreshDelayMs,
   reduceBiliRoomConnectionState,
+  shouldReconnectForSilence,
   type BiliRoomConnectionEvent,
   type BiliRoomConnectionState
 } from './bili-room-connection-policy';
+import { createAppConfigStore, type AppConfigLoadResult } from './app-config-store';
+import {
+  createDefaultAppConfig,
+  normalizeRoomId,
+  normalizeSysConfig,
+  normalizeUiColorMode,
+  type UiColorMode
+} from './app-config-policy';
+import {
+  createLogSink,
+  describeErrorForLog,
+  LOG_RING_LIMIT,
+  parseLogCursor,
+  selectFeedbackLogs,
+  selectLogsAfter
+} from './log-sink';
 import {
   isSuccessfulPlayerResult,
   PLAYER_LABELS,
@@ -160,17 +233,46 @@ import {
 } from './internal-api-port';
 // ⭐ 动态引入 Velopack 规避静态打包分析
 const customRequire = createRequire(import.meta.url);
-const { UpdateManager, VelopackApp } = customRequire('velopack');
+const { UpdateManager, VelopackApp } = customRequire('velopack') as typeof import('velopack');
+type VelopackUpdateInfo = import('velopack').UpdateInfo;
+// Velopack can log while run() executes, before the log system below exists;
+// those lines wait here (newest 200) and later ones are written directly.
+const VELOPACK_LOG_BUFFER_LIMIT = 200;
+const velopackLogBuffer: { level: string; message: string }[] = [];
+let velopackLogTarget: ((level: string, message: string) => void) | null = null;
+
+function recordVelopackLog(level: string, message: string): void {
+  if (level === 'trace') return;
+  if (velopackLogTarget) {
+    velopackLogTarget(level, message);
+    return;
+  }
+  velopackLogBuffer.push({ level, message });
+  if (velopackLogBuffer.length > VELOPACK_LOG_BUFFER_LIMIT) velopackLogBuffer.shift();
+}
+
 // Complete installer lifecycle callbacks before creating locks, settings or UI.
 // Updates are applied explicitly below so startup cannot bypass that owner.
-VelopackApp.build().setAutoApplyOnStartup(false).run();
+VelopackApp.build().setLogger(recordVelopackLog).setAutoApplyOnStartup(false).run();
 
 let applicationQuitRequested = false;
+// Declared before requestApplicationQuit, which a second instance calls
+// before any window or the rest of this module exists.
+let adminWindow: BrowserWindow | null = null;
 
+/**
+ * The one quit path of the app. An open control panel first sends its
+ * debounced edits (at most ADMIN_CLOSE_FLUSH_TIMEOUT_MS): before-quit closes
+ * the internal API they are sent to, and the panel's close guard no longer
+ * waits once a quit was requested.
+ */
 function requestApplicationQuit(): boolean {
   if (!shouldRequestAppQuit(applicationQuitRequested)) return false;
   applicationQuitRequested = true;
-  app.quit();
+  const quit = () => app.quit();
+  const panel = adminWindow && !adminWindow.isDestroyed() ? adminWindow : null;
+  if (panel) void flushAdminPendingSaves(panel).then(quit, quit);
+  else quit();
   return true;
 }
 
@@ -214,6 +316,53 @@ let internalApiServer: http.Server | null = null;
 let internalApiFallbackReason: 'conflict' | 'reserved' | null = null;
 let overlayModManager: OverlayModManager | null = null;
 let skinMarketplaceInstallInProgress = false;
+const DYNAMIC_COVER_LOG_INTERVAL_MS = 10 * 60_000;
+const dynamicCoverLoggedAt = new Map<string, number>();
+let lastDynamicCoverDiagnostic: (DynamicCoverDiagnostic & { at: string }) | null = null;
+const dynamicCoverService = new DynamicCoverService({
+  onDiagnostic: reportDynamicCoverDiagnostic
+});
+const dynamicCoverLookupDebouncer = createLookupDebouncer();
+
+function describeDynamicCoverDiagnostic({ kind, status }: DynamicCoverDiagnostic): string {
+  switch (kind) {
+    case 'hit': return '已匹配到 Apple Music 动态封面';
+    case 'miss': return '匹配的歌曲没有动态封面，继续使用普通封面';
+    case 'no-candidates': return 'Apple Music 未返回可识别的搜索结果（歌曲未收录或页面结构已变化）';
+    case 'timeout': return 'Apple Music 查询超时，稍后自动重试';
+    case 'parse': return 'Apple Music 页面无法识别，继续使用普通封面';
+    default: return status
+      ? `Apple Music 请求失败（HTTP ${status}），继续使用普通封面`
+      : '无法连接 Apple Music，稍后自动重试';
+  }
+}
+
+function reportDynamicCoverDiagnostic(diagnostic: DynamicCoverDiagnostic): void {
+  const now = Date.now();
+  lastDynamicCoverDiagnostic = { ...diagnostic, at: new Date(now).toISOString() };
+  // One line per outcome kind per 10 minutes keeps a failing service visible
+  // without flooding the log on every track change.
+  const previous = dynamicCoverLoggedAt.get(diagnostic.kind);
+  if (previous !== undefined && now - previous < DYNAMIC_COVER_LOG_INTERVAL_MS) return;
+  dynamicCoverLoggedAt.set(diagnostic.kind, now);
+  writeLog(`[动态封面] ${describeDynamicCoverDiagnostic(diagnostic)}`, 'DarkGray');
+}
+
+function getSongWithDynamicCover(song: any, { lookup = true }: { lookup?: boolean } = {}) {
+  // Query Apple only once a track has stayed current; quickly skipped songs
+  // and snapshots that never render artwork use cached results only.
+  const shouldLookup = lookup && Boolean(song)
+    && dynamicCoverLookupDebouncer.shouldLookup(
+      JSON.stringify([String(song.SongName || ''), String(song.ArtistName || '')]),
+      Date.now()
+    );
+  return withDynamicCover(
+    song,
+    appConfig.sysConfig?.DynamicCoverEnabled,
+    dynamicCoverService,
+    { lookup: shouldLookup }
+  );
+}
 
 function getOverlayModManager(): OverlayModManager {
   if (!overlayModManager) {
@@ -251,12 +400,24 @@ async function fetchWithTimeout(
 // 全局日志系统
 // ==========================================
 interface SysLog {
+  /** One higher for every line, so /api/logs?after=<Seq> can return only newer lines. */
+  Seq: number;
   Time: string;
   Color: string;
   Message: string;
 }
 
 const sysLogs: SysLog[] = [];
+let nextLogSeq = 1;
+// Every line also goes to userData/logs/main.log (rotated at 5 MB, three
+// files, cookies and tokens hidden), so the account of a failed update or a
+// crash survives the restart after it. It must exist before the first
+// writeLog call: the buffered Velopack lines are written further below.
+const logSink = createLogSink({
+  dir: path.join(app.getPath('userData'), 'logs'),
+  sanitize: sanitizeFeedbackLog,
+  onError: reportLogSinkError
+});
 let currentStatusMessage: string = '点歌就绪';
 let connectorMaintenanceStatus = '';
 let connectorMaintenanceStatusOwner = 0;
@@ -282,51 +443,40 @@ async function withPlayerConnectionRecoverySuppressed<T>(
   }
 }
 
-type AppUpdateDownloadState =
-  | 'idle'
-  | 'checking'
-  | 'downloading'
-  | 'applying'
-  | 'no-update'
-  | 'error';
-
-interface AppUpdateDownloadStatus {
-  state: AppUpdateDownloadState;
-  progress: number | null;
-  version: string | null;
-  message: string;
-  updatedAt: string;
-}
-
-let appUpdateDownloadStatus: AppUpdateDownloadStatus = {
-  state: 'idle',
-  progress: null,
-  version: null,
-  message: '',
-  updatedAt: new Date().toISOString()
-};
-let appUpdatePhase: AppUpdatePhase = 'idle';
-let appUpdateOperation: Promise<void> | null = null;
 const updateReceiptStore = new UpdateReceiptStore(app.getPath('userData'));
 let updateAnnouncementService: UpdateAnnouncementService | null = null;
+let appUpdater: AppUpdater<VelopackUpdateInfo> | null = null;
 
 async function checkCoreUpdateAnnouncement() {
-  const manager = new UpdateManager('https://app.enkianss.us/update/awoo');
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    const info = await Promise.race([
-      manager.checkForUpdatesAsync(),
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error('更新检查超时')), 15_000);
-      })
-    ]);
-    return info ? {
-      version: String(info.TargetFullRelease?.Version || ''),
-      notes: info.TargetFullRelease?.NotesMarkdown
-    } : null;
-  } finally {
-    if (timer) clearTimeout(timer);
+  const info = await withTimeout(
+    createAppUpdateManager(UpdateManager).checkForUpdatesAsync(), 15_000, '更新检查超时'
+  );
+  if (!info) return null;
+  const size = info.TargetFullRelease?.Size;
+  return {
+    version: String(info.TargetFullRelease?.Version || ''),
+    notes: info.TargetFullRelease?.NotesMarkdown,
+    ...(typeof size === 'number' && Number.isFinite(size) && size > 0 ? { sizeBytes: size } : {})
+  };
+}
+
+/** The one core self-update owner; it loads the native manager only when used. */
+function getAppUpdater(): AppUpdater<VelopackUpdateInfo> {
+  if (!appUpdater) {
+    appUpdater = new AppUpdater({
+      createManager: () => createAppUpdateManager(UpdateManager),
+      receiptStore: updateReceiptStore,
+      guard: updateInstallationGuard,
+      requestQuit: requestApplicationQuit,
+      log: writeLog,
+      setGlobalStatus,
+      getVersion: () => app.getVersion(),
+      // "Already current" drops only the core candidate; after a failure the
+      // next snapshot checks everything again so the dialog can offer a retry.
+      onFinished: outcome => getUpdateAnnouncementService().invalidate(outcome === 'no-update' ? 'core' : undefined)
+    });
   }
+  return appUpdater;
 }
 
 function getUpdateAnnouncementService(): UpdateAnnouncementService {
@@ -343,34 +493,80 @@ function getUpdateAnnouncementService(): UpdateAnnouncementService {
   return updateAnnouncementService;
 }
 
-setConnectorUpdateListener(async (id, name, previousVersion, version) => {
+/** Connectors whose running update or reinstall the user asked for. */
+const userInitiatedConnectorUpdates = new Set<NativeConnectorId>();
+
+/**
+ * Records a completed connector upgrade. Only an update the user asked for
+ * opens the control panel; an open panel shows the receipt on the tab the
+ * user is working in. Background and automatic installs never create, show,
+ * focus or navigate a window during a stream: the receipt waits until the
+ * panel is opened, and an open panel only flashes its taskbar button.
+ */
+async function handleCompletedConnectorUpdate(
+  id: NativeConnectorId,
+  name: string,
+  previousVersion: string | null,
+  version: string
+): Promise<void> {
   const service = getUpdateAnnouncementService();
   service.noteInstalled(id, version);
   const receipt = await updateReceiptStore.recordConnectorUpdate(id, name, previousVersion, version);
-  if (receipt && !applicationQuitRequested && startupBackgroundServicesStarted) {
-    createAdminWindow('updates');
+  if (!receipt || applicationQuitRequested || !startupBackgroundServicesStarted) return;
+  const panel = adminWindow && !adminWindow.isDestroyed() ? adminWindow : null;
+  if (userInitiatedConnectorUpdates.has(id)) {
+    if (!panel) createAdminWindow('updates');
+    return;
   }
-});
-
-async function checkStartupUpdateAnnouncements(): Promise<void> {
+  if (!panel || panel.isFocused()) return;
   try {
-    const result = await getUpdateAnnouncementService().get();
-    if (!applicationQuitRequested && (result.items.length || result.receipts.length)) {
+    panel.flashFrame(true);
+  } catch {
+    // Ignore teardown races while the control panel is closing.
+  }
+}
+
+setConnectorUpdateListener(handleCompletedConnectorUpdate);
+
+/**
+ * Shows a finished update at once from the local receipts, then opens the
+ * panel for an update only if one installs without asking anything first.
+ * Manual player-branch and blocked items wait until the user opens the panel.
+ */
+async function checkStartupUpdateAnnouncements(): Promise<void> {
+  const service = getUpdateAnnouncementService();
+  let opened = false;
+  try {
+    // A restart after an update is unexpected from the user's point of view,
+    // so its confirmation must not wait for the network check below.
+    const local = await service.getLocalSnapshot();
+    if (local.receipts.length && !applicationQuitRequested) {
+      opened = true;
+      createAdminWindow('updates');
+    }
+    // Another instance may legitimately be applying an update while this
+    // debugging instance starts; only the single production owner may judge it.
+    if (local.pendingFailure && !allowMultipleInstances) {
+      const { previousVersion, targetVersion } = local.pendingFailure;
+      writeLog(`[更新] 上次点歌机更新未完成：更新包 v${targetVersion} 没有安装，当前仍为 v${previousVersion}`, 'Yellow');
+      setGlobalStatus(`上次点歌机更新未完成（v${previousVersion} → v${targetVersion}），可在“版本升级”中重试`);
+      await updateReceiptStore.clearPendingCoreUpdate();
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeLog(`[更新] 检查本机更新记录失败：${message}`, 'Yellow');
+  }
+  try {
+    const result = await service.get();
+    if (opened || applicationQuitRequested) return;
+    // An open panel shows the update dialog on its own next poll.
+    if (adminWindow && !adminWindow.isDestroyed()) return;
+    if (result.items.some(item => item.canUpdate && !item.manualUpdate)) {
       createAdminWindow('updates');
     }
   } catch {
     // A failed optional network check must not interrupt startup.
   }
-}
-
-function setAppUpdateDownloadStatus(
-  patch: Partial<Omit<AppUpdateDownloadStatus, 'updatedAt'>>
-): void {
-  appUpdateDownloadStatus = {
-    ...appUpdateDownloadStatus,
-    ...patch,
-    updatedAt: new Date().toISOString()
-  };
 }
 
 function setGlobalStatus(msg: string) {
@@ -394,135 +590,53 @@ function releaseConnectorMaintenanceStatus(owner: number): void {
   connectorMaintenanceStatus = '';
 }
 
-function writeLog(message: string, color: string = 'Gray') {
-  console.log(`[${color}] ${message}`);
+function appendSysLog(message: string, color: string, at = Date.now()): void {
   sysLogs.push({
-    Time: new Date().toLocaleTimeString(),
+    Seq: nextLogSeq++,
+    Time: new Date(at).toLocaleTimeString(),
     Color: color,
     Message: message
   });
-  if (sysLogs.length > 100) sysLogs.shift();
+  if (sysLogs.length > LOG_RING_LIMIT) sysLogs.splice(0, sysLogs.length - LOG_RING_LIMIT);
 }
 
-function startAppUpdateOperation(): boolean {
-  if (
-    appUpdateOperation
-    || planAppUpdateRequest(appUpdatePhase) === 'already-running'
-  ) {
-    return false;
-  }
-  const releaseUpdateLock = updateInstallationGuard.acquire('core');
-  if (!releaseUpdateLock) return false;
-  appUpdatePhase = markAppUpdateStarted();
-  appUpdateOperation = (async () => {
-    let pendingSaved = false;
-    try {
-      setAppUpdateDownloadStatus({
-        state: 'checking',
-        progress: 0,
-        version: null,
-        message: '正在确认更新版本'
-      });
-      const updateManager = new UpdateManager(
-        'https://app.enkianss.us/update/awoo'
-      );
-      const updateInfo = await updateManager.checkForUpdatesAsync();
-      if (!updateInfo) {
-        appUpdatePhase = markAppUpdateRetryable();
-        setAppUpdateDownloadStatus({
-          state: 'no-update',
-          progress: null,
-          version: null,
-          message: '当前已经是最新版本'
-        });
-        return;
-      }
-
-      const version = String(
-        updateInfo.TargetFullRelease?.Version || ''
-      ) || null;
-      let lastLoggedBucket = -1;
-      setAppUpdateDownloadStatus({
-        state: 'downloading',
-        progress: 0,
-        version,
-        message: '正在下载更新'
-      });
-      setGlobalStatus('🚀 下载更新中...');
-      await updateManager.downloadUpdateAsync(
-        updateInfo,
-        (rawProgress: number) => {
-          const progress = Math.max(
-            0,
-            Math.min(100, Math.floor(Number(rawProgress) || 0))
-          );
-          setAppUpdateDownloadStatus({
-            state: 'downloading',
-            progress,
-            version,
-            message: '正在下载更新'
-          });
-          const bucket = Math.floor(progress / 10);
-          if (bucket > lastLoggedBucket) {
-            lastLoggedBucket = bucket;
-            writeLog(`[更新] 真实下载进度: ${progress}%`, 'DarkGray');
-          }
-        }
-      );
-      if (!version) throw new Error('更新包缺少版本号');
-      await updateReceiptStore.prepareCoreUpdate(app.getVersion(), version);
-      pendingSaved = true;
-      setAppUpdateDownloadStatus({
-        state: 'applying',
-        progress: 100,
-        version,
-        message: '下载完成，正在重启安装'
-      });
-      appUpdatePhase = markAppUpdateApplying();
-      updateManager.waitExitThenApplyUpdate(updateInfo, false, true);
-      // Velopack owns the one final restart.  Keep the phase latched after
-      // this point so duplicate HTTP requests cannot start another updater.
-      appUpdatePhase = markAppUpdateExitRequested();
-      requestApplicationQuit();
-    } catch (error: unknown) {
-      if (pendingSaved) {
-        await updateReceiptStore.clearPendingCoreUpdate().catch(() => undefined);
-      }
-      appUpdatePhase = markAppUpdateRetryable();
-      const message = error instanceof Error
-        ? error.message
-        : String(error);
-      setAppUpdateDownloadStatus({
-        state: 'error',
-        progress: null,
-        version: null,
-        message: `更新失败：${message}`
-      });
-      setGlobalStatus('❌ 更新失败');
-      writeLog(`[更新] ${message}`, 'Red');
-    }
-  })().finally(() => {
-    // Once Velopack owns the final restart, keep both gates closed until this
-    // old process has actually exited. Failed/no-update attempts are retryable.
-    if (appUpdatePhase !== 'exit-requested') {
-      appUpdateOperation = null;
-      releaseUpdateLock();
-    }
-  });
-  return true;
+function writeLog(message: string, color: string = 'Gray') {
+  console.log(`[${color}] ${message}`);
+  const at = Date.now();
+  appendSysLog(message, color, at);
+  logSink.write({ message, color, at });
 }
+
+/** A failing log file is shown in the logs panel only; writing it to the file again would loop. */
+function reportLogSinkError(error: unknown): void {
+  console.error('[日志] 无法写入日志文件', error);
+  // The code only: file system messages contain paths with the Windows user name.
+  const code = error && typeof error === 'object' ? (error as NodeJS.ErrnoException).code : undefined;
+  appendSysLog(`[日志] 无法写入日志文件（${code || (error instanceof Error ? error.message : String(error))}）`, 'Yellow');
+}
+
+function writeVelopackLog(level: string, message: string): void {
+  writeLog(`[Velopack] ${message}`, level === 'error' ? 'Red' : level === 'warn' ? 'Yellow' : 'DarkGray');
+}
+
+// From here on Velopack writes straight to the log, so feedback reports carry
+// its own account of a failed update.
+for (const entry of velopackLogBuffer.splice(0)) writeVelopackLog(entry.level, entry.message);
+velopackLogTarget = writeVelopackLog;
 
 process.on('uncaughtException', (err) => {
-  writeLog(`❌ [主进程致命错误]: ${err.message}`, 'Red');
+  writeLog(`❌ [主进程致命错误]: ${describeErrorForLog(err)}`, 'Red');
+  // The process may not get much further; put the stack on disk now.
+  logSink.flushSync();
 });
 
 process.on('unhandledRejection', (reason) => {
-  if (String(reason).includes('could not be cloned')) return;
-  writeLog(`⚠️ [未捕获的 Promise 异常]: ${reason}`, 'Yellow');
+  const description = describeErrorForLog(reason);
+  if (description.includes('could not be cloned')) return;
+  writeLog(`⚠️ [未捕获的 Promise 异常]: ${description}`, 'Yellow');
 });
 
 let overlayWindow: BrowserWindow | null = null;
-let adminWindow: BrowserWindow | null = null;
 let overlayAlwaysOnTop = DEFAULT_OVERLAY_ALWAYS_ON_TOP;
 
 function getOverlayAlwaysOnTop(): boolean {
@@ -595,6 +709,10 @@ function presentAdminWindow() {
 }
 
 function focusExistingWindow(): void {
+  // Starting the app again is how users try to recover a blank window.
+  for (const win of [overlayWindow, adminWindow]) {
+    if (win && !win.isDestroyed() && win.webContents.isCrashed()) win.webContents.reload();
+  }
   if (adminWindow && !adminWindow.isDestroyed()) {
     presentAdminWindow();
     return;
@@ -629,25 +747,177 @@ function parseQuery(qs: string): Record<string, string> {
   return result;
 }
 
+// The renderer documents loadWindow may open; only these receive the internal API token.
+const RENDERER_INDEX_FILE = path.join(__dirname, '../dist/index.html');
+const RENDERER_FALLBACK_INDEX_FILE = path.join(__dirname, '../renderer/index.html');
+
 function loadWindow(win: BrowserWindow, queryParams: string) {
   const devUrl = getDevUrl();
   if (devUrl) {
     const sep = devUrl.includes('?') ? '&' : '?';
     win.loadURL(`${devUrl}${sep}${queryParams}`);
   } else {
-    const indexPath = path.join(__dirname, '../dist/index.html');
-    win.loadFile(indexPath, { query: parseQuery(queryParams) }).catch(() => {
-      win.loadFile(path.join(__dirname, '../renderer/index.html'), { query: parseQuery(queryParams) });
+    win.loadFile(RENDERER_INDEX_FILE, { query: parseQuery(queryParams) }).catch(() => {
+      win.loadFile(RENDERER_FALLBACK_INDEX_FILE, { query: parseQuery(queryParams) });
     });
   }
+}
+
+// webContents ids of the overlay and admin windows.  Ids are never reused, and
+// one is dropped only once its webContents is gone, so a keepalive flush sent
+// while a window closes still counts as trusted.
+const trustedRendererWebContentsIds = new Set<number>();
+
+function trustRendererWindow(win: BrowserWindow): void {
+  const { id } = win.webContents;
+  trustedRendererWebContentsIds.add(id);
+  win.webContents.once('destroyed', () => trustedRendererWebContentsIds.delete(id));
+}
+
+/**
+ * Links never open in-app Electron windows, which would share the app session:
+ * the project's own pages go to the system browser and everything else is
+ * refused.  A window also never navigates away from the app's renderer, while
+ * sub-frames such as the Mod UI preview keep navigating freely.
+ */
+function hardenWebContents(contents: WebContents): void {
+  contents.setWindowOpenHandler(({ url }) => {
+    if (isAllowedExternalUrl(url, { isMarketplaceOrigin: isAllowedSkinMarketplaceOrigin })) {
+      shell.openExternal(url).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        writeLog(`[窗口] 无法用系统浏览器打开 ${describeUrlForLog(url)}：${message}`, 'Yellow');
+      });
+    } else {
+      writeLog(`[窗口] 已阻止打开链接：${describeUrlForLog(url)}`, 'Yellow');
+    }
+    return { action: 'deny' };
+  });
+  // DevTools runs in a web contents of its own and reloads itself.
+  if (contents.getType() === 'remote') return;
+  contents.on('will-navigate', event => {
+    if (isAppNavigationUrl(event.url, {
+      rendererFiles: [RENDERER_INDEX_FILE, RENDERER_FALLBACK_INDEX_FILE],
+      devUrl: getDevUrl()
+    })) return;
+    event.preventDefault();
+    writeLog(`[窗口] 已阻止页面跳转：${describeUrlForLog(event.url)}`, 'Yellow');
+  });
+}
+
+app.on('web-contents-created', (_event, contents) => hardenWebContents(contents));
+
+type AppWindowKind = 'overlay' | 'admin';
+
+const APP_WINDOW_LABELS: Record<AppWindowKind, string> = {
+  overlay: '点歌悬浮窗',
+  admin: '控制面板'
+};
+// One guard per window role, kept across reloads and re-created windows.
+const rendererCrashGuards: Record<AppWindowKind, CrashLoopGuard> = {
+  overlay: createCrashLoopGuard(),
+  admin: createCrashLoopGuard()
+};
+// Deferred so a renderer that dies while loading cannot restart in a tight loop.
+const RENDERER_RECOVERY_DELAY_MS = 1000;
+
+/**
+ * Brings a window back after its renderer dies or hangs.  The frameless
+ * transparent overlay has no frame to close, so a dead renderer would
+ * otherwise leave an invisible window that only ending the process removes.
+ */
+function watchRendererHealth(win: BrowserWindow, kind: AppWindowKind): void {
+  const label = APP_WINDOW_LABELS[kind];
+  const contents = win.webContents;
+  let unresponsivePrompt: AbortController | null = null;
+  contents.on('render-process-gone', (_event, details) => {
+    const clean = details.reason === 'clean-exit';
+    writeLog(
+      `[窗口] ${label}渲染进程已退出（${details.reason}，退出码 ${details.exitCode}）`,
+      clean ? 'DarkGray' : 'Red'
+    );
+    unresponsivePrompt?.abort();
+    if (clean || applicationQuitRequested) return;
+    const recovery = rendererCrashGuards[kind].record(Date.now());
+    setTimeout(() => {
+      if (applicationQuitRequested || win.isDestroyed() || contents.isDestroyed()) return;
+      // A renderer lost before its page committed has nothing to reload.
+      if (recovery === 'reload' && contents.getURL()) {
+        writeLog(`[窗口] 正在重新加载${label}`, 'Yellow');
+        contents.reload();
+        return;
+      }
+      writeLog(
+        `[窗口] ${label}${recovery === 'reload' ? '页面尚未加载' : '短时间内多次崩溃'}，正在重建窗口`,
+        'Yellow'
+      );
+      recreateAppWindow(win, kind);
+    }, RENDERER_RECOVERY_DELAY_MS);
+  });
+  contents.on('unresponsive', () => {
+    writeLog(`[窗口] ${label}没有响应`, 'Yellow');
+    if (unresponsivePrompt || applicationQuitRequested || win.isDestroyed()) return;
+    const prompt = new AbortController();
+    unresponsivePrompt = prompt;
+    // Asynchronous: the main process, API and players keep running meanwhile.
+    void dialog.showMessageBox(win, {
+      type: 'warning',
+      title: '嗷呜点歌机',
+      message: `${label}暂时没有响应`,
+      detail: '可以继续等待，或重新加载这个窗口。',
+      buttons: ['重新加载', '继续等待'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      signal: prompt.signal
+    }).then(({ response }) => {
+      if (unresponsivePrompt === prompt) unresponsivePrompt = null;
+      if (response !== 0 || win.isDestroyed() || contents.isDestroyed()) return;
+      writeLog(`[窗口] 已按用户选择重新加载${label}`, 'Yellow');
+      // A hung renderer cannot reload itself; ending it lets the crash
+      // recovery above reload the page in a new process.
+      contents.forcefullyCrashRenderer();
+    }, () => {
+      if (unresponsivePrompt === prompt) unresponsivePrompt = null;
+    });
+  });
+  contents.on('responsive', () => {
+    writeLog(`[窗口] ${label}已恢复响应`, 'DarkGray');
+    unresponsivePrompt?.abort();
+  });
+}
+
+/**
+ * Replaces a window whose renderer keeps crashing through the regular create
+ * function, so the new one is trusted and watched again.  The replacement
+ * exists before the old window is destroyed: closing the last window, or the
+ * overlay itself, would otherwise quit the app.
+ */
+function recreateAppWindow(crashed: BrowserWindow, kind: AppWindowKind): void {
+  if (kind === 'overlay') {
+    if (overlayWindow !== crashed) return;
+    const bounds = crashed.getBounds();
+    createOverlayWindow();
+    overlayWindow?.setBounds(bounds);
+  } else {
+    if (adminWindow !== crashed) return;
+    adminWindow = null;
+    createAdminWindow();
+  }
+  crashed.destroy();
 }
 
 const DEFAULT_OVERLAY_SIZE = { width: 400, height: 580 };
 const MIN_OVERLAY_SIZE = { width: 280, height: 380 };
 
-function normalizeWindowDimension(value: unknown, fallback: number, minimum: number): number {
+function normalizeWindowDimension(
+  value: unknown,
+  fallback: number,
+  minimum: number,
+  maximum = Number.POSITIVE_INFINITY
+): number {
+  // The minimum wins on a screen smaller than the minimum overlay.
   return typeof value === 'number' && Number.isFinite(value)
-    ? Math.max(minimum, Math.round(value))
+    ? Math.max(minimum, Math.min(maximum, Math.round(value)))
     : fallback;
 }
 
@@ -674,13 +944,85 @@ function createOverlayWindow() {
       sandbox: true
     }
   });
+  trustRendererWindow(overlayWindow);
+  watchRendererHealth(overlayWindow, 'overlay');
+  flushPendingWritesAtSessionEnd(overlayWindow);
   syncOverlayAlwaysOnTop();
   const initialWindow = overlayWindow;
   initialWindow.once('ready-to-show', () => {
     if (!initialWindow.isDestroyed()) initialWindow.show();
   });
   loadWindow(overlayWindow, 'mode=electron');
-  overlayWindow.on('closed', () => { overlayWindow = null; requestApplicationQuit(); });
+  overlayWindow.on('closed', () => {
+    // An overlay replaced after renderer crashes does not end the app.
+    if (overlayWindow !== initialWindow) return;
+    overlayWindow = null;
+    requestApplicationQuit();
+  });
+}
+
+/** The height of .studio-titlebar in src/admin-ui.css. */
+const ADMIN_TITLE_BAR_HEIGHT = 36;
+const ADMIN_WINDOW_COLORS: Record<UiColorMode, { background: string; symbol: string }> = {
+  dark: { background: '#0c1423', symbol: '#d9e8f8' },
+  light: { background: '#f5faff', symbol: '#244766' }
+};
+
+/** Caption buttons in the colours and height of the control panel's own title bar. */
+function adminTitleBarOverlay(mode: UiColorMode): Electron.TitleBarOverlay {
+  const colors = ADMIN_WINDOW_COLORS[mode];
+  return { color: colors.background, symbolColor: colors.symbol, height: ADMIN_TITLE_BAR_HEIGHT };
+}
+
+const ADMIN_CLOSE_FLUSH_TIMEOUT_MS = 1500;
+let adminFlushRequestSequence = 0;
+/** The flush a panel is still answering; closing it and quitting share it. */
+const adminPendingSaveFlushes = new WeakMap<BrowserWindow, Promise<void>>();
+
+/** Asks the control panel to send its debounced edits; never blocks closing for long. */
+function flushAdminPendingSaves(win: BrowserWindow): Promise<void> {
+  const running = adminPendingSaveFlushes.get(win);
+  if (running) return running;
+  const flush = new Promise<void>(resolve => {
+    const requestId = ++adminFlushRequestSequence;
+    const contents = win.webContents;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      ipcMain.removeListener('admin-pending-saves-flushed', onFlushed);
+      contents.removeListener('destroyed', finish);
+      resolve();
+    };
+    const onFlushed = (event: Electron.IpcMainEvent, id: unknown) => {
+      if (event.sender === contents && id === requestId) finish();
+    };
+    ipcMain.on('admin-pending-saves-flushed', onFlushed);
+    // A panel that is gone can no longer answer.
+    contents.once('destroyed', finish);
+    timer = setTimeout(finish, ADMIN_CLOSE_FLUSH_TIMEOUT_MS);
+    try {
+      contents.send('admin-flush-pending-saves', requestId);
+    } catch {
+      finish();
+    }
+  });
+  adminPendingSaveFlushes.set(win, flush);
+  const forget = () => {
+    if (adminPendingSaveFlushes.get(win) === flush) adminPendingSaveFlushes.delete(win);
+  };
+  void flush.then(forget, forget);
+  return flush;
+}
+
+/**
+ * Windows ends a shutdown, restart or log-off without before-quit or
+ * will-quit, and may end the process right after this event, so the pending
+ * settings and log lines are written now. Every window reports it; the next
+ * flush finds nothing left to write.
+ */
+function flushPendingWritesAtSessionEnd(win: BrowserWindow): void {
+  win.on('session-end', () => flushPendingWrites());
 }
 
 function createAdminWindow(initialTab?: unknown) {
@@ -691,11 +1033,13 @@ function createAdminWindow(initialTab?: unknown) {
     if (tab) adminWindow.webContents.send('admin-navigate', tab);
     return;
   }
+  // Open in the mode the panel last reported, so light mode does not flash dark.
+  const colorMode = normalizeUiColorMode(appConfig.uiColorMode);
   adminWindow = new BrowserWindow({
     width: 900, height: 640, minWidth: 600, minHeight: 420,
     autoHideMenuBar: true, titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#0c1423', symbolColor: '#d9e8f8' },
-    backgroundColor: '#0c1423', resizable: true,
+    titleBarOverlay: adminTitleBarOverlay(colorMode),
+    backgroundColor: ADMIN_WINDOW_COLORS[colorMode].background, resizable: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
       nodeIntegration: false,
@@ -703,6 +1047,9 @@ function createAdminWindow(initialTab?: unknown) {
       sandbox: true
     }
   });
+  trustRendererWindow(adminWindow);
+  watchRendererHealth(adminWindow, 'admin');
+  flushPendingWritesAtSessionEnd(adminWindow);
   adminWindow.once('ready-to-show', () => {
     presentAdminWindow();
   });
@@ -714,7 +1061,24 @@ function createAdminWindow(initialTab?: unknown) {
     syncOverlayAlwaysOnTop();
   });
   adminWindow.on('restore', presentAdminWindow);
+  // Pending edits must be sent before the window goes away: a keepalive request
+  // issued while the frame is being torn down no longer belongs to a trusted
+  // window, so it cannot carry the internal API token.
+  const closingWindow = adminWindow;
+  let pendingSavesFlush: 'idle' | 'flushing' | 'done' = 'idle';
+  closingWindow.on('close', event => {
+    if (pendingSavesFlush === 'done' || applicationQuitRequested) return;
+    event.preventDefault();
+    if (pendingSavesFlush === 'flushing') return;
+    pendingSavesFlush = 'flushing';
+    void flushAdminPendingSaves(closingWindow).finally(() => {
+      pendingSavesFlush = 'done';
+      if (!closingWindow.isDestroyed()) closingWindow.close();
+    });
+  });
   adminWindow.on('closed', () => {
+    // A panel replaced after renderer crashes no longer owns this state.
+    if (adminWindow !== closingWindow) return;
     setAdminWindowTopmost(false);
     adminWindow = null;
     syncOverlayAlwaysOnTop();
@@ -774,11 +1138,17 @@ ipcMain.on('open-admin', (_event, tab) => createAdminWindow(tab));
 ipcMain.on('set-window-color-mode', (event, mode) => {
   if (mode !== 'light' && mode !== 'dark') return;
   const win = BrowserWindow.fromWebContents(event.sender);
+  // Only the control panel reports its mode; the overlay never changes it.
   if (!win || win !== adminWindow) return;
-  const dark = mode === 'dark';
-  win.setBackgroundColor(dark ? '#0c1423' : '#f5faff');
+  const colorMode = normalizeUiColorMode(mode);
+  win.setBackgroundColor(ADMIN_WINDOW_COLORS[colorMode].background);
   if (process.platform === 'win32') {
-    win.setTitleBarOverlay({ color: dark ? '#0c1423' : '#f5faff', symbolColor: dark ? '#d9e8f8' : '#244766' });
+    win.setTitleBarOverlay(adminTitleBarOverlay(colorMode));
+  }
+  if (appConfig.uiColorMode !== colorMode) {
+    // A display preference only; the next panel opens in this mode.
+    appConfig.uiColorMode = colorMode;
+    saveConfig();
   }
 });
 ipcMain.handle('open-external', async (_event, value) => {
@@ -805,8 +1175,10 @@ ipcMain.on('overlay-resize', (event, w, h) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (win && win === overlayWindow) {
     const currentBounds = win.getBounds();
-    const width = normalizeWindowDimension(w, currentBounds.width, MIN_OVERLAY_SIZE.width);
-    const height = normalizeWindowDimension(h, currentBounds.height, MIN_OVERLAY_SIZE.height);
+    // Never larger than the work area of the display the overlay is on.
+    const workArea = screen.getDisplayMatching(currentBounds).workAreaSize;
+    const width = normalizeWindowDimension(w, currentBounds.width, MIN_OVERLAY_SIZE.width, workArea.width);
+    const height = normalizeWindowDimension(h, currentBounds.height, MIN_OVERLAY_SIZE.height, workArea.height);
     win.setBounds({ width, height });
 
     const resizedBounds = win.getBounds();
@@ -823,120 +1195,115 @@ ipcMain.on('overlay-resize', (event, w, h) => {
 
 const CONFIG_PATH = path.join(app.getPath('userData'), 'bili_bot_config.json');
 const CONFIG_EXISTED_AT_STARTUP = fs.existsSync(CONFIG_PATH);
+// Atomic saves (temporary file + rename), a backup of the last file that
+// loaded, and quarantine instead of loss for a damaged file.
+const appConfigStore = createAppConfigStore({ filePath: CONFIG_PATH, log: writeLog });
 const WELCOME_HINT_SENTINEL_PATH = path.join(
   app.getPath('userData'),
   'welcome-hint-shown-v1'
 );
 
-let appConfig: any = {
-  roomId: 0,
-  roomConnectionEnabled: false,
-  myRoomId: 0,
-  biliCookie: '',
-  biliUid: 0,
-  learnedGifts: [],
-  widgetStyle: null,
-  sysConfig: {
-    PlayerType: 'NCM',
-    FoliaToken: '',
-    Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 },
-    GiftRequestRequirements: createEmptyGiftRequestRequirements(),
-    IdleWaitNext: true,
-    ShowPlayerCurrentTrack: true,
-    PauseAfterRequests: false,
-    RequestedSongArtwork: 'bili_avatar',
-    ShowAllDanmaku: false,
-    SuperUsers: [],
-    ExternalHttpEnabled: false,
-    ExternalWebSocketEnabled: false,
-    ExternalApiPort: DEFAULT_EXTERNAL_API_PORT,
-    InternalApiPort: ENV_INTERNAL_API_PORT
-  }
-};
+let appConfig: any = createDefaultAppConfig({ envInternalPort: ENV_INTERNAL_API_PORT });
 
 let biliRoomState: BiliRoomConnectionState = createBiliRoomConnectionState();
 
-function loadConfig() {
-  try {
-    if (fs.existsSync(CONFIG_PATH)) {
-      const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
-      appConfig = { ...appConfig, ...saved };
-
-      // Older configs had no explicit connection switch. Preserve their
-      // previous behaviour only when a room was already configured; a user
-      // who has explicitly disconnected in a newer config stays disconnected
-      // across restarts.
-      const hasRoomConnectionEnabled = Boolean(
-        saved
-        && Object.prototype.hasOwnProperty.call(
-          saved,
-          'roomConnectionEnabled'
-        )
-      );
-      appConfig.roomConnectionEnabled = hasRoomConnectionEnabled
-        ? saved.roomConnectionEnabled === true
-        : Number(appConfig.roomId) > 0;
-      biliRoomState = createBiliRoomConnectionState(appConfig.roomId);
-
-      if (!appConfig.widgetStyle || typeof appConfig.widgetStyle !== 'object' || Array.isArray(appConfig.widgetStyle)) {
-        appConfig.widgetStyle = {};
-      }
-      overlayAlwaysOnTop = normalizeOverlayAlwaysOnTop(appConfig.widgetStyle.alwaysOnTop);
-      appConfig.widgetStyle.alwaysOnTop = overlayAlwaysOnTop;
-
-      if (!appConfig.sysConfig) {
-        appConfig.sysConfig = { PlayerType: 'NCM', FoliaToken: '', Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 }, GiftRequestRequirements: createEmptyGiftRequestRequirements(), IdleWaitNext: true, ShowPlayerCurrentTrack: true, PauseAfterRequests: false, RequestedSongArtwork: 'bili_avatar', ShowAllDanmaku: false, SuperUsers: appConfig.superUsers || [], ExternalHttpEnabled: false, ExternalWebSocketEnabled: false, ExternalApiPort: DEFAULT_EXTERNAL_API_PORT, InternalApiPort: ENV_INTERNAL_API_PORT };
-      }
-      if (!['NCM', 'Kugou', 'QQMusic', 'Folia'].includes(appConfig.sysConfig.PlayerType)) appConfig.sysConfig.PlayerType = 'NCM';
-      if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
-      if (appConfig.sysConfig.ShowPlayerCurrentTrack === undefined) appConfig.sysConfig.ShowPlayerCurrentTrack = true;
-      if (appConfig.sysConfig.PauseAfterRequests === undefined) appConfig.sysConfig.PauseAfterRequests = false;
-      if (!['bili_avatar', 'song_cover'].includes(appConfig.sysConfig.RequestedSongArtwork)) appConfig.sysConfig.RequestedSongArtwork = 'bili_avatar';
-      if (appConfig.sysConfig.ExternalHttpEnabled === undefined) appConfig.sysConfig.ExternalHttpEnabled = false;
-      if (appConfig.sysConfig.ExternalWebSocketEnabled === undefined) appConfig.sysConfig.ExternalWebSocketEnabled = false;
-      appConfig.sysConfig.InternalApiPort = normalizeLocalApiPort(
-        appConfig.sysConfig.InternalApiPort,
-        ENV_INTERNAL_API_PORT
-      );
-      configuredInternalApiPort = appConfig.sysConfig.InternalApiPort;
-      requestedInternalApiPort = configuredInternalApiPort;
-      const apiPort = Number(appConfig.sysConfig.ExternalApiPort);
-      appConfig.sysConfig.ExternalApiPort = (
-        Number.isInteger(apiPort)
-        && apiPort >= 1024
-        && apiPort <= 65535
-      ) ? apiPort : DEFAULT_EXTERNAL_API_PORT;
-      delete appConfig.sysConfig.EnableCDP;
-      delete appConfig.sysConfig.CdpPort;
-      delete appConfig.sysConfig.NcmExePath;
-
-      if (appConfig.sysConfig.CooldownMinutes !== undefined && !appConfig.sysConfig.Cooldowns) {
-        const oldSecs = appConfig.sysConfig.CooldownMinutes * 60;
-        appConfig.sysConfig.Cooldowns = { Normal: oldSecs, Captain: oldSecs, Admiral: oldSecs, Governor: oldSecs };
-        delete appConfig.sysConfig.CooldownMinutes;
-      }
-      appConfig.sysConfig.GiftRequestRequirements =
-        normalizeGiftRequestRequirements(
-          appConfig.sysConfig.GiftRequestRequirements
-        );
-      appConfig.learnedGifts = normalizeLearnedGifts(
-        appConfig.learnedGifts
-      );
-
-      biliCookie = appConfig.biliCookie || '';
-      biliUid = appConfig.biliUid || 0;
-      writeLog(`✅ 已加载本地配置，当前缓存的直播间为: ${appConfig.roomId}`, 'Green');
-      if (!hasRoomConnectionEnabled) saveConfig();
-    }
-  } catch { writeLog('加载配置失败', 'Red'); }
+function reportConfigLoadProblem(loaded: AppConfigLoadResult): void {
+  const preserved = loaded.quarantinePath
+    ? `，原文件已另存为 ${path.basename(loaded.quarantinePath)}`
+    : '';
+  if (loaded.status === 'recovered-from-backup') {
+    writeLog(`⚠️ [配置] 配置文件已损坏（${loaded.error}）${preserved}，已从上次成功加载时的备份恢复设置`, 'Yellow');
+  } else if (loaded.status === 'corrupt-reset') {
+    // A damaged file that could not be preserved blocks every save of this
+    // run, so asking the user to set things up again here would be lost work.
+    writeLog(
+      loaded.quarantinePath
+        ? `❌ [配置] 配置文件已损坏（${loaded.error}）且没有可用的备份${preserved}；`
+          + '当前使用默认设置，请重新扫码登录并设置直播间'
+        : `❌ [配置] 配置文件已损坏（${loaded.error}）且没有可用的备份，原文件也无法另存；`
+          + '为免覆盖它，本次运行中的设置更改都不会保存。'
+          + `请修复或移走 ${path.basename(appConfigStore.filePath)} 后重启点歌机`,
+      'Red'
+    );
+  } else if (loaded.status === 'unreadable') {
+    writeLog(
+      `❌ [配置] 无法读取配置文件（${loaded.error}），本次运行不会保存设置，以免覆盖它`
+        + (loaded.config ? '；已临时使用备份中的设置' : '；当前使用默认设置'),
+      'Red'
+    );
+  }
 }
 
-function saveConfig() {
+function loadConfig() {
+  const loaded = appConfigStore.load();
+  reportConfigLoadProblem(loaded);
+  const saved = loaded.config;
+  // No file (or nothing usable): keep the defaults, as for a first start.
+  if (!saved) return;
   try {
-    appConfig.biliCookie = biliCookie;
-    appConfig.biliUid = biliUid;
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(appConfig, null, 2));
-  } catch { writeLog('保存配置失败', 'Red'); }
+    appConfig = { ...appConfig, ...saved };
+    appConfig.roomId = normalizeRoomId(saved.roomId, 0);
+
+    // Older configs had no explicit connection switch. Preserve their
+    // previous behaviour only when a room was already configured; a user
+    // who has explicitly disconnected in a newer config stays disconnected
+    // across restarts.
+    const hasRoomConnectionEnabled = Object.prototype.hasOwnProperty.call(
+      saved,
+      'roomConnectionEnabled'
+    );
+    appConfig.roomConnectionEnabled = hasRoomConnectionEnabled
+      ? saved.roomConnectionEnabled === true
+      : appConfig.roomId > 0;
+    biliRoomState = createBiliRoomConnectionState(appConfig.roomId);
+
+    if (!appConfig.widgetStyle || typeof appConfig.widgetStyle !== 'object' || Array.isArray(appConfig.widgetStyle)) {
+      appConfig.widgetStyle = {};
+    }
+    overlayAlwaysOnTop = normalizeOverlayAlwaysOnTop(appConfig.widgetStyle.alwaysOnTop);
+    appConfig.widgetStyle.alwaysOnTop = overlayAlwaysOnTop;
+
+    // Very old configs kept the super users at the top level. As in 1.2.5
+    // they apply only to a saved sysConfig that is empty (null, false, 0 or
+    // ''); a missing or malformed sysConfig never adds anyone.
+    const legacySuperUsers = Object.prototype.hasOwnProperty.call(saved, 'sysConfig') && !saved.sysConfig
+      ? saved.superUsers
+      : undefined;
+    appConfig.sysConfig = normalizeSysConfig(saved.sysConfig, {
+      envInternalPort: ENV_INTERNAL_API_PORT,
+      legacySuperUsers
+    });
+    configuredInternalApiPort = appConfig.sysConfig.InternalApiPort;
+    requestedInternalApiPort = configuredInternalApiPort;
+    appConfig.learnedGifts = normalizeLearnedGifts(
+      appConfig.learnedGifts
+    );
+
+    biliCookie = appConfig.biliCookie || '';
+    biliUid = appConfig.biliUid || 0;
+    writeLog(`✅ 已加载本地配置，当前缓存的直播间为: ${appConfig.roomId}`, 'Green');
+    // Write a migration back at once, and replace a damaged file with the
+    // settings restored from the backup.
+    if (!hasRoomConnectionEnabled || loaded.status === 'recovered-from-backup') saveConfigNow();
+  } catch (error: unknown) {
+    writeLog(`加载配置失败：${describeErrorForLog(error)}`, 'Red');
+  }
+}
+
+function serializeAppConfig(): string {
+  appConfig.biliCookie = biliCookie;
+  appConfig.biliUid = biliUid;
+  return JSON.stringify(appConfig, null, 2);
+}
+
+/** Coalesced save (300 ms) for frequent changes: overlay size, pin, gift capture, colour mode. */
+function saveConfig(): void {
+  appConfigStore.scheduleSave(serializeAppConfig);
+}
+
+/** Immediate save for changes that must survive a crash right after them: login, room, settings. */
+function saveConfigNow(): void {
+  appConfigStore.saveNow(serializeAppConfig);
 }
 
 let isAccepting = true;
@@ -1209,9 +1576,19 @@ const playerManager = new PlayerManager({
     ) {
       playerControlNotice = null;
     }
+    const noticeBeforeHold = playerControlNotice;
     if (!holdUnsupportedQqQueue() && playerControlNotice?.kind === 'compatibility') {
       playerControlNotice = null;
       if (state.connected) setGlobalStatus('QQ 音乐点歌插入已恢复可用');
+    }
+    if (
+      playerControlNotice?.kind === 'compatibility'
+      && playerControlNotice !== noticeBeforeHold
+    ) {
+      // A newly detected unsupported QQ build. The queue is held, so newer
+      // profiles or a matching connector can be applied without interrupting
+      // anything in flight.
+      scheduleQqCompatibilityRecovery();
     }
     if (!state.connected) {
       clearDeferredQqInsert();
@@ -1330,8 +1707,60 @@ let giftLearningStartedAt = 0;
 let giftLearningExpiresAt = 0;
 let giftLearningCaptured: LearnedGift[] = [];
 let giftLearningDiagnostics = createGiftLearningDiagnostics();
-let giftLibrarySaveTimer: NodeJS.Timeout | null = null;
 let recentRejects: { id: number, user: any, reason: string }[] = [];
+const requestNotificationStore = new RequestNotificationStore();
+
+interface RequestFeedbackOperation {
+  id: string;
+  action: 'request' | 'cancel';
+  title: string;
+  requestedBy: string;
+  completed: boolean;
+}
+
+function beginRequestFeedback(
+  user: any,
+  action: RequestFeedbackOperation['action'],
+  title: string
+): RequestFeedbackOperation {
+  const requestedBy = String(user.name || user.uname || '观众');
+  const id = requestNotificationStore.publish({
+    kind: 'waiting', action, title, requestedBy,
+    message: action === 'cancel' ? '正在等待撤回处理' : '正在等待点歌处理'
+  });
+  return { id, action, title, requestedBy, completed: false };
+}
+
+function updateRequestFeedback(
+  operation: RequestFeedbackOperation | null | undefined,
+  kind: RequestNotificationKind,
+  message: string,
+  title = operation?.title || ''
+): void {
+  if (!operation) return;
+  operation.title = title;
+  operation.completed = kind !== 'waiting';
+  requestNotificationStore.publish({
+    id: operation.id, kind, action: operation.action, title, message,
+    requestedBy: operation.requestedBy
+  });
+}
+
+function failRequestFeedback(
+  operation: RequestFeedbackOperation | null | undefined,
+  reason: string
+): void {
+  if (!operation) return;
+  const label = operation.action === 'cancel' ? '撤回失败' : '点歌失败';
+  updateRequestFeedback(operation, 'error', reason.startsWith(label) ? reason : `${label}：${reason}`);
+}
+
+/** Completes feedback without a result card, removing its waiting notice. */
+function dismissRequestFeedback(operation: RequestFeedbackOperation | null | undefined): void {
+  if (!operation) return;
+  operation.completed = true;
+  requestNotificationStore.remove(operation.id);
+}
 
 function isGiftLearningActive(now = Date.now()): boolean {
   return giftLearningExpiresAt > now;
@@ -1371,11 +1800,8 @@ function getGiftLearningState(now = Date.now()) {
 }
 
 function scheduleGiftLibrarySave(): void {
-  if (giftLibrarySaveTimer) clearTimeout(giftLibrarySaveTimer);
-  giftLibrarySaveTimer = setTimeout(() => {
-    giftLibrarySaveTimer = null;
-    saveConfig();
-  }, 300);
+  // A burst of captured gifts becomes one write; quitting flushes it.
+  saveConfig();
 }
 
 function startGiftLearning(): { success: boolean; message?: string } {
@@ -1403,13 +1829,9 @@ function stopGiftLearning(): void {
 }
 
 function clearLearnedGiftLibrary(): void {
-  if (giftLibrarySaveTimer) {
-    clearTimeout(giftLibrarySaveTimer);
-    giftLibrarySaveTimer = null;
-  }
   appConfig.learnedGifts = [];
   giftLearningCaptured = [];
-  saveConfig();
+  saveConfigNow();
   writeLog('[礼物学习] 已清空本地礼物缓存', 'DarkGray');
 }
 
@@ -1490,12 +1912,29 @@ function claimGiftEvent(event: BilibiliGiftCreditEvent): boolean {
   return true;
 }
 
-async function addReject(user: any, reason: string) {
-  const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
-  const rejectItem = { id: Date.now() + Math.random(), user: { ...user, avatar: avatarUrl }, reason };
+async function addReject(
+  user: any,
+  reason: string,
+  operation?: RequestFeedbackOperation | null
+) {
+  // Publish immediately; an optional avatar lookup must not delay UI feedback.
+  failRequestFeedback(operation, reason);
+  const uid = String(user.uid || '');
+  const knownAvatar = user.avatar || biliAvatarCache.peek(uid);
+  const rejectItem = {
+    id: Date.now() + Math.random(),
+    user: { ...user, avatar: knownAvatar || AVATAR_PLACEHOLDER },
+    reason
+  };
   recentRejects.push(rejectItem);
   if (recentRejects.length > 5) recentRejects.shift();
   setTimeout(() => { recentRejects = recentRejects.filter(r => r.id !== rejectItem.id); }, 5000);
+  // The serialized danmaku command queue never waits for an avatar lookup.
+  if (!knownAvatar) {
+    void getBiliAvatar(uid).then(avatarUrl => {
+      if (recentRejects.includes(rejectItem)) rejectItem.user.avatar = avatarUrl;
+    });
+  }
 }
 
 // ==========================================
@@ -1506,6 +1945,11 @@ let biliPingTimer: NodeJS.Timeout | null = null;
 let biliReconnectTimer: NodeJS.Timeout | null = null;
 let biliConnectionTimer: NodeJS.Timeout | null = null;
 let biliRoomSession = 0;
+/** When the current socket last received anything; heartbeat replies (op=3) included. */
+let lastBiliPacketAt = 0;
+/** Token refreshes since the last successful authentication of this session. */
+let biliRoomRefreshAttempt = 0;
+const danmakuReceptionTracker = new DanmakuReceptionTracker();
 let biliConnectionAttempt: {
   session: number;
   resolve: (connected: boolean) => void;
@@ -1514,7 +1958,15 @@ let biliConnectionAttempt: {
 function dispatchBiliRoomConnectionEvent(
   event: BiliRoomConnectionEvent
 ): void {
+  const previousSession = biliRoomState.session;
+  const previousRoom = biliRoomState.realRoomId || biliRoomState.requestedRoomId;
+  const previousStatus = biliRoomState.status;
   biliRoomState = reduceBiliRoomConnectionState(biliRoomState, event);
+  const room = biliRoomState.realRoomId || biliRoomState.requestedRoomId;
+  if (previousSession !== biliRoomState.session || previousRoom !== room
+      || (previousStatus === 'connected' && biliRoomState.status !== 'connected')) {
+    danmakuReceptionTracker.resetSession(biliRoomState.session, room);
+  }
 }
 
 function getBiliRoomConnectionInfo() {
@@ -1579,6 +2031,7 @@ function invalidateBiliRoomTransport(): number {
   clearBiliConnectionTimers();
   clearBiliPingTimer();
   closeCurrentBiliWebSocket();
+  biliRoomRefreshAttempt = 0;
   dispatchBiliRoomConnectionEvent({
     type: 'disconnect-requested',
     session,
@@ -1590,7 +2043,7 @@ function invalidateBiliRoomTransport(): number {
 function disconnectFromLiveRoom(): void {
   appConfig.roomConnectionEnabled = false;
   invalidateBiliRoomTransport();
-  saveConfig();
+  saveConfigNow();
   setGlobalStatus(BILI_ROOM_CONNECTION_MESSAGES.disconnected);
   writeLog('[Bilibili] 已断开直播间连接，已停止自动重连', 'DarkGray');
 }
@@ -1607,16 +2060,18 @@ function logoutBiliAccount() {
   biliCookie = '';
   biliUid = 0;
   currentUserInfo = createEmptyBiliUserInfo();
-  saveConfig();
+  saveConfigNow();
   writeLog('[Bilibili] 已退出登录并清除本地账号凭据', 'Green');
   if (appConfig.roomConnectionEnabled === true && appConfig.roomId) {
     void connectToLiveRoom(appConfig.roomId, { enable: false }).then(connected => {
-      writeLog(
-        connected
-          ? '[Bilibili] 已自动切换为游客弹幕连接'
-          : '[Bilibili] 游客弹幕自动重连失败，请手动重试',
-        connected ? 'Green' : 'Yellow'
-      );
+      if (connected) {
+        writeLog('[Bilibili] 已自动切换为游客弹幕连接', 'Green');
+      } else if (isBiliRoomRetryPending()) {
+        // A network failure is retried in the background.
+        writeLog('[Bilibili] 游客弹幕暂未连接成功，将自动重试', 'Yellow');
+      } else if (appConfig.roomConnectionEnabled === true) {
+        writeLog('[Bilibili] 游客弹幕自动重连失败，请手动重试', 'Yellow');
+      }
     });
   }
 }
@@ -1660,9 +2115,146 @@ interface ConnectToLiveRoomOptions {
   enable?: boolean;
 }
 
+type BiliDanmuAuthResult =
+  | { ok: true; authObj: Record<string, unknown>; endpoints: BiliDanmuEndpoint[] }
+  | { ok: false; log: string; message: string };
+
+function createBiliRoomRequestHeaders(roomId: number): Record<string, string> {
+  const headers: Record<string, string> = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": `https://live.bilibili.com/${roomId}`,
+    "Accept": "application/json, text/plain, */*"
+  };
+  if (biliCookie) headers["Cookie"] = biliCookie;
+  return headers;
+}
+
+/**
+ * Fetches a danmaku token and host list for a resolved room. It neither logs
+ * nor uses the result itself: the caller checks its session first.
+ */
+async function fetchBiliDanmuAuth(
+  realRoomId: number,
+  headers: Record<string, string>
+): Promise<BiliDanmuAuthResult> {
+  const danmuData = await fetchBiliDanmuInfoWithFallback(
+    fetchWithTimeout,
+    realRoomId,
+    {
+      headers,
+      onWbiFailure: message => writeLog(
+        `[Bilibili] WBI 弹幕鉴权不可用（${message}），尝试兼容接口`,
+        'Yellow'
+      )
+    }
+  ) as any;
+
+  const token = danmuData.data?.token || "";
+  if (danmuData.code !== 0 || !token) {
+    return {
+      ok: false,
+      log: `[Bilibili] 无法获取弹幕鉴权信息，code=${danmuData.code}`,
+      message: '连接失败：无法取得弹幕鉴权'
+    };
+  }
+
+  const endpoints = getBiliDanmuEndpoints(danmuData);
+  if (endpoints.length === 0) {
+    return {
+      ok: false,
+      log: '[Bilibili] 接口未返回可用的弹幕节点',
+      message: '连接失败：没有可用的弹幕节点'
+    };
+  }
+
+  let finalBuvid = "999E9060-EA3F-0F79-7BDC-A14879D11DCB95434infoc";
+  const b3Match = biliCookie.match(/buvid3=([^;]+)/);
+  if (b3Match) finalBuvid = b3Match[1];
+
+  return {
+    ok: true,
+    authObj: {
+      uid: biliUid || 0,
+      roomid: realRoomId,
+      // This complete web-client auth combination was verified to receive
+      // SEND_GIFT_V2; the previous combination received only widget/rank updates.
+      protover: 2,
+      buvid: finalBuvid,
+      support_ack: true,
+      platform: 'web',
+      queue_uuid: randomBytes(4).toString('hex'),
+      scene: 'room',
+      type: 2,
+      key: token
+    },
+    endpoints
+  };
+}
+
+/**
+ * After a whole round of endpoints failed, fetches a fresh token and host
+ * list for the same room within the same session, then starts the next
+ * round: a token can expire during a long stream. A failed refresh retries
+ * with the previous token, as every retry did before.
+ */
+async function refreshBiliRoomAuth(
+  session: number,
+  realRoomId: number,
+  previousAuth: any,
+  previousEndpoints: BiliDanmuEndpoint[]
+): Promise<void> {
+  if (!isBiliRoomSessionCurrent(session)) return;
+  let authObj = previousAuth;
+  let endpoints = previousEndpoints;
+  try {
+    const auth = await fetchBiliDanmuAuth(
+      realRoomId,
+      createBiliRoomRequestHeaders(Number(appConfig.roomId) || realRoomId)
+    );
+    if (!isBiliRoomSessionCurrent(session)) return;
+    if (auth.ok) {
+      authObj = auth.authObj;
+      endpoints = auth.endpoints;
+      writeLog('[Bilibili] 已重新获取弹幕鉴权和节点列表', 'DarkGray');
+    } else {
+      writeLog(`${auth.log}，继续使用上次的鉴权信息重试`, 'Yellow');
+    }
+  } catch (error: any) {
+    if (!isBiliRoomSessionCurrent(session)) return;
+    writeLog(`[Bilibili] 刷新弹幕鉴权失败：${error?.message || error}，继续使用上次的鉴权信息重试`, 'Yellow');
+  }
+  startBiliWebSocket(authObj, endpoints, 0, session, 0, realRoomId);
+}
+
+/** The refresh after a failed round waits 5 s, 15 s, 30 s, then 60 s until a socket authenticates. */
+function scheduleBiliRoomRefresh(
+  session: number,
+  realRoomId: number,
+  authObj: any,
+  endpoints: BiliDanmuEndpoint[]
+): void {
+  if (!isBiliRoomSessionCurrent(session)) return;
+  const delayMs = nextRoomRefreshDelayMs(biliRoomRefreshAttempt);
+  biliRoomRefreshAttempt += 1;
+  writeLog(`[Bilibili] ${Math.round(delayMs / 1000)} 秒后重新获取弹幕鉴权并重连`, 'DarkGray');
+  biliReconnectTimer = setTimeout(() => {
+    biliReconnectTimer = null;
+    void refreshBiliRoomAuth(session, realRoomId, authObj, endpoints);
+  }, delayMs);
+}
+
 function isBiliRoomSessionCurrent(session: number): boolean {
   return session === biliRoomSession
     && appConfig.roomConnectionEnabled === true;
+}
+
+/**
+ * Whether the room will be tried again on its own. After a connection
+ * attempt has failed, the only timer left is the retry of a failed request
+ * or of a failed round of endpoints; disconnecting clears it.
+ */
+function isBiliRoomRetryPending(): boolean {
+  return biliReconnectTimer !== null && appConfig.roomConnectionEnabled === true;
 }
 
 function failBiliRoomConnection(session: number, message: string): void {
@@ -1698,100 +2290,82 @@ async function connectToLiveRoom(
     session,
     requestedRoomId: normalizedRoomId
   });
-  saveConfig();
+  saveConfigNow();
 
   const connection = new Promise<boolean>(resolve => {
     biliConnectionAttempt = { session, resolve };
   });
 
-  void (async () => {
-    try {
-      const headers: Record<string, string> = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": `https://live.bilibili.com/${normalizedRoomId}`,
-        "Accept": "application/json, text/plain, */*"
-      };
-      if (biliCookie) headers["Cookie"] = biliCookie;
-
-      const initRes = await fetchWithTimeout(
-        `https://api.live.bilibili.com/room/v1/Room/room_init?id=${normalizedRoomId}`,
-        { headers }
-      );
-      const initData: any = await initRes.json();
-      if (!isBiliRoomSessionCurrent(session)) return;
-      if (initData.code !== 0) {
-        writeLog(`[Bilibili] 房间初始化失败，code=${initData.code}`, 'Yellow');
-        failBiliRoomConnection(session, '连接失败：房间号无效或不可用');
-        return;
-      }
-
-      const realRoomId = Number(initData.data?.room_id) || normalizedRoomId;
-      dispatchBiliRoomConnectionEvent({
-        type: 'room-resolved',
-        session,
-        realRoomId
-      });
-      const danmuData = await fetchBiliDanmuInfoWithFallback(
-        fetchWithTimeout,
-        realRoomId,
-        {
-          headers,
-          onWbiFailure: message => writeLog(
-            `[Bilibili] WBI 弹幕鉴权不可用（${message}），尝试兼容接口`,
-            'Yellow'
-          )
-        }
-      ) as any;
-      if (!isBiliRoomSessionCurrent(session)) return;
-
-      const token = danmuData.data?.token || "";
-      if (danmuData.code !== 0 || !token) {
-        writeLog(`[Bilibili] 无法获取弹幕鉴权信息，code=${danmuData.code}`, 'Red');
-        failBiliRoomConnection(session, '连接失败：无法取得弹幕鉴权');
-        return;
-      }
-
-      const endpoints = getBiliDanmuEndpoints(danmuData);
-      if (endpoints.length === 0) {
-        writeLog('[Bilibili] 接口未返回可用的弹幕节点', 'Red');
-        failBiliRoomConnection(session, '连接失败：没有可用的弹幕节点');
-        return;
-      }
-
-      let finalBuvid = "999E9060-EA3F-0F79-7BDC-A14879D11DCB95434infoc";
-      const b3Match = biliCookie.match(/buvid3=([^;]+)/);
-      if (b3Match) finalBuvid = b3Match[1];
-
-      startBiliWebSocket(
-        {
-          uid: biliUid || 0,
-          roomid: realRoomId,
-          // This complete web-client auth combination was verified to receive
-          // SEND_GIFT_V2; the previous combination received only widget/rank updates.
-          protover: 2,
-          buvid: finalBuvid,
-          support_ack: true,
-          platform: 'web',
-          queue_uuid: randomBytes(4).toString('hex'),
-          scene: 'room',
-          type: 2,
-          key: token
-        },
-        endpoints,
-        0,
-        session,
-        0,
-        realRoomId
-      );
-    } catch (err: any) {
-      if (!isBiliRoomSessionCurrent(session)) return;
-      const message = err?.message || String(err);
-      writeLog(`[Bilibili] 连接直播间失败：${message}`, 'Red');
-      failBiliRoomConnection(session, `连接失败：${message}`);
-    }
-  })();
+  void openBiliRoomConnection(session, normalizedRoomId);
 
   return await connection;
+}
+
+/**
+ * Resolves the room, fetches a danmaku token and starts the first socket.
+ * Bilibili refusing the room or the token is final; a request that fails or
+ * cannot be read (no network yet, a timeout) is tried again in this session.
+ */
+async function openBiliRoomConnection(session: number, roomId: number): Promise<void> {
+  try {
+    const headers = createBiliRoomRequestHeaders(roomId);
+
+    const initRes = await fetchWithTimeout(
+      `https://api.live.bilibili.com/room/v1/Room/room_init?id=${roomId}`,
+      { headers }
+    );
+    const initData: any = await initRes.json();
+    if (!isBiliRoomSessionCurrent(session)) return;
+    if (initData.code !== 0) {
+      writeLog(`[Bilibili] 房间初始化失败，code=${initData.code}`, 'Yellow');
+      failBiliRoomConnection(session, '连接失败：房间号无效或不可用');
+      return;
+    }
+
+    const realRoomId = Number(initData.data?.room_id) || roomId;
+    dispatchBiliRoomConnectionEvent({
+      type: 'room-resolved',
+      session,
+      realRoomId
+    });
+    const auth = await fetchBiliDanmuAuth(realRoomId, headers);
+    if (!isBiliRoomSessionCurrent(session)) return;
+    if (!auth.ok) {
+      writeLog(auth.log, 'Red');
+      failBiliRoomConnection(session, auth.message);
+      return;
+    }
+
+    startBiliWebSocket(auth.authObj, auth.endpoints, 0, session, 0, realRoomId);
+  } catch (err: any) {
+    if (!isBiliRoomSessionCurrent(session)) return;
+    const message = err?.message || String(err);
+    writeLog(`[Bilibili] 连接直播间失败：${message}`, 'Red');
+    failBiliRoomConnection(session, `连接失败：${message}`);
+    scheduleBiliRoomConnectRetry(session, roomId);
+  }
+}
+
+/**
+ * The retry after a failed request waits like a failed socket round (5 s,
+ * 15 s, 30 s, then 60 s). Disconnecting or choosing another room ends the
+ * session, which clears the timer and stops a retry already under way.
+ */
+function scheduleBiliRoomConnectRetry(session: number, roomId: number): void {
+  if (!isBiliRoomSessionCurrent(session)) return;
+  const delayMs = nextRoomRefreshDelayMs(biliRoomRefreshAttempt);
+  biliRoomRefreshAttempt += 1;
+  writeLog(`[Bilibili] ${Math.round(delayMs / 1000)} 秒后重新连接直播间`, 'DarkGray');
+  biliReconnectTimer = setTimeout(() => {
+    biliReconnectTimer = null;
+    if (!isBiliRoomSessionCurrent(session)) return;
+    dispatchBiliRoomConnectionEvent({
+      type: 'socket-reconnecting',
+      session,
+      message: BILI_ROOM_CONNECTION_MESSAGES.connecting
+    });
+    void openBiliRoomConnection(session, roomId);
+  }, delayMs);
 }
 
 function readBiliAuthReply(buffer: Buffer): { code: number, message?: string } | null {
@@ -1875,11 +2449,13 @@ function startBiliWebSocket(
       }, 1500);
     } else {
       failBiliRoomConnection(session, BILI_ROOM_CONNECTION_MESSAGES.failed);
+      scheduleBiliRoomRefresh(session, realRoomId, authObj, endpoints);
     }
     return;
   }
 
   currentBiliWs = ws;
+  lastBiliPacketAt = Date.now();
   let authenticated = false;
   let reconnectScheduled = false;
 
@@ -1928,16 +2504,10 @@ function startBiliWebSocket(
       }
 
       // Only op=8/code=0 can complete the initial promise. If every node
-      // failed before authentication, expose an error but keep a slow,
-      // session-guarded retry while the user remains connected.
+      // failed, expose an error but keep a slow, session-guarded retry with
+      // a freshly fetched token while the user remains connected.
       failBiliRoomConnection(session, BILI_ROOM_CONNECTION_MESSAGES.failed);
-      if (!isBiliRoomSessionCurrent(session)) return;
-      biliReconnectTimer = setTimeout(() => {
-        biliReconnectTimer = null;
-        if (isBiliRoomSessionCurrent(session)) {
-          startBiliWebSocket(authObj, endpoints, 0, session, 0, realRoomId);
-        }
-      }, 5000);
+      scheduleBiliRoomRefresh(session, realRoomId, authObj, endpoints);
     }, hasNextEndpoint ? 1500 : 1500);
   };
 
@@ -1961,11 +2531,15 @@ function startBiliWebSocket(
 
   const onMessage = async (data: any) => {
     if (currentBiliWs !== ws || !isBiliRoomSessionCurrent(session)) return;
+    lastBiliPacketAt = Date.now();
     let buffer: Buffer;
     if (Buffer.isBuffer(data)) buffer = data;
     else if (data instanceof ArrayBuffer) buffer = Buffer.from(data);
     else if (typeof Blob !== 'undefined' && data instanceof Blob) buffer = Buffer.from(await data.arrayBuffer());
     else buffer = Buffer.from(data);
+    // Blob conversion can yield while a room/socket is replaced. Never let
+    // bytes from the previous connection prove reception in the new session.
+    if (currentBiliWs !== ws || !isBiliRoomSessionCurrent(session)) return;
 
     if (!authenticated) {
       const authReply = readBiliAuthReply(buffer);
@@ -1986,9 +2560,17 @@ function startBiliWebSocket(
           realRoomId
         });
         finishBiliConnectionAttempt(session, true);
+        biliRoomRefreshAttempt = 0;
         writeLog(`✅ [Bilibili] 弹幕节点已鉴权：${endpoint.host}`, 'Green');
         biliPingTimer = setInterval(() => {
-          if (currentBiliWs === ws && ws.readyState === 1) {
+          if (currentBiliWs !== ws) return;
+          // Every heartbeat is answered (op=3). A half-open connection (NAT
+          // timeout, Wi-Fi change) still looks open but delivers nothing.
+          if (shouldReconnectForSilence(lastBiliPacketAt, Date.now())) {
+            scheduleReconnect('心跳超时');
+            return;
+          }
+          if (ws.readyState === 1) {
             const hb = Buffer.alloc(31);
             hb.writeInt32BE(hb.length, 0);
             hb.writeInt16BE(16, 4);
@@ -2113,6 +2695,7 @@ interface QueuedDanmakuCommand {
   user: any;
   message: string;
   enqueuedAt: number;
+  feedback?: RequestFeedbackOperation;
 }
 
 const MAX_DANMAKU_COMMAND_QUEUE = 200;
@@ -2144,12 +2727,17 @@ function enqueueDanmakuCommand(user: any, message: string): void {
     }
   }
 
+  const requestCommand = parseRequestNotificationCommand(normalized);
+  const feedback = requestCommand
+    ? beginRequestFeedback(user, requestCommand.action, requestCommand.title)
+    : undefined;
   if (danmakuCommandQueue.length >= MAX_DANMAKU_COMMAND_QUEUE) {
     writeLog(`[指令队列] 队列已满，已丢弃来自 ${user.uname || user.uid} 的指令`, 'Red');
+    failRequestFeedback(feedback, '等待处理的指令过多，请稍后再试');
     return;
   }
 
-  danmakuCommandQueue.push({ user, message: normalized, enqueuedAt: now });
+  danmakuCommandQueue.push({ user, message: normalized, enqueuedAt: now, feedback });
   void processDanmakuCommandQueue();
 }
 
@@ -2165,12 +2753,20 @@ async function processDanmakuCommandQueue(): Promise<void> {
           `[指令队列] 已丢弃等待超过 90 秒的过期指令：${item.message}`,
           'Yellow'
         );
+        failRequestFeedback(item.feedback, '等待超过 90 秒，请重新发送指令');
         continue;
       }
       try {
-        await handleDanmaku(item.user, item.message);
+        await handleDanmaku(item.user, item.message, item.feedback);
       } catch (err: any) {
         writeLog(`[指令队列] 处理失败: ${err?.message || err}`, 'Red');
+        // A published result (such as an accepted request) or a dismissed
+        // notice is final; never replace it with a later failure.
+        if (!item.feedback?.completed) failRequestFeedback(item.feedback, '处理异常，请稍后再试');
+      } finally {
+        if (item.feedback && !item.feedback.completed) {
+          failRequestFeedback(item.feedback, '请求未完成，请稍后再试');
+        }
       }
     }
   } finally {
@@ -2289,7 +2885,16 @@ function handleRawDanmaku(doc: any, depth = 0) {
   if (cmd.startsWith("DANMU_MSG")) {
     if (appConfig.sysConfig?.ShowAllDanmaku) writeLog(`[RAW原始数据] ${JSON.stringify(doc)}`, 'DarkGray');
     const info = doc.info;
+    if (!Array.isArray(info) || typeof info[1] !== 'string'
+        || !Array.isArray(info[2]) || !info[1].trim()) return;
     const msg = info[1].trim();
+    if (biliRoomState.status === 'connected') {
+      danmakuReceptionTracker.observe(
+        biliRoomSession,
+        biliRoomState.realRoomId || biliRoomState.requestedRoomId,
+        msg
+      );
+    }
     const userBase = info[2];
     const rawUid = typeof userBase[0] === 'number' ? userBase[0].toString() : String(userBase[0]).replace(/"/g, '');
     const uname = userBase[1] || `游客${rawUid.slice(-6)}`;
@@ -2987,8 +3592,44 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
 // 播放器连接与控制实现位于 electron/players。
 // main.ts 只保留业务队列与界面的调用入口。
 const CONNECTOR_MAINTENANCE_INTERVAL_MS = 30 * 60 * 1000;
+/** After a resume the network needs a moment before the catalog is checked. */
+const CONNECTOR_MAINTENANCE_RESUME_DELAY_MS = 60 * 1000;
+/** How long a hot-updated connector may take to reach a running player. */
+const CONNECTOR_UPDATE_CONNECT_TIMEOUT_MS = 30 * 1000;
+const QQ_COMPATIBILITY_RECOVERY_DELAY_MS = 5 * 1000;
+const QQ_COMPATIBILITY_RECOVERY_BUSY_DELAY_MS = 60 * 1000;
+/**
+ * The waits before the second and third attempt for one QQ session. A
+ * profile or catalog check that fails for a network problem reports no
+ * change, so one outage must not use up the only attempt.
+ */
+const QQ_COMPATIBILITY_RECOVERY_RETRY_DELAYS_MS: readonly number[] = [2 * 60 * 1000, 10 * 60 * 1000];
 let connectorMaintenanceTimer: NodeJS.Timeout | null = null;
+let connectorMaintenanceRetryTimer: NodeJS.Timeout | null = null;
+let connectorMaintenanceResumeTimer: NodeJS.Timeout | null = null;
 let connectorMaintenanceRunning = false;
+/**
+ * A background update of the selected connector whose reconnect waits for
+ * idle playback while the previous version keeps running, kept for the
+ * connection check that follows the restart.
+ */
+let deferredConnectorUpdate: {
+  status: ConnectorUpdateStatus;
+  result: PlayerConnectorUpdateResult;
+} | null = null;
+let deferredConnectorRestartTimer: NodeJS.Timeout | null = null;
+let deferredConnectorRestartInFlight: Promise<void> | null = null;
+const connectorMaintenanceFailures: MaintenanceFailureMemo = new Map();
+/** The last logged maintenance decision per connector; repeats stay quiet. */
+const connectorMaintenanceDecisions = new Map<NativeConnectorId, string>();
+/** `connector@version` updates already rolled back in this process. */
+const connectorRollbackAttempts = new Set<string>();
+let qqCompatibilityRecoveryTimer: NodeJS.Timeout | null = null;
+/**
+ * Compatibility recovery attempts per QQ `processId@version` session, and
+ * when the next one is due (null while one runs or when none follows).
+ */
+const qqCompatibilityRecoveryAttempts = new Map<string, { count: number; retryAt: number | null }>();
 let connectorAutoRepairInFlight: Promise<boolean> | null = null;
 let connectorAutoRepairAttemptKey = '';
 let connectorConnectionRecoveryInFlight: Promise<boolean> | null = null;
@@ -3011,17 +3652,26 @@ function getConnectorAutoRepairAttemptKey(
   ].join('|');
 }
 
+/**
+ * `quiet`: a background retry. It skips a player session that was already
+ * attempted without checking the catalog again, and reports failures in the
+ * log only instead of the 4 s global status.
+ */
 async function runConnectorAutoRepair(
-  connectorId: NativeConnectorId
+  connectorId: NativeConnectorId,
+  { quiet = false }: { quiet?: boolean } = {}
 ): Promise<boolean> {
   if (!shouldRunAutomaticConnectorMaintenance(devUserDataDir)) return false;
   if (connectorAutoRepairInFlight) {
     return await connectorAutoRepairInFlight;
   }
 
+  const showStatus = (message: string) => {
+    if (!quiet) setGlobalStatus(message);
+  };
   const operation = (async (): Promise<boolean> => {
     if (connectorId === 'folia') {
-      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      showStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
       return false;
     }
 
@@ -3031,7 +3681,7 @@ async function runConnectorAutoRepair(
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       writeLog(`[连接器兼容恢复] 播放器进程探测失败：${message}`, 'Yellow');
-      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      showStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
       return false;
     }
     if (!processInfo.querySucceeded) {
@@ -3040,7 +3690,7 @@ async function runConnectorAutoRepair(
         + '暂不自动更换连接器。',
         'Yellow'
       );
-      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      showStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
       return false;
     }
 
@@ -3051,7 +3701,7 @@ async function runConnectorAutoRepair(
         + '不会自动升级连接器。',
         'DarkGray'
       );
-      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.playerNotRunning);
+      showStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.playerNotRunning);
       return false;
     }
 
@@ -3061,6 +3711,8 @@ async function runConnectorAutoRepair(
       processInfo.version
     );
     const attempted = connectorAutoRepairAttemptKey === attemptKey;
+    // A background retry of the same player session has nothing new to try.
+    if (attempted && quiet) return false;
     if (!attempted) {
       // Mark the process session before fetching the catalog. Any subsequent
       // failure/event burst for this same player can therefore not re-enter
@@ -3074,7 +3726,7 @@ async function runConnectorAutoRepair(
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       writeLog(`[连接器兼容恢复] 刷新连接器清单失败：${message}`, 'Yellow');
-      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      showStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
       return false;
     }
     const status = statuses.find(item => item.id === connectorId);
@@ -3112,7 +3764,7 @@ async function runConnectorAutoRepair(
           'DarkGray'
         );
       }
-      setGlobalStatus(plan.message);
+      showStatus(plan.message);
       return false;
     }
 
@@ -3140,12 +3792,12 @@ async function runConnectorAutoRepair(
         setGlobalStatus(result.message);
         return true;
       }
-      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      showStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
       return false;
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       writeLog(`[连接器兼容恢复] 自动修复失败：${message}`, 'Yellow');
-      setGlobalStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
+      showStatus(CONNECTOR_AUTO_REPAIR_MESSAGES.failed);
       return false;
     } finally {
       releaseConnectorMaintenanceStatus(statusOwner);
@@ -3161,7 +3813,8 @@ async function runConnectorAutoRepair(
 }
 
 async function connectWithConnectorMaintenanceStatus(
-  connect: () => Promise<boolean>
+  connect: () => Promise<boolean>,
+  allowCompatibilityRepair = true
 ): Promise<boolean> {
   if (connectorConnectionRecoveryInFlight) {
     return await connectorConnectionRecoveryInFlight;
@@ -3186,7 +3839,7 @@ async function connectWithConnectorMaintenanceStatus(
         connectorAutoRepairAttemptKey = '';
         return true;
       }
-      return await runConnectorAutoRepair(connectorId);
+      return allowCompatibilityRepair ? await runConnectorAutoRepair(connectorId) : false;
     } finally {
       releaseConnectorMaintenanceStatus(statusOwner);
     }
@@ -3213,74 +3866,526 @@ async function maintainPlayerConnectors(
   if (!shouldRunAutomaticConnectorMaintenance(devUserDataDir)) return;
   if (connectorMaintenanceRunning) return;
   connectorMaintenanceRunning = true;
+  let retrySoonMs: number | null = null;
   try {
+    // An update installed while requested playback kept the previous version
+    // running is started first, once playback is idle.
+    await applyDeferredConnectorUpdate();
+    // Backoff deadlines count from the start of a run, so the interval tick
+    // after a failed attempt already reaches its deadline.
+    const now = Date.now();
     const statuses = await playerManager.getConnectorStatuses(forceRefresh);
-    for (const status of statuses) {
-      if (status.error) {
-        writeLog(
-          `[连接器热更新] ${status.name}检查失败：${status.error}`,
-          'Yellow'
-        );
-        continue;
+    const plan = await planPlayerConnectorMaintenance(statuses, now);
+    retrySoonMs = plan.retrySoonMs;
+    let updatesStarted = 0;
+    for (const planned of plan.actions) {
+      const status = statuses.find(item => item.id === planned.id);
+      if (!status) continue;
+      let action = planned;
+      if (action.kind === 'update' && updatesStarted > 0) {
+        // An earlier update can take minutes; decide again on the current
+        // lock, playback and NetEase state.
+        const replanned = await planPlayerConnectorMaintenance([status], now);
+        action = replanned.actions[0];
+        retrySoonMs = earliestRetry(retrySoonMs, replanned.retrySoonMs);
       }
-      if (!status.compatible) {
-        writeLog(
-          `[连接器热更新] ${status.name}最新版本要求本体 `
-          + `${status.minimumCoreVersion}`,
-          'Yellow'
-        );
-        continue;
-      }
-      if (status.updating) {
-        continue;
-      }
-      if (status.installed && !status.autoUpdateAvailable) {
-        if (status.manualUpdateAvailable) {
-          writeLog(
-            `[连接器热更新] ${status.name} 有新的播放器版本分支 `
-            + `${status.latestVersion}，支持播放器版本 `
-            + `${status.supportedPlayerVersion || '未注明'}；`
-            + '不会自动更新，可在播放器设置中手动确认。',
-            'Yellow'
-          );
-        } else if (status.updateAvailable) {
-          writeLog(
-            `[连接器热更新] ${status.name} 有不可自动应用的更新 `
-            + `${status.latestVersion}，已保留当前版本。`,
-            'DarkGray'
-          );
-        }
+      if (action.kind === 'skip') {
+        reportConnectorMaintenanceSkip(status, action.reason);
         continue;
       }
 
-      const selected = getSelectedNativeConnector() === status.id;
-      const ownedStatus = selected && !status.installed
-        ? `正在更新${status.name}播放器连接器`
-        : '';
-      const statusOwner = ownedStatus
-        ? claimConnectorMaintenanceStatus(ownedStatus)
-        : 0;
-
+      updatesStarted++;
+      connectorMaintenanceDecisions.set(status.id, 'update');
+      const failureKey = maintenanceFailureKey(status.id, status.latestVersion);
+      let outcome: ConnectorMaintenanceOutcome = 'failed';
+      // A failure of one connector never stops the others.
       try {
-        const result = await withPlayerConnectionRecoverySuppressed(
-          () => playerManager.updateConnector(status.id)
-        );
+        outcome = await applyConnectorMaintenanceUpdate(status);
+      } catch (error: unknown) {
+        const message = error instanceof Error
+          ? error.message
+          : String(error);
         writeLog(
-          `[连接器热更新] ${result.message}`,
-          result.success ? 'Green' : 'Yellow'
+          `[连接器热更新] ${status.name}连接器更新失败：${message}`,
+          'Yellow'
         );
-      } finally {
-        releaseConnectorMaintenanceStatus(statusOwner);
       }
+      if (outcome === 'deferred') {
+        // NetEase was opened during the download. Nothing was replaced and
+        // nothing failed: wait for it to close, as the planned skip does.
+        reportConnectorMaintenanceSkip(status, 'netease-running');
+        retrySoonMs = earliestRetry(retrySoonMs, MAINTENANCE_NETEASE_RETRY_MS);
+        continue;
+      }
+      if (outcome === 'succeeded') {
+        recordMaintenanceSuccess(connectorMaintenanceFailures, failureKey);
+        continue;
+      }
+      const failure = recordMaintenanceFailure(
+        connectorMaintenanceFailures,
+        failureKey,
+        now
+      );
+      writeLog(
+        `[连接器热更新] ${status.name}连接器 ${status.latestVersion || ''} `
+        + `将在 ${describeMaintenanceDelay(failure.nextAttemptAt - now)}后再次尝试自动更新`,
+        'DarkGray'
+      );
     }
   } catch (error: unknown) {
     const message = error instanceof Error
       ? error.message
       : String(error);
     writeLog(`[连接器热更新] 后台检查失败：${message}`, 'Yellow');
+    retrySoonMs = earliestRetry(retrySoonMs, MAINTENANCE_ERROR_RETRY_MS);
   } finally {
     connectorMaintenanceRunning = false;
+    scheduleConnectorMaintenanceRetry(retrySoonMs);
   }
+}
+
+async function planPlayerConnectorMaintenance(
+  statuses: ConnectorUpdateStatus[],
+  now: number
+): Promise<MaintenancePlan<NativeConnectorId>> {
+  // The process query starts PowerShell, so only a pending patch of an
+  // installed NetEase connector asks for it.
+  const neteasePatchPending = statuses.some(status => status.id === 'netease'
+    && status.installed
+    && status.autoUpdateAvailable
+    && !status.updating
+    && !status.error);
+  const neteaseRunning = neteasePatchPending && await isNeteaseProcessRunning();
+  return planConnectorMaintenance({
+    statuses,
+    selectedId: getSelectedNativeConnector(),
+    guardComponentId: updateInstallationGuard.componentId,
+    neteaseRunning,
+    selectedBusy: isSelectedConnectorBusy(),
+    failureMemo: connectorMaintenanceFailures,
+    now
+  });
+}
+
+/** A failed process query counts as running, so NetEase is never closed blindly. */
+async function isNeteaseProcessRunning(): Promise<boolean> {
+  const processInfo = await inspectPlayerProcess('netease');
+  return processInfo.running || !processInfo.querySucceeded;
+}
+
+/**
+ * Whether reconnecting the selected connector would interrupt requested
+ * playback: a reconnect drops the next-song guard and holds commands until
+ * the connector is back. A disconnected player has nothing to interrupt, and
+ * a queue held for an unsupported QQ build has nothing in flight.
+ */
+function isSelectedConnectorBusy(): boolean {
+  return isPlayerConnected
+    && isPlaying
+    && playerControlNotice?.kind !== 'compatibility'
+    && (
+      targetQueue.length > 0
+      || Boolean(currentPlayingSong)
+      || activeManagedPlayerAction !== null
+      || Boolean(registeredNextGuardKey)
+    );
+}
+
+/** Logs a skipped connector once per change of its reason or version. */
+function reportConnectorMaintenanceSkip(
+  status: ConnectorUpdateStatus,
+  reason: MaintenanceSkipReason
+): void {
+  const decision = [
+    reason,
+    status.latestVersion || '',
+    reason === 'error' ? status.error : ''
+  ].join('|');
+  if (connectorMaintenanceDecisions.get(status.id) === decision) return;
+  connectorMaintenanceDecisions.set(status.id, decision);
+  const description = describeMaintenanceSkip(status, reason);
+  if (description) {
+    writeLog(`[连接器热更新] ${description.message}`, description.color);
+  }
+}
+
+/**
+ * `deferred`: an automatic NetEase update stopped before replacing anything
+ * because NetEase was opened meanwhile; it is neither a success nor a failure.
+ */
+type ConnectorMaintenanceOutcome = 'succeeded' | 'failed' | 'deferred';
+
+/**
+ * Applies one planned background update. The selected connector shows a
+ * maintenance status through its reconnect, and a new version that cannot
+ * reach the running player is rolled back. While requested playback is busy
+ * the previous version keeps running; applyDeferredConnectorUpdate() starts
+ * the new one, and checks it, once playback is idle.
+ */
+async function applyConnectorMaintenanceUpdate(
+  status: ConnectorUpdateStatus
+): Promise<ConnectorMaintenanceOutcome> {
+  const selected = getSelectedNativeConnector() === status.id;
+  const statusOwner = selected
+    ? claimConnectorMaintenanceStatus(
+      status.installed
+        ? `正在应用${status.name}连接器更新`
+        : `正在更新${status.name}播放器连接器`
+    )
+    : 0;
+  try {
+    const connectedBefore = selected && isPlayerConnected;
+    const result = await withPlayerConnectionRecoverySuppressed(
+      () => playerManager.updateConnector(status.id, false, {
+        automatic: true,
+        deferReconnectWhile: isSelectedConnectorBusy
+      })
+    );
+    if (result.deferred) return 'deferred';
+    writeLog(
+      `[连接器热更新] ${result.message}`,
+      result.success ? 'Green' : 'Yellow'
+    );
+    if (result.reconnectDeferred) {
+      deferredConnectorUpdate = { status, result };
+      scheduleDeferredConnectorRestart(MAINTENANCE_BUSY_RETRY_MS);
+      return 'succeeded';
+    }
+    if (connectedBefore && result.success && result.updated) {
+      // The install itself succeeded, whatever happens to this check.
+      await rollBackUnconnectableConnectorUpdate(status, result).catch(
+        (error: unknown) => writeLog(
+          `[连接器热更新] ${status.name}连接器更新后的连接检查失败：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+          'Yellow'
+        )
+      );
+    }
+    return result.success ? 'succeeded' : 'failed';
+  } finally {
+    releaseConnectorMaintenanceStatus(statusOwner);
+  }
+}
+
+/** Looks for idle playback again after `delayMs`; one pending check at most. */
+function scheduleDeferredConnectorRestart(delayMs: number | null): void {
+  if (deferredConnectorRestartTimer) {
+    clearTimeout(deferredConnectorRestartTimer);
+    deferredConnectorRestartTimer = null;
+  }
+  if (delayMs === null || applicationQuitRequested) return;
+  deferredConnectorRestartTimer = setTimeout(() => {
+    deferredConnectorRestartTimer = null;
+    // Another update or reconnect owns the connector right now.
+    if (
+      connectorMaintenanceRunning
+      || connectorAutoRepairInFlight
+      || connectorConnectionRecoveryInFlight
+    ) {
+      scheduleDeferredConnectorRestart(MAINTENANCE_BUSY_RETRY_MS);
+      return;
+    }
+    void applyDeferredConnectorUpdate();
+  }, delayMs);
+}
+
+/**
+ * Starts the version that a background update installed while requested
+ * playback kept the previous one running, once playback is idle. A restart
+ * that does not reach the player gets the same check as an update that
+ * reconnected at once. Never rejects; concurrent callers share one run.
+ */
+function applyDeferredConnectorUpdate(): Promise<void> {
+  if (deferredConnectorRestartInFlight) return deferredConnectorRestartInFlight;
+  const tracked: Promise<void> = restartDeferredConnector()
+    .catch((error: unknown) => writeLog(
+      '[连接器热更新] 启用已安装的连接器更新失败：'
+        + `${error instanceof Error ? error.message : String(error)}`,
+      'Yellow'
+    ))
+    .finally(() => {
+      if (deferredConnectorRestartInFlight === tracked) deferredConnectorRestartInFlight = null;
+    });
+  deferredConnectorRestartInFlight = tracked;
+  return tracked;
+}
+
+async function restartDeferredConnector(): Promise<void> {
+  const connectorId = playerManager.deferredConnectorRestart;
+  if (connectorId === null || applicationQuitRequested) {
+    // Nothing pending, or a reconnect, player switch or connector exit has
+    // already started the new version.
+    if (connectorId === null) deferredConnectorUpdate = null;
+    scheduleDeferredConnectorRestart(null);
+    return;
+  }
+  if (isSelectedConnectorBusy()) {
+    scheduleDeferredConnectorRestart(MAINTENANCE_BUSY_RETRY_MS);
+    return;
+  }
+  scheduleDeferredConnectorRestart(null);
+  const update = deferredConnectorUpdate?.status.id === connectorId ? deferredConnectorUpdate : null;
+  const name = update?.status.name || PLAYER_LABELS[connectorId];
+  // The previous version was connected right before the restart: the same
+  // proof the check after an immediate reconnect relies on.
+  const connectedBefore = isPlayerConnected;
+  const statusOwner = claimConnectorMaintenanceStatus(`正在应用${name}连接器更新`);
+  try {
+    const restart = await withPlayerConnectionRecoverySuppressed(
+      () => playerManager.applyDeferredConnectorRestart(isSelectedConnectorBusy)
+    );
+    if (!restart.restarted) {
+      // Requested playback started again, or something else restarted it.
+      if (playerManager.deferredConnectorRestart === connectorId) {
+        scheduleDeferredConnectorRestart(MAINTENANCE_BUSY_RETRY_MS);
+      } else {
+        deferredConnectorUpdate = null;
+      }
+      return;
+    }
+    deferredConnectorUpdate = null;
+    writeLog(
+      restart.reconnected
+        ? `[连接器热更新] 已启用${name}连接器的新版本并重新连接播放器`
+        : `[连接器热更新] 已启用${name}连接器的新版本，后台正在等待播放器连接`,
+      restart.reconnected ? 'Green' : 'Yellow'
+    );
+    if (!restart.reconnected && connectedBefore && update) {
+      await rollBackUnconnectableConnectorUpdate(
+        update.status,
+        { ...update.result, reconnected: false }
+      ).catch((error: unknown) => writeLog(
+        `[连接器热更新] ${name}连接器更新后的连接检查失败：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        'Yellow'
+      ));
+    }
+  } finally {
+    releaseConnectorMaintenanceStatus(statusOwner);
+  }
+}
+
+/**
+ * A background update must not leave a streamer without a player
+ * connection. When the new version cannot reach a player that is still
+ * running, the previous version is restored once and the updater pauses the
+ * new one. NetEase is left alone: a bridge it has already loaded keeps the
+ * previous version from injecting until NetEase restarts.
+ */
+async function rollBackUnconnectableConnectorUpdate(
+  status: ConnectorUpdateStatus,
+  result: ConnectorUpdateResult & { reconnected?: boolean }
+): Promise<void> {
+  const connectorId = status.id;
+  if (result.reconnected === true) return;
+  if (await waitForSelectedPlayerConnection(
+    connectorId,
+    CONNECTOR_UPDATE_CONNECT_TIMEOUT_MS
+  )) return;
+  // A reconnect that is already running finishes before the version is judged.
+  if (connectorConnectionRecoveryInFlight) {
+    await connectorConnectionRecoveryInFlight.catch(() => false);
+  }
+  const stillDisconnected = () => !applicationQuitRequested
+    && !isPlayerConnected
+    && getSelectedNativeConnector() === connectorId;
+  if (!stillDisconnected()) return;
+  // Only a player that is still running shows that the new version cannot
+  // connect; a closed player proves nothing about it.
+  const processInfo = await playerManager.inspectSelectedPlayerProcess();
+  if (!processInfo.running || !stillDisconnected()) return;
+
+  const version = result.status.currentVersion || status.latestVersion || '未知版本';
+  if (connectorId === 'netease') {
+    writeLog(
+      `[连接器热更新] ${status.name} 新版本 ${version} 无法连接播放器。`
+      + '网易云已加载的连接组件需重启网易云才能更换，因此不会自动回退：'
+      + '请完全退出并重新打开网易云；仍无法连接时，请在播放器设置中重新安装连接器。',
+      'Yellow'
+    );
+    return;
+  }
+  const attemptKey = `${connectorId}@${version}`;
+  if (connectorRollbackAttempts.has(attemptKey)) return;
+  connectorRollbackAttempts.add(attemptKey);
+
+  const statusOwner = claimConnectorMaintenanceStatus(`正在回退${status.name}连接器`);
+  try {
+    const rollback = await withPlayerConnectionRecoverySuppressed(
+      () => playerManager.rollbackConnector(connectorId)
+    );
+    writeLog(
+      rollback.success
+        ? `[连接器热更新] ${status.name} 新版本 ${version} 无法连接播放器，`
+          + `已回退到 ${rollback.version || '上一版本'} 并暂停该版本的自动更新`
+        : `[连接器热更新] ${status.name} 新版本 ${version} 无法连接播放器，`
+          + `回退未完成：${rollback.message}`,
+      rollback.success ? 'Yellow' : 'Red'
+    );
+    if (rollback.success) {
+      // The update dialog must neither announce the bad version as installed
+      // nor offer it again from a check made before the rollback.
+      void getUpdateAnnouncementService().noteRolledBack(connectorId, version, rollback.version)
+        .catch((error: unknown) => writeLog(
+          `[连接器热更新] ${status.name}连接器回退后未能更新升级记录：`
+            + `${error instanceof Error ? error.message : String(error)}`,
+          'Yellow'
+        ));
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeLog(`[连接器热更新] ${status.name}连接器回退失败：${message}`, 'Red');
+  } finally {
+    releaseConnectorMaintenanceStatus(statusOwner);
+  }
+  // The rollback stopped the connector and its retries, so connect again
+  // whether or not the previous version could be restored. A reconnect
+  // started meanwhile may have been cut short by the rollback.
+  if (connectorConnectionRecoveryInFlight) {
+    await connectorConnectionRecoveryInFlight.catch(() => false);
+  }
+  if (!stillDisconnected()) return;
+  await connectWithConnectorMaintenanceStatus(() => playerManager.reconnect());
+}
+
+/** Resolves true once the selected player connects within the timeout. */
+async function waitForSelectedPlayerConnection(
+  connectorId: NativeConnectorId,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!isPlayerConnected) {
+    if (
+      applicationQuitRequested
+      || getSelectedNativeConnector() !== connectorId
+      || Date.now() >= deadline
+    ) return false;
+    await new Promise<void>(resolve => setTimeout(resolve, 500));
+  }
+  return true;
+}
+
+/** Keeps at most one early maintenance run pending; every run replaces it. */
+function scheduleConnectorMaintenanceRetry(delayMs: number | null): void {
+  if (connectorMaintenanceRetryTimer) {
+    clearTimeout(connectorMaintenanceRetryTimer);
+    connectorMaintenanceRetryTimer = null;
+  }
+  if (delayMs === null || applicationQuitRequested) return;
+  connectorMaintenanceRetryTimer = setTimeout(() => {
+    connectorMaintenanceRetryTimer = null;
+    void maintainPlayerConnectors(true);
+  }, delayMs);
+}
+
+/** A computer that slept missed interval ticks; check again once it is back. */
+function scheduleConnectorMaintenanceAfterResume(): void {
+  if (
+    !shouldRunAutomaticConnectorMaintenance(devUserDataDir)
+    || applicationQuitRequested
+  ) return;
+  if (connectorMaintenanceResumeTimer) clearTimeout(connectorMaintenanceResumeTimer);
+  connectorMaintenanceResumeTimer = setTimeout(() => {
+    connectorMaintenanceResumeTimer = null;
+    void maintainPlayerConnectors(true);
+  }, CONNECTOR_MAINTENANCE_RESUME_DELAY_MS);
+}
+
+/** Waits for the QQ snapshots to settle before recovering compatibility. */
+function scheduleQqCompatibilityRecovery(
+  delayMs = QQ_COMPATIBILITY_RECOVERY_DELAY_MS
+): void {
+  if (
+    !shouldRunAutomaticConnectorMaintenance(devUserDataDir)
+    || applicationQuitRequested
+  ) return;
+  if (qqCompatibilityRecoveryTimer) clearTimeout(qqCompatibilityRecoveryTimer);
+  qqCompatibilityRecoveryTimer = setTimeout(() => {
+    qqCompatibilityRecoveryTimer = null;
+    void recoverQqCompatibility();
+  }, delayMs);
+}
+
+/**
+ * Up to three times per QQ process and version (5 s, 2 min and 10 min after
+ * the build was found unsupported), tries the fixes that need no user
+ * action: newer signed profiles, then the exact-build connector repair, then
+ * a same-branch connector patch through the regular maintenance. A later
+ * attempt follows only one that changed nothing while QQ still reports the
+ * same build as unsupported.
+ */
+async function recoverQqCompatibility(): Promise<void> {
+  const notice = playerControlNotice;
+  const stillUnsupported = () => !applicationQuitRequested
+    && getSelectedPlayerKey() === 'qqmusic'
+    && playerControlNotice?.kind === 'compatibility';
+  if (!stillUnsupported() || notice?.kind !== 'compatibility') return;
+  if (
+    updateInstallationGuard.componentId
+    || connectorMaintenanceRunning
+    || connectorAutoRepairInFlight
+    || connectorConnectionRecoveryInFlight
+  ) {
+    // Another update or reconnect owns the connector; look again later.
+    scheduleQqCompatibilityRecovery(QQ_COMPATIBILITY_RECOVERY_BUSY_DELAY_MS);
+    return;
+  }
+  const sessionKey = (hint: { processId: number | null; currentVersion: string }) =>
+    `${hint.processId || 'unknown-process'}@${hint.currentVersion}`;
+  const attemptKey = sessionKey(notice);
+  const previous = qqCompatibilityRecoveryAttempts.get(attemptKey);
+  if (previous) {
+    // Running, finished, or asked again (a reconnect) before the next attempt is due.
+    if (previous.retryAt === null) return;
+    const wait = previous.retryAt - Date.now();
+    if (wait > 0) {
+      scheduleQqCompatibilityRecovery(wait);
+      return;
+    }
+  }
+  const attempt = { count: (previous?.count ?? 0) + 1, retryAt: null as number | null };
+  qqCompatibilityRecoveryAttempts.set(attemptKey, attempt);
+  try {
+    writeLog(
+      `[连接器兼容恢复] QQ 音乐 ${notice.currentVersion} 尚未适配点歌插入，正在检查在线兼容画像`
+        + (attempt.count > 1 ? `（第 ${attempt.count} 次）` : ''),
+      'Cyan'
+    );
+    const profiles = await playerManager.refreshConnectorProfiles('qqmusic');
+    // The user may have switched players, or QQ recovered on its own.
+    if (!stillUnsupported()) return;
+    if (profiles.changed) {
+      writeLog(
+        `[连接器兼容恢复] 已更新 QQ 音乐兼容画像 ${profiles.version}，正在重连播放器`,
+        'Cyan'
+      );
+      await connectWithConnectorMaintenanceStatus(() => playerManager.reconnect());
+      return;
+    }
+    // A retry stays out of the status line and skips a session already tried.
+    if (await runConnectorAutoRepair('qqmusic', { quiet: attempt.count > 1 }) || !stillUnsupported()) return;
+    // The held queue does not defer a same-branch patch.
+    await maintainPlayerConnectors(true);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeLog(`[连接器兼容恢复] QQ 音乐兼容恢复失败：${message}`, 'Yellow');
+  }
+  // Nothing helped; the profile or catalog check may have failed offline.
+  const retryDelayMs = QQ_COMPATIBILITY_RECOVERY_RETRY_DELAYS_MS[attempt.count - 1];
+  const current = playerControlNotice;
+  if (
+    retryDelayMs === undefined
+    || !stillUnsupported()
+    || current?.kind !== 'compatibility'
+    || sessionKey(current) !== attemptKey
+  ) return;
+  attempt.retryAt = Date.now() + retryDelayMs;
+  writeLog(
+    `[连接器兼容恢复] QQ 音乐 ${notice.currentVersion} 仍未恢复点歌插入，`
+      + `${Math.round(retryDelayMs / 60_000)} 分钟后再检查一次`,
+    'DarkGray'
+  );
+  scheduleQqCompatibilityRecovery(retryDelayMs);
 }
 
 async function startPlayerBridge(): Promise<void> {
@@ -3319,12 +4424,18 @@ function scheduleStartupBackgroundServices(win: BrowserWindow): void {
   fallbackTimer = setTimeout(schedule, STARTUP_BACKGROUND_FALLBACK_MS);
 }
 
-async function reconnectPlayerBridge(): Promise<boolean> {
+async function reconnectPlayerBridge(allowCompatibilityRepair = true): Promise<boolean> {
   clearDeferredQqInsert();
   clearRecentQqGuardedCompletion();
   updatePlayerCurrentTrack('', '');
   return await connectWithConnectorMaintenanceStatus(
-    () => playerManager.reconnect()
+    () => {
+      if (!allowCompatibilityRepair && (updateInstallationGuard.componentId || connectorMaintenanceRunning || connectorAutoRepairInFlight)) {
+        throw new Error('播放器维护或更新已开始，请完成后重试');
+      }
+      return playerManager.reconnect();
+    },
+    allowCompatibilityRepair
   );
 }
 
@@ -4007,13 +5118,20 @@ function getWebSocketClient() {
 // ==========================================
 // 核心功能：获取 B站 头像与用户信息
 // ==========================================
+async function fetchBiliAvatar(uid: string): Promise<string> {
+  // Only real Bilibili accounts have a card; local test users never query it.
+  if (!/^\d+$/.test(uid)) return '';
+  const res = await fetchWithTimeout(`https://api.bilibili.com/x/web-interface/card?mid=${uid}`, { headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" } }, 8_000);
+  const data: any = await res.json();
+  return data.code === 0 && typeof data.data?.card?.face === 'string' ? data.data.card.face : '';
+}
+
+// Cached and deduplicated per viewer; misses use a local placeholder instead
+// of sending the UID to a third-party avatar service.
+const biliAvatarCache = createAvatarCache({ fetchAvatar: fetchBiliAvatar });
+
 async function getBiliAvatar(uid: string): Promise<string> {
-  try {
-    const res = await fetchWithTimeout(`https://api.bilibili.com/x/web-interface/card?mid=${uid}`, { headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" } }, 8_000);
-    const data: any = await res.json();
-    if (data.code === 0 && data.data?.card?.face) return data.data.card.face;
-  } catch {}
-  return `https://api.dicebear.com/7.x/identicon/svg?seed=${uid}`;
+  return await biliAvatarCache.get(String(uid || '')) || AVATAR_PLACEHOLDER;
 }
 
 async function updateCurrentUserInfo(expectedCookie: string = biliCookie): Promise<boolean> {
@@ -4073,7 +5191,8 @@ async function updateCurrentUserInfo(expectedCookie: string = biliCookie): Promi
         writeLog(`>>> [账号] 检测到本账号直播间 ${nextUserInfo.myRoomId}，已自动设为监控房间。`, 'Cyan');
       }
     }
-    saveConfig();
+    // A verified login cookie must survive a crash right after scanning.
+    saveConfigNow();
     return true;
   } catch (err: any) {
     writeLog(`[系统] 获取用户信息失败: ${err.message}`, 'Yellow');
@@ -4111,23 +5230,48 @@ async function serializeLocalTestRequest<T>(
   }
 }
 
+// Incremented whenever the selected player changes. A request resolved by the
+// previous player must never enter the new player's queue.
+let playerSelectionEpoch = 0;
+
 async function tryRequestSong(
   user: any,
   keyword: string,
-  mode: LocalSongRequestMode = 'normal'
+  mode: LocalSongRequestMode = 'normal',
+  // Only danmaku requests publish viewer notices; local tests stay off stream.
+  feedback: RequestFeedbackOperation | null = null
 ): Promise<SongRequestResult> {
+  updateRequestFeedback(feedback, 'waiting', '正在搜索歌曲，请稍候');
+  const playerKey = getSelectedPlayerKey();
+  const epoch = playerSelectionEpoch;
+  const playerChanged = () => getSelectedPlayerKey() !== playerKey
+    || playerSelectionEpoch !== epoch;
+  const rejectChangedPlayer = async (): Promise<SongRequestResult> => {
+    writeLog(`[点歌] 处理期间播放器已切换，已放弃旧播放器的点歌: ${keyword}`, 'Yellow');
+    await addReject(user, '播放器已切换，请重新点歌', feedback);
+    return { success: false, mode, keyword, message: '播放器已切换，请重新点歌' };
+  };
+  // While an unsupported QQ version holds the queue, nothing plays automatically.
+  const queuedNotice = (message: string) => (
+    getSelectedPlayerKey() === 'qqmusic' && playerControlNotice?.kind === 'compatibility'
+      ? '点歌成功，已保留在待播队列（当前 QQ 版本暂不支持自动插入，等待主播处理）'
+      : message
+  );
+  let newSong: any = null;
+  let enqueued = false;
   try {
     const normalizedKeyword = keyword.replace(/\s+/g, '');
     if (normalizedKeyword === '贞理的小曲' || normalizedKeyword === '真理的小曲') {
       keyword = 'missing you 具岛直子';
     }
 
-    const playerKey = getSelectedPlayerKey();
+    // An uncached avatar is looked up while the player searches.
+    const avatarLookup = user.avatar ? null : getBiliAvatar(user.uid).catch(() => '');
     const track = (await playerManager.search(keyword))[0];
 
     if (!track) {
       setGlobalStatus(`❌ 未搜到: ${keyword}`);
-      await addReject(user, `未搜到歌曲: ${keyword}`);
+      await addReject(user, `未搜到歌曲: ${keyword}`, feedback);
       return {
         success: false,
         mode,
@@ -4136,11 +5280,13 @@ async function tryRequestSong(
       };
     }
 
-    const avatarUrl = user.avatar || await getBiliAvatar(user.uid);
+    const avatarUrl = user.avatar || await avatarLookup;
     const coverUrl = track.coverUrl || (playerKey === 'netease'
       ? await getNcmSongCover(track.id)
       : '');
-    const newSong = {
+    if (playerChanged()) return await rejectChangedPlayer();
+    newSong = {
+      RequestId: randomUUID(),
       Id: String(track.id),
       SongName: track.title,
       ArtistName: track.artist || '未知歌手',
@@ -4154,14 +5300,23 @@ async function tryRequestSong(
       GuardLevel: user.guardLevel
     };
     cancelledNativeNextSongs.delete(getQueueSongIdentity(newSong));
+    updateRequestFeedback(feedback, 'waiting', '已找到歌曲，正在处理点歌', newSong.SongName);
 
     if (mode === 'interrupt') {
       clearRecentQqGuardedCompletion();
       await waitForManagedPlayerActionSettlement();
+      if (playerChanged()) return await rejectChangedPlayer();
       if (currentPlayingSong) targetQueue.unshift(currentPlayingSong);
       setGlobalStatus(`⚡ 插队: ${newSong.SongName}`);
       const playbackConfirmed = await playSongNow(newSong, 'interrupt');
-      if (!playbackConfirmed) targetQueue.unshift(newSong);
+      if (!playbackConfirmed) {
+        if (playerChanged()) return await rejectChangedPlayer();
+        targetQueue.unshift(newSong);
+        enqueued = true;
+      }
+      updateRequestFeedback(feedback, 'success', playbackConfirmed
+        ? '点歌成功，已插队播放'
+        : queuedNotice('点歌成功，已加入队首等待播放'), newSong.SongName);
       return {
         success: true,
         mode,
@@ -4178,9 +5333,17 @@ async function tryRequestSong(
     if (mode === 'play_now') {
       clearRecentQqGuardedCompletion();
       await waitForManagedPlayerActionSettlement();
+      if (playerChanged()) return await rejectChangedPlayer();
       setGlobalStatus(`▶️ 立即: ${newSong.SongName}`);
       const playbackConfirmed = await playSongNow(newSong);
-      if (!playbackConfirmed) targetQueue.unshift(newSong);
+      if (!playbackConfirmed) {
+        if (playerChanged()) return await rejectChangedPlayer();
+        targetQueue.unshift(newSong);
+        enqueued = true;
+      }
+      updateRequestFeedback(feedback, 'success', playbackConfirmed
+        ? '点歌成功，已开始播放'
+        : queuedNotice('点歌成功，已加入队首等待播放'), newSong.SongName);
       return {
         success: true,
         mode,
@@ -4202,6 +5365,12 @@ async function tryRequestSong(
       targetQueue.push(newSong);
       setGlobalStatus(`✅ 点歌: ${newSong.SongName}`);
     }
+    enqueued = true;
+    // Queued is accepted. Player sync below can wait on connector timeouts
+    // and must neither delay nor contradict the viewer's notice.
+    updateRequestFeedback(feedback, 'success', queuedNotice(mode === 'top'
+      ? '点歌成功，已置顶待播'
+      : '点歌成功，已加入待播队列'), newSong.SongName);
 
     let guardRegistered: boolean | null = null;
     if (mode === 'top' && previousHead) {
@@ -4235,9 +5404,23 @@ async function tryRequestSong(
       guardRegistered
     };
   } catch (err: any) {
+    if (enqueued) {
+      // The song stays queued; the next queue-head change retries player sync.
+      writeLog(`[点歌] ${newSong.SongName} 已加入待播队列，但播放器同步失败: ${err?.message || err}`, 'Yellow');
+      updateRequestFeedback(feedback, 'success', queuedNotice('已加入待播队列，播放器同步稍后重试'), newSong.SongName);
+      return {
+        success: true,
+        mode,
+        keyword,
+        message: `已加入待播队列，播放器同步稍后重试: ${newSong.SongName}`,
+        song: newSong,
+        queued: true
+      };
+    }
+    const reason = playerChanged() ? '播放器已切换，请重新点歌' : '搜索或播放器通信异常';
     writeLog(`[点歌搜索] ${getSelectedPlayerLabel()} 搜索异常: ${err?.message || err}`, 'Red');
-    setGlobalStatus('❌ 搜索或播放器通信异常');
-    await addReject(user, '搜索或播放器通信异常');
+    setGlobalStatus(`❌ ${reason}`);
+    await addReject(user, reason, feedback);
     return {
       success: false,
       mode,
@@ -4247,7 +5430,13 @@ async function tryRequestSong(
   }
 }
 
-async function handleDanmaku(user: any, msg: string): Promise<void> {
+let lastPausedIntakeNoticeAt = 0;
+
+async function handleDanmaku(
+  user: any,
+  msg: string,
+  feedback?: RequestFeedbackOperation
+): Promise<void> {
   if (msg.toLowerCase().includes('test') || msg.includes('测试')) writeLog(`[弹幕] 测试通信: ${msg}`, 'Cyan');
 
   const isOrder = msg.startsWith('点歌') || msg.startsWith('點歌');
@@ -4263,7 +5452,18 @@ async function handleDanmaku(user: any, msg: string): Promise<void> {
     || msg === '关闭点歌'
   );
 
-  if (!isAccepting && (isOrder || isTopOrder || isInterruptOrder || isPlayNowOrder || isCancel || isSkip)) return;
+  if (!isAccepting && (isOrder || isTopOrder || isInterruptOrder || isPlayNowOrder || isCancel || isSkip)) {
+    // The overlay already shows paused intake; one public reminder per 10 s
+    // is enough, and the other waiting cards simply disappear.
+    const now = Date.now();
+    if (feedback && now - lastPausedIntakeNoticeAt >= 10_000) {
+      lastPausedIntakeNoticeAt = now;
+      failRequestFeedback(feedback, '已暂停接收点歌，请稍后再试');
+    } else {
+      dismissRequestFeedback(feedback);
+    }
+    return;
+  }
 
   if (isToggleAccept) {
     const permission = checkPermission(user, 'ToggleAcceptPermission');
@@ -4277,10 +5477,11 @@ async function handleDanmaku(user: any, msg: string): Promise<void> {
   }
 
   if (isCancel) {
+    updateRequestFeedback(feedback, 'waiting', '正在撤回歌曲，请稍候');
     const keyword = msg.replace(/^撤回/, '').trim();
     if (keyword) {
       const perm = checkPermission(user, 'ForceControlPermission');
-      if (!perm.allowed) { await addReject(user, "权限不足: 需要强控权限"); return; }
+      if (!perm.allowed) { await addReject(user, "权限不足: 需要强控权限", feedback); return; }
       const idx = targetQueue.findIndex(s => s.SongName.includes(keyword) || s.ArtistName.includes(keyword));
       if (idx !== -1) {
         const previousHead = targetQueue[0] || null;
@@ -4289,11 +5490,12 @@ async function handleDanmaku(user: any, msg: string): Promise<void> {
           await reconcileQueueHeadAfterMutation(previousHead, '强行撤回');
         }
         setGlobalStatus(`🗑️ 强行撤回: ${removed.SongName}`);
+        updateRequestFeedback(feedback, 'cancelled', '撤回成功，已移出待播队列', removed.SongName);
       }
-      else await addReject(user, "撤回失败: 未在队列中找到");
+      else await addReject(user, "撤回失败: 未在队列中找到", feedback);
     } else {
       const perm = checkPermission(user, 'CancelPermission');
-      if (!perm.allowed) { await addReject(user, perm.reason!); return; }
+      if (!perm.allowed) { await addReject(user, perm.reason!, feedback); return; }
       let foundIdx = -1;
       for (let i = targetQueue.length - 1; i >= 0; i--) { if (targetQueue[i].OrderedByUid === user.uid) { foundIdx = i; break; } }
       if (foundIdx !== -1) {
@@ -4303,8 +5505,9 @@ async function handleDanmaku(user: any, msg: string): Promise<void> {
           await reconcileQueueHeadAfterMutation(previousHead, '撤回点歌');
         }
         setGlobalStatus(`🗑️ 已撤回: ${removed.SongName}`);
+        updateRequestFeedback(feedback, 'cancelled', '撤回成功，已移出待播队列', removed.SongName);
       }
-      else await addReject(user, "队列中没有你点的歌");
+      else await addReject(user, "队列中没有你点的歌", feedback);
     }
     return;
   }
@@ -4324,6 +5527,13 @@ async function handleDanmaku(user: any, msg: string): Promise<void> {
     else if (isTopOrder) { keyword = msg.replace(/^(置顶点歌|优先点歌)/, '').trim(); mode = 'top'; }
     else { keyword = msg.substring(2).trim(); }
 
+    if (!keyword) {
+      // A bare command only fails its own notice: no reject toast, no avatar
+      // lookup, and no cooldown or permission message in its place.
+      failRequestFeedback(feedback, '请在点歌指令后填写歌名');
+      return;
+    }
+
     const isSuperUser = isConfiguredSuperUser(user);
     if (!isSuperUser) {
       const cds = appConfig.sysConfig?.Cooldowns || { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 };
@@ -4334,51 +5544,182 @@ async function handleDanmaku(user: any, msg: string): Promise<void> {
 
       if (cdSeconds > 0) {
         const passed = (Date.now() - (userCooldowns.get(user.uid) || 0)) / 1000;
-        if (passed < cdSeconds) { await addReject(user, `冷却中，需等待 ${Math.ceil(cdSeconds - passed)} 秒`); return; }
+        if (passed < cdSeconds) { await addReject(user, `冷却中，需等待 ${Math.ceil(cdSeconds - passed)} 秒`, feedback); return; }
       }
     }
 
-    if (mode === 'top') { const perm = checkPermission(user, 'PriorityPermission'); if (!perm.allowed) { await addReject(user, perm.reason!); return; } }
-    else if (mode === 'interrupt' || mode === 'play_now') { const perm = checkPermission(user, 'ForceControlPermission'); if (!perm.allowed) { await addReject(user, perm.reason!); return; } }
-    else { const perm = checkPermission(user, 'OrderPermission'); if (!perm.allowed) { await addReject(user, perm.reason!); return; } }
+    if (mode === 'top') { const perm = checkPermission(user, 'PriorityPermission'); if (!perm.allowed) { await addReject(user, perm.reason!, feedback); return; } }
+    else if (mode === 'interrupt' || mode === 'play_now') { const perm = checkPermission(user, 'ForceControlPermission'); if (!perm.allowed) { await addReject(user, perm.reason!, feedback); return; } }
+    else { const perm = checkPermission(user, 'OrderPermission'); if (!perm.allowed) { await addReject(user, perm.reason!, feedback); return; } }
 
-    if (keyword) {
-      const uid = String(user.uid || '');
-      const { tier, requirement } = getGiftRequirementForGuardLevel(
-        user.guardLevel
+    const uid = String(user.uid || '');
+    const { tier, requirement } = getGiftRequirementForGuardLevel(
+      user.guardLevel
+    );
+    const currentCredits = giftRequestCredits.get(uid) || 0;
+    if (!canRequestWithGiftCredits(
+      requirement,
+      currentCredits,
+      isSuperUser
+    )) {
+      await addReject(
+        user,
+        `${giftRequestTierLabel(tier)}点歌需要先赠送 ${describeGiftRequestRequirement(requirement)}；每赠送 1 个增加 1 次点歌`,
+        feedback
       );
-      const currentCredits = giftRequestCredits.get(uid) || 0;
-      if (!canRequestWithGiftCredits(
+      return;
+    }
+
+    const result = await tryRequestSong(user, keyword, mode, feedback);
+    if (result.success) {
+      userCooldowns.set(uid, Date.now());
+      const remainingCredits = consumeGiftRequestCredit(
         requirement,
         currentCredits,
-        isSuperUser
-      )) {
-        await addReject(
-          user,
-          `${giftRequestTierLabel(tier)}点歌需要先赠送 ${describeGiftRequestRequirement(requirement)}；每赠送 1 个增加 1 次点歌`
+        isSuperUser,
+        true
+      );
+      if (remainingCredits !== currentCredits) {
+        if (remainingCredits > 0) giftRequestCredits.set(uid, remainingCredits);
+        else giftRequestCredits.delete(uid);
+        writeLog(
+          `[礼物点歌] ${user.uname || uid} 使用 1 次点歌，当前剩余 ${remainingCredits} 次`,
+          'DarkGray'
         );
-        return;
-      }
-
-      const result = await tryRequestSong(user, keyword, mode);
-      if (result.success) {
-        userCooldowns.set(uid, Date.now());
-        const remainingCredits = consumeGiftRequestCredit(
-          requirement,
-          currentCredits,
-          isSuperUser,
-          true
-        );
-        if (remainingCredits !== currentCredits) {
-          if (remainingCredits > 0) giftRequestCredits.set(uid, remainingCredits);
-          else giftRequestCredits.delete(uid);
-          writeLog(
-            `[礼物点歌] ${user.uname || uid} 使用 1 次点歌，当前剩余 ${remainingCredits} 次`,
-            'DarkGray'
-          );
-        }
       }
     }
+  }
+}
+
+// ==========================================
+// 主播队列操作（悬浮窗按钮与拖拽）
+// ==========================================
+interface QueueActionResult {
+  success: boolean;
+  message?: string;
+}
+
+/**
+ * Index-only bodies keep their original meaning. With `expected` or
+ * `expectedCurrent`, an action applies only to the request the streamer saw,
+ * even after songs ending, 置顶 or 插队 shifted the queue. Logical failures
+ * are results, not HTTP errors.
+ */
+async function applyQueueAction(doc: Record<string, any>): Promise<QueueActionResult> {
+  const action = doc.action;
+  const expectedCurrent = doc.expectedCurrent ?? null;
+  let queueChanged = false;
+  try {
+    switch (action) {
+      case 'delete': {
+        const target = resolveQueueActionTarget(targetQueue, doc.index, doc.expected);
+        if (!target.ok) return { success: false, message: target.message };
+        const previousHead = targetQueue[0] || null;
+        const removed = targetQueue.splice(target.index, 1)[0];
+        queueChanged = true;
+        // Attributed to the streamer: viewers must not read it as a withdrawal.
+        requestNotificationStore.publish({
+          kind: 'cancelled', action: 'remove', title: removed.SongName,
+          message: '主播已将歌曲移出待播队列', requestedBy: '主播'
+        });
+        if (target.index === 0) {
+          await reconcileQueueHeadAfterMutation(previousHead, '删除队首');
+        }
+        setGlobalStatus('🗑️ 已移除曲目');
+        return { success: true };
+      }
+      case 'top': {
+        const target = resolveQueueActionTarget(targetQueue, doc.index, doc.expected);
+        if (!target.ok) return { success: false, message: target.message };
+        const previousHead = targetQueue[0] || null;
+        const item = targetQueue.splice(target.index, 1)[0];
+        targetQueue.unshift(item);
+        queueChanged = true;
+        await reconcileQueueHeadAfterMutation(previousHead, '置顶队列');
+        setGlobalStatus(`⬆️ 置顶: ${item.SongName}`);
+        return { success: true };
+      }
+      case 'play_now': {
+        const target = resolveQueueActionTarget(targetQueue, doc.index, doc.expected);
+        if (!target.ok) return { success: false, message: target.message };
+        const item = targetQueue[target.index];
+        clearRecentQqGuardedCompletion();
+        const played = await playSongNow(item);
+        // The queue can shift while playback is confirmed; remove this
+        // request wherever it is now, never whatever took its old position.
+        const playedIndex = played ? targetQueue.indexOf(item) : -1;
+        if (playedIndex !== -1) targetQueue.splice(playedIndex, 1);
+        setGlobalStatus(
+          played
+            ? `▶️ 强制播放: ${item.SongName}`
+            : `⚠️ 强制播放未确认，已保留在队列: ${item.SongName}`
+        );
+        return played
+          ? { success: true }
+          : { success: false, message: '播放器未确认播放，歌曲已保留在队列' };
+      }
+      case 'skip_current': {
+        // Without a playing request the card shows the player's own track.
+        const current = currentPlayingSong || playerCurrentTrack;
+        if (expectedCurrent !== null && current && !matchesCurrentSong(current, expectedCurrent)) {
+          return { success: false, message: '当前歌曲已变化，未执行操作' };
+        }
+        const skipped = await requestPlayerNext();
+        setGlobalStatus(skipped ? '⏭️ 已切歌' : '⚠️ 切歌未确认');
+        return skipped
+          ? { success: true }
+          : { success: false, message: '播放器未确认切歌，请检查播放器连接' };
+      }
+      case 'reorder': {
+        if (!isQueueIndex(doc.to, targetQueue.length)) {
+          return { success: false, message: QUEUE_ITEM_MISSING_MESSAGE };
+        }
+        const target = resolveQueueActionTarget(targetQueue, doc.from, doc.expected);
+        if (!target.ok) return { success: false, message: target.message };
+        const previousHead = targetQueue[0] || null;
+        const item = targetQueue.splice(target.index, 1)[0];
+        targetQueue.splice(doc.to, 0, item);
+        queueChanged = true;
+        await reconcileQueueHeadAfterMutation(previousHead, '重排队列');
+        setGlobalStatus('🔄 列表已重排');
+        return { success: true };
+      }
+      case 'push_current_to_queue': {
+        if (!currentPlayingSong) return { success: false, message: '当前没有正在播放的点歌' };
+        if (expectedCurrent !== null && !matchesCurrentSong(currentPlayingSong, expectedCurrent)) {
+          return { success: false, message: '当前歌曲已变化，未执行操作' };
+        }
+        // Returning the current request to the queue starts a fresh
+        // guard cycle, even when the same song object is reused.
+        const returningSongIdentity = getQueueSongIdentity(
+          currentPlayingSong
+        );
+        if (
+          targetQueue.length === 0
+          || registeredNextGuardSongIdentity === returningSongIdentity
+        ) {
+          // Reject an old terminal snapshot during the gap between the
+          // native Next and registration of this new same-song cycle.
+          clearRegisteredNextGuard();
+        }
+        clearRecentQqGuardedCompletion();
+        skipForcePlayOnceSong = currentPlayingSong;
+        targetQueue.push(currentPlayingSong);
+        skipForcePlayOnce = true;
+        queueChanged = true;
+        setGlobalStatus('🔙 已退回点歌列表末端');
+        return await requestPlayerNext()
+          ? { success: true }
+          : { success: true, message: '已退回点歌列表，播放器未确认切歌' };
+      }
+      default:
+        return { success: false, message: '不支持的队列操作' };
+    }
+  } catch (error: any) {
+    writeLog(`[队列操作] ${String(action)} 同步播放器失败: ${error?.message || error}`, 'Yellow');
+    return queueChanged
+      ? { success: true, message: '队列已更新，播放器同步稍后重试' }
+      : { success: false, message: '播放器通信异常，请稍后重试' };
   }
 }
 
@@ -4680,46 +6021,22 @@ function getPublicSysConfig(): Record<string, any> {
   };
 }
 
-function isAllowedInternalOrigin(origin: string | undefined): boolean {
-  if (!origin) return true;
-  if (origin === 'null') return true;
+// Electron resolves the requesting frame lazily. A frame that cannot be read
+// any more cannot be verified, so it is treated as a sub-frame.
+function describeRequestFrame(frame: WebFrameMain | null | undefined): RequestFrame | null {
+  if (!frame) return null;
   try {
-    const parsed = new URL(origin);
-    return (
-      (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
-      && (parsed.protocol === 'http:' || parsed.protocol === 'https:')
-    );
+    return { isMainFrame: frame.parent === null, url: frame.url };
   } catch {
-    return false;
-  }
-}
-
-function isTrustedInternalMutationRequest(
-  req: http.IncomingMessage
-): boolean {
-  if (
-    req.headers['x-awoo-internal-token']
-    === INTERNAL_API_BROWSER_TOKEN
-  ) {
-    return true;
-  }
-  const origin = req.headers.origin;
-  if (!origin) return true;
-  try {
-    const parsed = new URL(origin);
-    const internalOrigin =
-      `${parsed.protocol}//${parsed.hostname}:${parsed.port || (parsed.protocol === 'https:' ? '443' : '80')}`;
-    if (isActualInternalApiOrigin(internalOrigin)) {
-      return true;
-    }
-    const devUrl = getDevUrl();
-    return Boolean(devUrl && new URL(devUrl).origin === parsed.origin);
-  } catch {
-    return false;
+    return { isMainFrame: false, url: '' };
   }
 }
 
 function attachInternalApiTokenToAppSession(): void {
+  const isAppRendererUrl = createAppRendererUrlMatcher({
+    rendererFiles: [RENDERER_INDEX_FILE, RENDERER_FALLBACK_INDEX_FILE],
+    devUrl: getDevUrl()
+  });
   session.defaultSession.webRequest.onBeforeSendHeaders(
     {
       urls: [
@@ -4728,9 +6045,17 @@ function attachInternalApiTokenToAppSession(): void {
       ]
     },
     (details, callback) => {
-      if (isActualInternalApiOrigin(details.url)) {
-        details.requestHeaders['X-Awoo-Internal-Token'] =
-          INTERNAL_API_BROWSER_TOKEN;
+      const isInternalApiUrl = isActualInternalApiOrigin(details.url);
+      // The Mod UI preview shares this session, so the token goes only to the
+      // top-level renderer of the overlay and admin windows.
+      if (isInternalApiUrl && shouldAttachInternalToken({
+        isInternalApiUrl,
+        webContentsId: details.webContentsId,
+        trustedWebContentsIds: [...trustedRendererWebContentsIds],
+        frame: describeRequestFrame(details.frame),
+        isAppRendererUrl
+      })) {
+        details.requestHeaders[INTERNAL_API_TOKEN_HEADER] = INTERNAL_API_BROWSER_TOKEN;
       }
       callback({ requestHeaders: details.requestHeaders });
     }
@@ -4749,12 +6074,13 @@ function buildExternalState() {
       version: activePlayerSnapshot?.version || '',
       status: activePlayerSnapshot?.status || ''
     },
-    currentSong: currentPlayingSong || playerCurrentTrack,
+    currentSong: getSongWithDynamicCover(currentPlayingSong || playerCurrentTrack),
     currentIsRequested: Boolean(currentPlayingSong),
     queue: targetQueue,
     acceptingRequests: isAccepting,
     queuePlaybackEnabled: isPlaying,
     pausedAfterRequests: playerPausedAfterRequests,
+    requestNotifications: requestNotificationStore.snapshot(),
     commandQueue: {
       pending: danmakuCommandQueue.length,
       processing: processingDanmakuCommand
@@ -4762,207 +6088,23 @@ function buildExternalState() {
   });
 }
 
-const OBS_OVERLAY_HOST_HTML = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>嗷呜点歌机 Mod UI</title>
-  <link rel="stylesheet" href="/overlay/host.css">
-  <script src="/overlay/host.js" defer></script>
-</head>
-<body>
-  <iframe id="awoo-overlay-frame" title="嗷呜点歌机 Mod UI" sandbox="allow-scripts"></iframe>
-  <div id="awoo-overlay-status">正在载入 Mod UI…</div>
-</body>
-</html>`;
-
-const OBS_OVERLAY_HOST_CSS = `
-html,body,#awoo-overlay-frame{width:100%;height:100%;margin:0;background:transparent}
-body{overflow:hidden}
-#awoo-overlay-frame{display:block;border:0;opacity:0;transition:opacity .16s ease}
-#awoo-overlay-frame[data-ready="true"]{opacity:1}
-#awoo-overlay-status{position:fixed;left:16px;top:16px;padding:8px 11px;border:1px solid rgba(120,190,255,.35);border-radius:10px;background:rgba(12,24,40,.72);color:#bfe3ff;font:12px/1.4 system-ui,sans-serif}
-#awoo-overlay-frame[data-ready="true"]+#awoo-overlay-status{display:none}
-`;
-
-const OBS_OVERLAY_HOST_JS = `
-(function(){
-  var frame=document.getElementById('awoo-overlay-frame');
-  var status=document.getElementById('awoo-overlay-status');
-  var revision='';
-  var settingsRevision='';
-  var activeState=null;
-  function deliverSettings(){
-    if(!activeState||!frame.contentWindow)return;
-    frame.contentWindow.postMessage({
-      type:'awoo-overlay-settings',
-      overlayId:activeState.id||'builtin',
-      definitions:Array.isArray(activeState.settings)?activeState.settings:[],
-      values:activeState.values&&typeof activeState.values==='object'?activeState.values:{}
-    },'*');
-  }
-  function refresh(){
-    fetch('/api/v1/overlay',{cache:'no-store'}).then(function(response){
-      if(!response.ok)throw new Error('HTTP '+response.status);
-      return response.json();
-    }).then(function(state){
-      var active=state&&state.active?state.active:{};
-      var next=[active.id||'builtin',active.version||'',active.installedAt||''].join('@');
-      var nextSettings=JSON.stringify(active.values||{});
-      activeState=active;
-      if(next!==revision){
-        revision=next;
-        settingsRevision=nextSettings;
-        frame.dataset.ready='false';
-        status.textContent='正在载入 '+(active.name||'Mod UI')+'…';
-        frame.src='/overlay/content/?revision='+encodeURIComponent(next);
-        return;
-      }
-      if(nextSettings!==settingsRevision){
-        settingsRevision=nextSettings;
-      }
-      // iframe 在刚完成导航或被 Electron 后台节流时可能错过单次消息。
-      // 每轮补发当前参数，让预览与 OBS 最迟在下一次轮询恢复一致。
-      deliverSettings();
-    }).catch(function(error){
-      status.textContent='Mod UI 无法载入：'+error.message;
-    });
-  }
-  frame.addEventListener('load',function(){
-    frame.dataset.ready='true';
-    deliverSettings();
-  });
-  window.addEventListener('message',function(event){
-    if(event.source===frame.contentWindow&&event.data&&event.data.type==='awoo-overlay-ready'){
-      deliverSettings();
-    }
-  });
-  refresh();
-  window.setInterval(refresh,500);
-}());
-`;
-
-const OBS_OVERLAY_RUNTIME_JS = `
-(function(){
-  'use strict';
-  var current={overlayId:'',definitions:[],values:{}};
-  var applied=[];
-  var subscribers=[];
-  function attributeName(key){
-    return 'data-awoo-setting-'+String(key||'').replace(/([a-z0-9])([A-Z])/g,'$1-$2').replace(/[^A-Za-z0-9_-]/g,'-').toLowerCase();
-  }
-  function cssValue(definition,value){
-    if(typeof value==='boolean')return value?'1':'0';
-    return String(value)+(definition.cssUnit||'');
-  }
-  function apply(payload){
-    var root=document.documentElement;
-    applied.forEach(function(definition){
-      if(definition.cssVariable)root.style.removeProperty(definition.cssVariable);
-      root.removeAttribute(attributeName(definition.key));
-    });
-    var definitions=Array.isArray(payload.definitions)?payload.definitions:[];
-    var values=payload.values&&typeof payload.values==='object'?payload.values:{};
-    definitions.forEach(function(definition){
-      if(!definition||typeof definition.key!=='string')return;
-      var value=Object.prototype.hasOwnProperty.call(values,definition.key)?values[definition.key]:definition.default;
-      if(typeof definition.cssVariable==='string'&&/^--[a-z][a-z0-9-]*$/.test(definition.cssVariable)){
-        root.style.setProperty(definition.cssVariable,cssValue(definition,value));
-      }
-      root.setAttribute(attributeName(definition.key),String(value));
-    });
-    applied=definitions;
-    current={overlayId:String(payload.overlayId||''),definitions:definitions,values:Object.assign({},values)};
-    var detail={overlayId:current.overlayId,definitions:current.definitions,values:Object.assign({},current.values)};
-    window.dispatchEvent(new CustomEvent('awoo-overlay-settings',{detail:detail}));
-    subscribers.slice().forEach(function(callback){try{callback(detail);}catch(_error){}});
-  }
-  window.AwooOverlay={
-    getSettings:function(){return Object.assign({},current.values);},
-    subscribe:function(callback){
-      if(typeof callback!=='function')return function(){};
-      subscribers.push(callback);
-      if(current.overlayId)callback({overlayId:current.overlayId,definitions:current.definitions,values:Object.assign({},current.values)});
-      return function(){subscribers=subscribers.filter(function(item){return item!==callback;});};
-    }
-  };
-  window.addEventListener('message',function(event){
-    if(event.source!==window.parent||!event.data||event.data.type!=='awoo-overlay-settings')return;
-    apply(event.data);
-  });
-  window.parent.postMessage({type:'awoo-overlay-ready'},'*');
-}());
-`;
-
-function injectObsOverlayRuntime(content: Buffer): Buffer {
-  const html = content.toString('utf8');
-  if (html.includes('data-awoo-overlay-runtime')) return content;
-  const runtimeTag = '<script src="/overlay/runtime.js" defer data-awoo-overlay-runtime></script>';
-  const injected = /<head(?:\s[^>]*)?>/i.test(html)
-    ? html.replace(/<head(?:\s[^>]*)?>/i, match => `${match}\n  ${runtimeTag}`)
-    : `${runtimeTag}\n${html}`;
-  return Buffer.from(injected, 'utf8');
-}
-
-async function serveObsOverlay(
-  pathname: string,
-  res: http.ServerResponse
-): Promise<boolean> {
+async function readOverlayVendorScript(): Promise<Buffer> {
   try {
-    if (pathname === '/overlay/' || pathname === '/overlay/index.html') {
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.setHeader(
-        'Content-Security-Policy',
-        "default-src 'self'; frame-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'"
-      );
-      res.end(OBS_OVERLAY_HOST_HTML);
-      return true;
-    }
-    if (pathname === '/overlay/host.css') {
-      res.setHeader('Content-Type', 'text/css; charset=utf-8');
-      res.end(OBS_OVERLAY_HOST_CSS);
-      return true;
-    }
-    if (pathname === '/overlay/host.js') {
-      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
-      res.end(OBS_OVERLAY_HOST_JS);
-      return true;
-    }
-    if (pathname === '/overlay/runtime.js') {
-      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
-      res.end(OBS_OVERLAY_RUNTIME_JS);
-      return true;
-    }
-    if (!pathname.startsWith('/overlay/content/')) return false;
-    const relativePath = decodeURIComponent(
-      pathname.slice('/overlay/content/'.length)
+    // The renderer build emits this file next to index.html (vite.config.ts).
+    return await fs.promises.readFile(
+      path.join(app.getAppPath(), 'dist', 'overlay-vendor', 'hls.min.js')
     );
-    const asset = await getOverlayModManager().resolveActiveAsset(relativePath);
-    if (!asset) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Mod UI asset not found');
-      return true;
-    }
-    const rawContent = await fs.promises.readFile(asset.filePath);
-    const content = asset.contentType.startsWith('text/html')
-      ? injectObsOverlayRuntime(rawContent)
-      : rawContent;
-    res.setHeader('Content-Type', asset.contentType);
-    res.setHeader('X-Awoo-Overlay-Revision', asset.revision);
-    res.setHeader(
-      'Content-Security-Policy',
-      "default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; img-src http: https: data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' file: http://127.0.0.1:* http://localhost:*"
-    );
-    res.end(content);
-  } catch (error: unknown) {
-    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end(
-      `OBS overlay unavailable: ${error instanceof Error ? error.message : String(error)}`
-    );
+  } catch {
+    // `npm run dev` serves the renderer from memory; use the dev dependency.
+    return fs.promises.readFile(customRequire.resolve('hls.js/dist/hls.min.js'));
   }
-  return true;
 }
+
+const obsOverlayHost = createObsOverlayHost({
+  resolveActiveAsset: relativePath => getOverlayModManager().resolveActiveAsset(relativePath),
+  readVendorScript: readOverlayVendorScript,
+  vendorVersion: HLS_VENDOR_VERSION
+});
 
 async function buildFeedbackContext(
   includeLogs = false
@@ -5015,13 +6157,18 @@ async function buildFeedbackContext(
       compatible: status.compatible,
       updateAvailable: status.updateAvailable,
       updating: status.updating,
-      error: status.error
+      // File errors name paths in the Windows profile folder.
+      error: status.error ? sanitizeFeedbackLog(status.error) : status.error
     })),
-    connectorCheckError,
+    connectorCheckError: sanitizeFeedbackLog(connectorCheckError),
     queues: {
       requestedSongs: targetQueue.length,
       danmakuCommandsPending: danmakuCommandQueue.length,
       danmakuCommandProcessing: processingDanmakuCommand
+    },
+    dynamicCover: {
+      enabled: appConfig.sysConfig?.DynamicCoverEnabled !== false,
+      lastDiagnostic: lastDynamicCoverDiagnostic
     },
     service: {
       accepting: isAccepting,
@@ -5031,15 +6178,14 @@ async function buildFeedbackContext(
         appConfig.sysConfig?.ExternalHttpEnabled === true,
       externalWebSocketEnabled:
         appConfig.sysConfig?.ExternalWebSocketEnabled === true,
-      externalApiRunning
+      externalApiRunning: externalApi.getInfo().running
     }
   };
   if (includeLogs) {
-    diagnostics.recentLogs = sysLogs.slice(-80).map(log => ({
-      time: log.Time,
-      color: log.Color,
-      message: sanitizeFeedbackLog(log.Message)
-    }));
+    // The newest 80 lines plus up to 40 older connector/update lines, which
+    // chatty danmaku would otherwise have pushed out, within the size the
+    // feedback service accepts.
+    diagnostics.recentLogs = selectFeedbackLogs(sysLogs, { sanitize: sanitizeFeedbackLog });
   }
 
   return {
@@ -5060,12 +6206,6 @@ async function buildFeedbackContext(
   };
 }
 
-let externalApiServer: http.Server | null = null;
-let externalWebSocketServer: WebSocketServer | null = null;
-let externalBroadcastTimer: NodeJS.Timeout | null = null;
-let externalApiRunning = false;
-let lastExternalStateFingerprint = '';
-
 function getExternalApiPort(): number {
   const value = Number(appConfig.sysConfig?.ExternalApiPort);
   const configured = (
@@ -5084,151 +6224,221 @@ function getExternalApiPort(): number {
   return DEFAULT_EXTERNAL_API_PORT;
 }
 
-function stopExternalApiServer(): Promise<void> {
-  if (externalBroadcastTimer) {
-    clearInterval(externalBroadcastTimer);
-    externalBroadcastTimer = null;
-  }
-  lastExternalStateFingerprint = '';
-  externalApiRunning = false;
-  externalWebSocketServer?.clients.forEach(client => client.close(1001, 'server restart'));
-  externalWebSocketServer?.close();
-  externalWebSocketServer = null;
+const externalApi = createExternalApiServer({
+  getSettings: () => ({
+    httpEnabled: appConfig.sysConfig?.ExternalHttpEnabled === true,
+    wsEnabled: appConfig.sysConfig?.ExternalWebSocketEnabled === true,
+    port: getExternalApiPort()
+  }),
+  appVersion: app.getVersion(),
+  buildState: buildExternalState,
+  getOverlayPublicState: () => getOverlayModManager().getPublicState(),
+  serveOverlay: (req, res, pathname) => obsOverlayHost.serve(req, res, pathname),
+  log: writeLog
+});
 
-  const server = externalApiServer;
-  externalApiServer = null;
-  if (!server) return Promise.resolve();
-  return new Promise(resolve => server.close(() => resolve()));
+function stopExternalApiServer(): Promise<void> {
+  return externalApi.stop();
 }
 
-async function restartExternalApiServer(): Promise<void> {
-  await stopExternalApiServer();
-  const httpEnabled = appConfig.sysConfig?.ExternalHttpEnabled === true;
-  const webSocketEnabled = appConfig.sysConfig?.ExternalWebSocketEnabled === true;
-  if (!httpEnabled && !webSocketEnabled) {
-    writeLog('[外部接口] HTTP 与 WebSocket 均已关闭', 'DarkGray');
-    return;
-  }
-
-  const port = getExternalApiPort();
-  const server = http.createServer(async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (!httpEnabled || req.method !== 'GET') {
-      res.writeHead(404);
-      res.end();
-      return;
-    }
-
-    const url = new URL(req.url || '/', `http://${req.headers.host || `127.0.0.1:${port}`}`);
-    if (url.pathname === '/overlay') {
-      res.writeHead(302, { Location: `/overlay/${url.search}` });
-      res.end();
-      return;
-    }
-    if (await serveObsOverlay(url.pathname, res)) return;
-
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    if (url.pathname === '/health') {
-      res.end(JSON.stringify({ ok: true, schemaVersion: 1, version: app.getVersion() }));
-      return;
-    }
-
-    if (url.pathname === '/api/v1/overlay') {
-      res.end(JSON.stringify(await getOverlayModManager().getPublicState()));
-      return;
-    }
-
-    const state = buildExternalState();
-    if (url.pathname === '/api/v1/state') {
-      res.end(JSON.stringify(state));
-      return;
-    }
-    if (url.pathname === '/api/v1/current') {
-      res.end(JSON.stringify({
-        schemaVersion: state.schemaVersion,
-        appVersion: state.appVersion,
-        timestamp: state.timestamp,
-        player: state.player,
-        current: state.current,
-        currentIsRequested: state.currentIsRequested,
-        service: state.service
-      }));
-      return;
-    }
-    if (url.pathname === '/api/v1/queue') {
-      res.end(JSON.stringify({
-        schemaVersion: state.schemaVersion,
-        appVersion: state.appVersion,
-        timestamp: state.timestamp,
-        queue: state.queue,
-        queueLength: state.queueLength,
-        service: state.service
-      }));
-      return;
-    }
-    res.writeHead(404);
-    res.end(JSON.stringify({ error: 'not_found' }));
-  });
-
-  const webSocketServer = new WebSocketServer({ noServer: true });
-  server.on('upgrade', (request, socket, head) => {
-    const url = new URL(request.url || '/', `http://${request.headers.host || `127.0.0.1:${port}`}`);
-    if (!webSocketEnabled || url.pathname !== '/ws') {
-      socket.destroy();
-      return;
-    }
-    webSocketServer.handleUpgrade(request, socket, head, client => {
-      webSocketServer.emit('connection', client, request);
-    });
-  });
-  webSocketServer.on('connection', client => {
-    client.send(JSON.stringify({ type: 'state', data: buildExternalState() }));
-  });
-
-  externalApiServer = server;
-  externalWebSocketServer = webSocketServer;
-  server.on('error', (error: any) => {
-    externalApiRunning = false;
-    writeLog(`[外部接口] 启动失败: ${error?.message || error}`, 'Red');
-  });
-  server.listen(port, '127.0.0.1', () => {
-    externalApiRunning = true;
-    writeLog(
-      `✅ 外部只读接口已启动: ${httpEnabled ? `HTTP http://127.0.0.1:${port}/api/v1/state` : ''}`
-      + `${httpEnabled && webSocketEnabled ? ' | ' : ''}`
-      + `${webSocketEnabled ? `WebSocket ws://127.0.0.1:${port}/ws` : ''}`,
-      'Green'
-    );
-  });
-
-  externalBroadcastTimer = setInterval(() => {
-    if (!webSocketEnabled || webSocketServer.clients.size === 0) return;
-    const state = buildExternalState();
-    const fingerprint = JSON.stringify({ ...state, timestamp: undefined });
-    if (fingerprint === lastExternalStateFingerprint) return;
-    lastExternalStateFingerprint = fingerprint;
-    const payload = JSON.stringify({ type: 'state', data: state });
-    webSocketServer.clients.forEach(client => {
-      if (client.readyState === WebSocket.OPEN) client.send(payload);
-    });
-  }, 250);
+function restartExternalApiServer(): Promise<void> {
+  return externalApi.restart();
 }
 
 // ==========================================
 // 后端 API 与 静态网页托管服务
 // ==========================================
+const diagnosticsState: Omit<DiagnosticsState, 'reception'> = {
+  busy: false, phase: '', report: null, repairResults: [], error: ''
+};
+let diagnosticsKeyword = '晴天';
+
+function getDiagnosticsState(): DiagnosticsState {
+  return { ...diagnosticsState, reception: danmakuReceptionTracker.getState() };
+}
+
+function diagnosticError(error: unknown): string {
+  return sanitizeFeedbackLog(error instanceof Error ? error.message : String(error));
+}
+
+function isDiagnosticRoomCurrent(roomId: number): boolean {
+  return roomId === (biliRoomState.realRoomId || biliRoomState.requestedRoomId)
+    || (roomId > 0 && roomId === biliRoomState.requestedRoomId);
+}
+
+async function collectDiagnostics(keyword: string): Promise<void> {
+  const playerKey = getSelectedPlayerKey();
+  const roomSession = biliRoomSession;
+  diagnosticsState.phase = '正在检查连接器版本…';
+  let connector: ConnectorUpdateStatus | null = null;
+  let connectorError = '';
+  try {
+    connector = (await playerManager.getConnectorStatuses(true, playerKey))[0] || null;
+    connectorError = connector?.error ? diagnosticError(connector.error) : '';
+  } catch (error) {
+    connectorError = diagnosticError(error);
+  }
+  if (getSelectedPlayerKey() !== playerKey || biliRoomSession !== roomSession) {
+    throw new Error('检测期间播放器或直播间已切换，请重新检查');
+  }
+
+  diagnosticsState.phase = '正在测试歌曲搜索…';
+  let search: DiagnosticInputs['search'] = {
+    status: 'unknown', message: '连接器和播放器就绪后才能测试歌曲搜索'
+  };
+  // Search starts the bridge when it is absent. Only use an already connected,
+  // installed bridge so ordinary checks cannot install or switch connectors.
+  const connection = playerManager.connectionState;
+  if (connector?.installed && !connector.updating && !updateInstallationGuard.componentId
+      && connection.connected && !connection.connecting
+      && connection.snapshot?.capabilities?.search !== false) {
+    try {
+      const tracks = await playerManager.searchConnected(keyword);
+      search = tracks.length
+        ? { status: 'pass', message: `“${keyword}”搜索成功，找到 ${tracks.length} 个结果；尚未验证入队或播放` }
+        : { status: 'unknown', message: `“${keyword}”没有搜索结果，请换一首确定存在的歌曲重试` };
+    } catch (error) {
+      search = { status: 'error', message: `歌曲搜索失败：${diagnosticError(error)}` };
+    }
+  }
+  if (getSelectedPlayerKey() !== playerKey || biliRoomSession !== roomSession) {
+    throw new Error('检测期间播放器或直播间已切换，请重新检查');
+  }
+
+  const currentConnection = playerManager.connectionState;
+  const observation = danmakuReceptionTracker.observation;
+  const ordinaryUser = { uid: 'diagnostic-ordinary-viewer', uname: '', guardLevel: 0, medalLevel: 0, isManager: false };
+  const requirement = getGiftRequirementForGuardLevel(0).requirement;
+  const requiresGift = !canRequestWithGiftCredits(requirement, 0, false);
+  diagnosticsState.report = {
+    checkedAt: Date.now(), playerKey, playerLabel: PLAYER_LABELS[playerKey],
+    roomId: biliRoomState.realRoomId || biliRoomState.requestedRoomId,
+    checks: buildDiagnosticChecks({
+      room: getBiliRoomConnectionInfo(), loginReady: isBiliLoginReady(),
+      accepting: isAccepting, queuePlaybackEnabled: requestedQueuePlaybackEnabled,
+      playerKey, playerConnected: currentConnection.connected,
+      playerConnecting: currentConnection.connecting, snapshot: currentConnection.snapshot,
+      connector, connectorError, search,
+      ordinaryPermission: checkPermission(ordinaryUser, 'OrderPermission'),
+      giftRequirement: requiresGift ? describeGiftRequestRequirement(requirement) : '',
+      cooldownSeconds: Number(appConfig.sysConfig?.Cooldowns?.Normal) || 0,
+      pendingCommands: danmakuCommandQueue.length,
+      receptionCount: observation.count, lastDanmakuAt: observation.lastDanmakuAt
+    })
+  };
+}
+
+async function repairDiagnosticAction(
+  action: DiagnosticRepair, playerKey: PlayerKey, roomId: number
+): Promise<{ success: boolean; message: string }> {
+  if (getSelectedPlayerKey() !== playerKey
+      || !isDiagnosticRoomCurrent(roomId)) {
+    throw new Error('播放器或直播间已切换，修复已停止，请重新检查');
+  }
+  if (action === 'reconnect-room') {
+    if (!appConfig.roomConnectionEnabled || biliRoomState.status === 'connecting') {
+      return { success: false, message: '直播间已关闭或正在连接，已跳过重连' };
+    }
+    if (biliRoomState.status === 'connected') return { success: true, message: '直播间已恢复连接' };
+    const success = await connectToLiveRoom(Number(appConfig.roomId), { enable: false });
+    return { success, message: success ? '直播间已重新鉴权连接，请继续验证真实弹幕接收' : '直播间重连失败，请检查房间号、网络或重新登录' };
+  }
+  if (updateInstallationGuard.componentId || connectorMaintenanceRunning
+      || connectorAutoRepairInFlight || connectorConnectionRecoveryInFlight) {
+    return { success: false, message: '正在进行播放器维护或更新，请完成后重新检查' };
+  }
+  const status = (await playerManager.getConnectorStatuses(true, playerKey))[0];
+  if (getSelectedPlayerKey() !== playerKey
+      || !isDiagnosticRoomCurrent(roomId)) {
+    throw new Error('播放器或直播间已切换，修复已停止');
+  }
+  if (updateInstallationGuard.componentId || connectorMaintenanceRunning
+      || connectorAutoRepairInFlight || connectorConnectionRecoveryInFlight) {
+    return { success: false, message: '播放器维护或更新已开始，请完成后重试' };
+  }
+  if (!status || status.id !== playerKey || status.updating) {
+    return { success: false, message: '无法确认连接器状态，已跳过修复' };
+  }
+  if (action === 'update-connector') {
+    if (status.error || !status.latestVersion || !status.compatible || status.manualUpdateAvailable
+        || (status.installed && !status.autoUpdateAvailable)) {
+      return { success: false, message: status.error ? diagnosticError(status.error) : '当前更新不能自动应用，请在播放器设置中查看兼容要求' };
+    }
+    // The user asked for this repair, so its receipt may open the panel.
+    userInitiatedConnectorUpdates.add(playerKey);
+    try {
+      const result = await withPlayerConnectionRecoverySuppressed(
+        () => playerManager.updateConnector(playerKey, false)
+      );
+      return { success: result.success, message: diagnosticError(result.message) };
+    } finally {
+      userInitiatedConnectorUpdates.delete(playerKey);
+    }
+  }
+  if (!status.installed) return { success: false, message: '连接器尚未安装，请先完成连接器安装' };
+  if (playerManager.connectionState.connected) return { success: true, message: '播放器已恢复连接' };
+  if (playerManager.connectionState.connecting) return { success: false, message: '播放器正在连接，请稍后重新检查' };
+  // Reuse the existing single-flight reconnect coordinator without its
+  // optional cross-player-branch upgrade. Offline catalogs do not prevent
+  // reconnecting an already installed connector.
+  const success = await reconnectPlayerBridge(false);
+  return { success, message: success ? '播放器已重新连接' : '重连后仍未连接，请打开播放器并检查播放器版本与连接器是否匹配' };
+}
+
+async function runDiagnostics(repair: boolean, keyword = diagnosticsKeyword): Promise<void> {
+  if (diagnosticsState.busy) return;
+  const approvedReport = diagnosticsState.report;
+  const approvedActions = new Set(approvedReport?.checks.map(check => check.repair));
+  diagnosticsState.busy = true;
+  diagnosticsState.error = '';
+  diagnosticsState.repairResults = [];
+  diagnosticsState.report = null;
+  diagnosticsKeyword = keyword;
+  try {
+    if (repair && (!approvedReport || approvedReport.playerKey !== getSelectedPlayerKey()
+        || !isDiagnosticRoomCurrent(approvedReport.roomId))) {
+      throw new Error('当前设置与上次检查不一致，请先重新检查，再选择修复');
+    }
+    await collectDiagnostics(keyword);
+    const report = getDiagnosticsState().report;
+    if (repair && report) {
+      // Refresh first, then revalidate each action before it is executed. Put
+      // installation before reconnection, since a missing bridge cannot start.
+      const actions = new Set(report.checks.map(check => check.repair));
+      for (const action of ['reconnect-room', 'update-connector', 'reconnect-player'] as const) {
+        if (!actions.has(action) || !approvedActions.has(action)) continue;
+        diagnosticsState.phase = action === 'reconnect-room' ? '正在重连直播间…'
+          : action === 'update-connector' ? '正在安装或更新连接器…' : '正在重连播放器…';
+        try {
+          const result = await repairDiagnosticAction(action, report.playerKey as PlayerKey, report.roomId);
+          diagnosticsState.repairResults.push({ action, ...result });
+          writeLog(`[诊断修复] ${result.message}`, result.success ? 'Green' : 'Yellow');
+        } catch (error) {
+          diagnosticsState.repairResults.push({ action, success: false, message: diagnosticError(error) });
+        }
+      }
+      await collectDiagnostics(keyword);
+    }
+  } catch (error) {
+    diagnosticsState.report = null;
+    diagnosticsState.error = diagnosticError(error);
+  } finally {
+    diagnosticsState.busy = false;
+    diagnosticsState.phase = '';
+  }
+}
+
 async function startBackendServer(): Promise<void> {
   const server = http.createServer(async (req, res) => {
     try {
+      // A DNS-rebound page reaches this port under its own host name.
+      const address = server.address();
+      const listeningPort = address && typeof address === 'object' ? address.port : null;
+      if (!isLoopbackHostHeader(req.headers.host, actualInternalApiPort ?? listeningPort)) {
+        res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Invalid host');
+        return;
+      }
       const url = new URL(req.url || '/', `http://${req.headers.host}`);
       const origin = req.headers.origin;
       const isSkinMarketplaceRoute =
@@ -5239,7 +6449,33 @@ async function startBackendServer(): Promise<void> {
         && isLoopbackRemoteAddress(req.socket.remoteAddress)
         && isAllowedSkinMarketplaceOrigin(origin)
       );
-      if (!isAllowedInternalOrigin(origin) && !isTrustedSkinMarketplaceRequest) {
+      const hasValidToken = isValidInternalToken(
+        req.headers['x-awoo-internal-token'],
+        INTERNAL_API_BROWSER_TOKEN
+      );
+      const fromSameApp = isSameAppOrigin(origin, {
+        internalApiPort: actualInternalApiPort,
+        devUrl: getDevUrl()
+      });
+      const secFetchSite = req.headers['sec-fetch-site'];
+      const access = classifyInternalRequest({
+        origin,
+        hasValidToken,
+        isTrustedSkinMarketplace: isTrustedSkinMarketplaceRequest,
+        isSameAppOrigin: fromSameApp,
+        method: req.method,
+        pathname: url.pathname,
+        secFetchSite
+      });
+      // Update, catalog and feedback checks reach the network; other pages
+      // get the cached answer or a refusal instead of starting them.
+      const mayStartNetworkCheck = mayTriggerNetworkWork({
+        origin,
+        hasValidToken,
+        isSameAppOrigin: fromSameApp,
+        secFetchSite
+      });
+      if (access === 'forbid-origin') {
         res.writeHead(403);
         res.end('Forbidden origin');
         return;
@@ -5261,12 +6497,7 @@ async function startBackendServer(): Promise<void> {
       }
       if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-      if (
-        req.method !== 'GET'
-        && req.method !== 'HEAD'
-        && !isTrustedSkinMarketplaceRequest
-        && !isTrustedInternalMutationRequest(req)
-      ) {
+      if (access === 'forbid-mutation') {
         res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({
           success: false,
@@ -5274,6 +6505,73 @@ async function startBackendServer(): Promise<void> {
         }));
         return;
       }
+      if (access === 'forbid-sensitive-read') {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          success: false,
+          message: '此接口包含登录、日志或设置信息，仅限点歌机自身窗口读取'
+        }));
+        return;
+      }
+
+    if (url.pathname === '/api/diagnostics' || url.pathname.startsWith('/api/diagnostics/')) {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      if (!isLoopbackRemoteAddress(req.socket.remoteAddress)) {
+        res.writeHead(403);
+        res.end(JSON.stringify({ success: false, message: '诊断接口仅允许本机访问' }));
+        return;
+      }
+      if (url.pathname === '/api/diagnostics' && req.method === 'GET') {
+        res.end(JSON.stringify({ success: true, ...getDiagnosticsState() }));
+        return;
+      }
+      if (req.method !== 'POST') {
+        res.writeHead(405);
+        res.end(JSON.stringify({ success: false, message: '此操作需要 POST 请求' }));
+        return;
+      }
+      const body = await readJsonRequest(req);
+      if (url.pathname === '/api/diagnostics/run' || url.pathname === '/api/diagnostics/repair') {
+        const keyword = body.keyword === undefined ? diagnosticsKeyword : normalizeLocalSongKeyword(body.keyword);
+        if (!keyword) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ success: false, message: '测试歌名必须为 1 到 200 个字符' }));
+          return;
+        }
+        // Repeated requests share the same in-flight run, including renderer
+        // remounts. Return promptly so the panel can show phase/progress.
+        void runDiagnostics(url.pathname.endsWith('/repair'), keyword);
+        res.writeHead(202);
+        res.end(JSON.stringify({ success: true, ...getDiagnosticsState() }));
+        return;
+      }
+      if (url.pathname === '/api/diagnostics/reception') {
+        if (body.action === 'stop') {
+          danmakuReceptionTracker.cancel();
+        } else if (body.action === 'start') {
+          if (biliRoomState.status !== 'connected' || appConfig.roomConnectionEnabled !== true) {
+            res.writeHead(409);
+            res.end(JSON.stringify({ success: false, message: '请先连接直播间，再测试真实弹幕接收' }));
+            return;
+          }
+          danmakuReceptionTracker.start(
+            biliRoomSession,
+            biliRoomState.realRoomId || biliRoomState.requestedRoomId,
+            `嗷呜测试${randomBytes(3).toString('hex')}`
+          );
+        } else {
+          res.writeHead(400);
+          res.end(JSON.stringify({ success: false, message: '不支持的弹幕测试操作' }));
+          return;
+        }
+        res.end(JSON.stringify({ success: true, ...getDiagnosticsState() }));
+        return;
+      }
+      res.writeHead(404);
+      res.end(JSON.stringify({ success: false, message: '诊断接口不存在' }));
+      return;
+    }
 
     if (url.pathname === '/api/skin-marketplace/status' && req.method === 'GET') {
       if (origin && !isTrustedSkinMarketplaceRequest) {
@@ -5352,10 +6650,10 @@ async function startBackendServer(): Promise<void> {
 
     if (url.pathname === '/data') {
       const showPlayerCurrentTrack = appConfig.sysConfig?.ShowPlayerCurrentTrack !== false;
-      const displayCurrent = currentPlayingSong || (showPlayerCurrentTrack ? playerCurrentTrack : null);
+      const displayCurrent = getSongWithDynamicCover(currentPlayingSong || (showPlayerCurrentTrack ? playerCurrentTrack : null));
       const requestedSongArtwork = appConfig.sysConfig?.RequestedSongArtwork === 'song_cover' ? 'song_cover' : 'bili_avatar';
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ current: displayCurrent, currentIsRequested: !!currentPlayingSong, playerPausedAfterRequests, requestedSongArtwork, queue: targetQueue, status: connectorMaintenanceStatus || currentStatusMessage, accepting: isAccepting, playing: isPlaying, autoplayPauseConfirmed: isAutoplayPauseConfirmed(), uiConfig: appConfig.widgetStyle, rejects: recentRejects, cdpConnected: isPlayerConnected, playerConnected: isPlayerConnected, playerConnecting, roomConnection: getBiliRoomConnectionInfo(), commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand } }));
+      res.end(JSON.stringify({ current: displayCurrent, currentIsRequested: !!currentPlayingSong, playerPausedAfterRequests, requestedSongArtwork, queue: targetQueue, status: connectorMaintenanceStatus || currentStatusMessage, accepting: isAccepting, playing: isPlaying, autoplayPauseConfirmed: isAutoplayPauseConfirmed(), uiConfig: appConfig.widgetStyle, rejects: recentRejects, requestNotifications: requestNotificationStore.snapshot(), cdpConnected: isPlayerConnected, playerConnected: isPlayerConnected, playerConnecting, roomConnection: getBiliRoomConnectionInfo(), commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand } }));
       return;
     }
 
@@ -5562,13 +6860,14 @@ async function startBackendServer(): Promise<void> {
       if (req.method === 'POST') {
         const body = await readJsonRequest(req);
         const previousPlayerType = appConfig.sysConfig?.PlayerType;
+        const previousDynamicCoverEnabled = appConfig.sysConfig?.DynamicCoverEnabled !== false;
         const previousInternalApiPort = configuredInternalApiPort;
         const previousExternalSettings = JSON.stringify({
           http: appConfig.sysConfig?.ExternalHttpEnabled === true,
           ws: appConfig.sysConfig?.ExternalWebSocketEnabled === true,
           port: getExternalApiPort()
         });
-        if (body.roomId !== undefined) appConfig.roomId = body.roomId;
+        if (body.roomId !== undefined) appConfig.roomId = normalizeRoomId(body.roomId, appConfig.roomId);
         if (body.roomConnectionEnabled === false) {
           disconnectFromLiveRoom();
         } else if (body.roomConnectionEnabled === true) {
@@ -5589,30 +6888,28 @@ async function startBackendServer(): Promise<void> {
             alwaysOnTop: getOverlayAlwaysOnTop()
           };
         }
-        if (body.sysConfig !== undefined) {
-          const incomingConfig = { ...body.sysConfig };
-          delete incomingConfig.FoliaTokenConfigured;
+        if (
+          body.sysConfig
+          && typeof body.sysConfig === 'object'
+          && !Array.isArray(body.sysConfig)
+        ) {
           appConfig.sysConfig = {
             ...appConfig.sysConfig,
-            ...incomingConfig
+            ...body.sysConfig
           };
         }
-        if (!['NCM', 'Kugou', 'QQMusic', 'Folia'].includes(appConfig.sysConfig?.PlayerType)) appConfig.sysConfig.PlayerType = 'NCM';
-        if (appConfig.sysConfig.FoliaToken === undefined) appConfig.sysConfig.FoliaToken = '';
-        appConfig.sysConfig.GiftRequestRequirements =
-          normalizeGiftRequestRequirements(
-            appConfig.sysConfig.GiftRequestRequirements
-          );
-        appConfig.sysConfig.InternalApiPort = normalizeLocalApiPort(
-          appConfig.sysConfig.InternalApiPort,
-          ENV_INTERNAL_API_PORT
-        );
+        // The same rules as loading the file; FoliaTokenConfigured is derived
+        // and dropped there, unknown keys are kept.
+        appConfig.sysConfig = normalizeSysConfig(appConfig.sysConfig, {
+          envInternalPort: ENV_INTERNAL_API_PORT
+        });
+        if (previousDynamicCoverEnabled && !appConfig.sysConfig.DynamicCoverEnabled) {
+          dynamicCoverService.clear();
+        }
         configuredInternalApiPort = appConfig.sysConfig.InternalApiPort;
+        // Also moves the external port off the internal port actually in use.
         appConfig.sysConfig.ExternalApiPort = getExternalApiPort();
-        delete appConfig.sysConfig.EnableCDP;
-        delete appConfig.sysConfig.CdpPort;
-        delete appConfig.sysConfig.NcmExePath;
-        saveConfig();
+        saveConfigNow();
         if (configuredInternalApiPort !== previousInternalApiPort) {
           writeLog(
             `[内部 API] 已保存请求端口 ${configuredInternalApiPort}，重启点歌机后生效（当前启动请求 ${requestedInternalApiPort}，实际使用 ${actualInternalApiPort || '未启动'}）`,
@@ -5625,6 +6922,8 @@ async function startBackendServer(): Promise<void> {
           clearRecentQqGuardedCompletion();
           clearRegisteredNextGuard();
           clearSkipForcePlayOnce();
+          // Requests still searching the previous player must not enqueue.
+          playerSelectionEpoch++;
           targetQueue = [];
           currentPlayingSong = null;
           playerPausedAfterRequests = false;
@@ -5655,6 +6954,7 @@ async function startBackendServer(): Promise<void> {
         }));
         return;
       }
+      const externalApiInfo = externalApi.getInfo();
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
         roomId: appConfig.roomId,
@@ -5682,15 +6982,17 @@ async function startBackendServer(): Promise<void> {
         connectorMaintenanceStatus,
         giftLearning: getGiftLearningState(),
         commandQueue: { pending: danmakuCommandQueue.length, processing: processingDanmakuCommand },
-        current: currentPlayingSong || playerCurrentTrack,
+        current: getSongWithDynamicCover(currentPlayingSong || playerCurrentTrack, { lookup: false }),
         currentIsRequested: Boolean(currentPlayingSong),
         playerPausedAfterRequests,
         internalApi: getInternalApiInfo(),
         externalApi: {
-          running: externalApiRunning,
+          running: externalApiInfo.running,
           httpEnabled: appConfig.sysConfig?.ExternalHttpEnabled === true,
           webSocketEnabled: appConfig.sysConfig?.ExternalWebSocketEnabled === true,
-          port: getExternalApiPort()
+          port: getExternalApiPort(),
+          // The last bind or runtime error, e.g. EADDRINUSE when the port is taken.
+          error: externalApiInfo.error
         },
         config: getPublicSysConfig()
       }));
@@ -5707,74 +7009,9 @@ async function startBackendServer(): Promise<void> {
       }
       lastQueueActionTime = now;
 
-      const doc = await readJsonRequest(req);
-      const { action, index } = doc;
-
-      if (action === 'delete' && index >= 0 && index < targetQueue.length) {
-        const previousHead = targetQueue[0] || null;
-        targetQueue.splice(index, 1);
-        if (index === 0) {
-          await reconcileQueueHeadAfterMutation(previousHead, '删除队首');
-        }
-        setGlobalStatus('🗑️ 已移除曲目');
-      }
-      else if (action === 'top' && index >= 0 && index < targetQueue.length) {
-        const previousHead = targetQueue[0] || null;
-        const item = targetQueue.splice(index, 1)[0];
-        if (item) {
-          targetQueue.unshift(item);
-          await reconcileQueueHeadAfterMutation(previousHead, '置顶队列');
-          setGlobalStatus(`⬆️ 置顶: ${item.SongName}`);
-        }
-      } else if (action === 'play_now' && index >= 0 && index < targetQueue.length) {
-        const item = targetQueue[index];
-        if (item) {
-          clearRecentQqGuardedCompletion();
-          const played = await playSongNow(item);
-          if (played && targetQueue[index] === item) {
-            targetQueue.splice(index, 1);
-          }
-          setGlobalStatus(
-            played
-              ? `▶️ 强制播放: ${item.SongName}`
-              : `⚠️ 强制播放未确认，已保留在队列: ${item.SongName}`
-          );
-        }
-      } else if (action === 'skip_current') {
-        await requestPlayerNext();
-        setGlobalStatus('⏭️ 已切歌');
-      } else if (action === 'reorder' && doc.from >= 0 && doc.from < targetQueue.length && doc.to >= 0 && doc.to < targetQueue.length) {
-        const previousHead = targetQueue[0] || null;
-        const item = targetQueue.splice(doc.from, 1)[0];
-        if (item) {
-          targetQueue.splice(doc.to, 0, item);
-          await reconcileQueueHeadAfterMutation(previousHead, '重排队列');
-          setGlobalStatus('🔄 列表已重排');
-        }
-      } else if (action === 'push_current_to_queue') {
-        if (currentPlayingSong) {
-          // Returning the current request to the queue starts a fresh
-          // guard cycle, even when the same song object is reused.
-          const returningSongIdentity = getQueueSongIdentity(
-            currentPlayingSong
-          );
-          if (
-            targetQueue.length === 0
-            || registeredNextGuardSongIdentity === returningSongIdentity
-          ) {
-            // Reject an old terminal snapshot during the gap between the
-            // native Next and registration of this new same-song cycle.
-            clearRegisteredNextGuard();
-          }
-          clearRecentQqGuardedCompletion();
-          skipForcePlayOnceSong = currentPlayingSong;
-          targetQueue.push(currentPlayingSong);
-          skipForcePlayOnce = true;
-          setGlobalStatus('🔙 已退回点歌列表末端');
-          await requestPlayerNext();
-        }
-      }
-      res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true }));
+      const result = await applyQueueAction(await readJsonRequest(req));
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify(result));
       return;
     }
 
@@ -5847,7 +7084,7 @@ async function startBackendServer(): Promise<void> {
 
     if (url.pathname === '/api/connectors/status' && req.method === 'GET') {
       try {
-        const forceRefresh = url.searchParams.get('refresh') === '1';
+        const forceRefresh = url.searchParams.get('refresh') === '1' && mayStartNetworkCheck;
         const connectorId = url.searchParams.get('connectorId');
         if (connectorId !== null && !['netease', 'kugou', 'qqmusic', 'folia'].includes(connectorId)) {
           res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -5914,6 +7151,11 @@ async function startBackendServer(): Promise<void> {
           success: false,
           message: '问题编号格式无效'
         }));
+        return;
+      }
+      if (!mayStartNetworkCheck) {
+        res.writeHead(403);
+        res.end(JSON.stringify({ success: false, message: '只有点歌机自身窗口或本机工具可以查询反馈状态' }));
         return;
       }
       try {
@@ -6024,20 +7266,29 @@ async function startBackendServer(): Promise<void> {
           return;
         }
 
-        setGlobalStatus(`正在更新${PLAYER_LABELS[connectorId]}连接器...`);
-        const result = await withPlayerConnectionRecoverySuppressed(
-          () => playerManager.updateConnector(connectorId, true)
+        // The status stays for the whole update instead of expiring after 4 s.
+        const statusOwner = claimConnectorMaintenanceStatus(
+          `正在更新${PLAYER_LABELS[connectorId]}连接器...`
         );
-        setGlobalStatus(
-          result.success
-            ? `✅ ${result.message}`
-            : `❌ ${result.message}`
-        );
-        writeLog(
-          `[连接器更新] ${result.message}`,
-          result.success ? 'Green' : 'Red'
-        );
-        res.end(JSON.stringify(result));
+        userInitiatedConnectorUpdates.add(connectorId);
+        try {
+          const result = await withPlayerConnectionRecoverySuppressed(
+            () => playerManager.updateConnector(connectorId, true)
+          );
+          setGlobalStatus(
+            result.success
+              ? `✅ ${result.message}`
+              : `❌ ${result.message}`
+          );
+          writeLog(
+            `[连接器更新] ${result.message}`,
+            result.success ? 'Green' : 'Red'
+          );
+          res.end(JSON.stringify(result));
+        } finally {
+          userInitiatedConnectorUpdates.delete(connectorId);
+          releaseConnectorMaintenanceStatus(statusOwner);
+        }
       } catch (error: unknown) {
         const message = error instanceof Error
           ? error.message
@@ -6067,19 +7318,28 @@ async function startBackendServer(): Promise<void> {
           return;
         }
 
-        const result = await withPlayerConnectionRecoverySuppressed(
-          () => playerManager.reinstallConnector(connectorId)
+        const statusOwner = claimConnectorMaintenanceStatus(
+          `正在重新安装${PLAYER_LABELS[connectorId]}连接器...`
         );
-        setGlobalStatus(
-          result.success
-            ? `✅ ${result.message}`
-            : `❌ ${result.message}`
-        );
-        writeLog(
-          `[连接器重装] ${result.message}`,
-          result.success ? 'Green' : 'Red'
-        );
-        res.end(JSON.stringify(result));
+        userInitiatedConnectorUpdates.add(connectorId);
+        try {
+          const result = await withPlayerConnectionRecoverySuppressed(
+            () => playerManager.reinstallConnector(connectorId)
+          );
+          setGlobalStatus(
+            result.success
+              ? `✅ ${result.message}`
+              : `❌ ${result.message}`
+          );
+          writeLog(
+            `[连接器重装] ${result.message}`,
+            result.success ? 'Green' : 'Red'
+          );
+          res.end(JSON.stringify(result));
+        } finally {
+          userInitiatedConnectorUpdates.delete(connectorId);
+          releaseConnectorMaintenanceStatus(statusOwner);
+        }
       } catch (error: unknown) {
         const message = error instanceof Error
           ? error.message
@@ -6097,8 +7357,10 @@ async function startBackendServer(): Promise<void> {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.setHeader('Cache-Control', 'no-store');
       try {
+        // Only the app's own windows may force the network check; other
+        // callers get the cached result instead of triggering it repeatedly.
         res.end(JSON.stringify(await getUpdateAnnouncementService().get(
-          url.searchParams.get('refresh') === '1'
+          url.searchParams.get('refresh') === '1' && hasValidToken
         )));
       } catch {
         res.writeHead(503);
@@ -6126,30 +7388,40 @@ async function startBackendServer(): Promise<void> {
       return;
     }
 
+    // Kept for local tools; the app's own windows use the announcements.
     if (url.pathname === '/api/update/check') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      if (req.method !== 'GET') {
+        res.writeHead(405, { Allow: 'GET' });
+        res.end(JSON.stringify({ error: '此接口只支持 GET 请求' }));
+        return;
+      }
+      if (!mayStartNetworkCheck) {
+        res.writeHead(403);
+        res.end(JSON.stringify({ error: '只有点歌机自身窗口或本机工具可以检查更新' }));
+        return;
+      }
       if (allowMultipleInstances) {
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.end(JSON.stringify({
           error: '多实例调试模式下已禁用自动更新，请使用正式安装版更新'
         }));
         return;
       }
       try {
-        const um = new UpdateManager('https://app.enkianss.us/update/awoo');
-        const updateInfo = await um.checkForUpdatesAsync();
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        if (updateInfo) res.end(JSON.stringify({ hasUpdate: true, version: updateInfo.TargetFullRelease.Version }));
-        else res.end(JSON.stringify({ hasUpdate: false }));
-      } catch (err: any) { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ error: `无法连接更新服务器` })); }
+        res.end(JSON.stringify(await getAppUpdater().check()));
+      } catch {
+        res.end(JSON.stringify({ error: '无法连接更新服务器' }));
+      }
       return;
     }
 
     if (url.pathname === '/api/update/status' && req.method === 'GET') {
+      const updater = getAppUpdater();
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
         success: true,
-        status: appUpdateDownloadStatus,
-        phase: appUpdatePhase
+        status: updater.getStatus(),
+        phase: updater.phase
       }));
       return;
     }
@@ -6172,13 +7444,14 @@ async function startBackendServer(): Promise<void> {
           message: '连接器正在更新，请完成后再更新点歌机' }));
         return;
       }
-      const started = startAppUpdateOperation();
+      const updater = getAppUpdater();
+      const started = updater.start();
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
         success: true,
         alreadyRunning: !started,
-        status: appUpdateDownloadStatus,
-        phase: appUpdatePhase
+        status: updater.getStatus(),
+        phase: updater.phase
       }));
       return;
     }
@@ -6214,7 +7487,13 @@ async function startBackendServer(): Promise<void> {
     if (url.pathname === '/api/bili/logout' && req.method === 'POST') { logoutBiliAccount(); res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
     if (url.pathname === '/api/bili/qrstart' && req.method === 'POST') { startBiliQrLogin(); res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ success: true })); return; }
     if (url.pathname === '/api/bili/qrstatus') { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ qrBase64: qrCodeBase64, status: qrLoginStatus, isLogin: isBiliLoginReady(), uid: biliUid, currentUser: currentUserInfo })); return; }
-    if (url.pathname === '/api/logs') { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify(sysLogs)); return; }
+    if (url.pathname === '/api/logs') {
+      // ?after=<Seq> returns only newer lines; without it the whole ring, as before.
+      const after = parseLogCursor(url.searchParams.get('after'));
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify(selectLogsAfter(sysLogs, after)));
+      return;
+    }
 
     if (req.method === 'GET' && !url.pathname.startsWith('/api/') && url.pathname !== '/data') {
       const distPath = path.resolve(__dirname, '../dist');
@@ -6297,6 +7576,8 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
       CONNECTOR_MAINTENANCE_INTERVAL_MS
     );
   }
+  // The handler applies the same isolation gate as the timer above.
+  powerMonitor.on('resume', scheduleConnectorMaintenanceAfterResume);
   // 先开始监听本地接口，再加载悬浮窗，避免首次轮询撞上尚未启动的后端。
   void startBackendServer().then(() => {
     attachInternalApiTokenToAppSession();
@@ -6323,14 +7604,26 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
 
 app.on('before-quit', () => {
   applicationQuitRequested = true;
-  if (giftLibrarySaveTimer) {
-    clearTimeout(giftLibrarySaveTimer);
-    giftLibrarySaveTimer = null;
-    saveConfig();
-  }
+  dynamicCoverService.dispose();
   if (connectorMaintenanceTimer) {
     clearInterval(connectorMaintenanceTimer);
     connectorMaintenanceTimer = null;
+  }
+  if (connectorMaintenanceRetryTimer) {
+    clearTimeout(connectorMaintenanceRetryTimer);
+    connectorMaintenanceRetryTimer = null;
+  }
+  if (connectorMaintenanceResumeTimer) {
+    clearTimeout(connectorMaintenanceResumeTimer);
+    connectorMaintenanceResumeTimer = null;
+  }
+  if (qqCompatibilityRecoveryTimer) {
+    clearTimeout(qqCompatibilityRecoveryTimer);
+    qqCompatibilityRecoveryTimer = null;
+  }
+  if (deferredConnectorRestartTimer) {
+    clearTimeout(deferredConnectorRestartTimer);
+    deferredConnectorRestartTimer = null;
   }
   // Stop sockets and delayed reconnects without changing the persisted
   // connection preference; an enabled room may reconnect on the next launch.
@@ -6343,8 +7636,24 @@ app.on('before-quit', () => {
   actualInternalApiPort = null;
   if (internalServer?.listening) internalServer.close();
   void stopExternalApiServer();
+  // Synchronous on purpose: waiting here would need a second quit request,
+  // and requestApplicationQuit stays the one idempotent quit path.
+  flushPendingWrites();
 });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') requestApplicationQuit();
 });
+
+// Windows close between before-quit and here; catch what they still saved or logged.
+app.on('will-quit', flushPendingWrites);
+
+/**
+ * Writes a scheduled settings save and the queued log lines before the
+ * process ends: at quit, and when Windows ends the session. Each call writes
+ * only what is still pending, so repeated calls are harmless.
+ */
+function flushPendingWrites(): void {
+  appConfigStore.flushSync();
+  logSink.flushSync();
+}

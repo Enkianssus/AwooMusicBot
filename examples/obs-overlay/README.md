@@ -50,7 +50,7 @@ http://127.0.0.1:5556/overlay/?maxQueue=3
 ws://127.0.0.1:5556/ws
 ```
 
-收到 `{ "type": "state", "data": ... }` 后刷新页面。WebSocket 不可用时，会每 3 秒读取一次：
+收到 `{ "type": "state", "data": ... }` 后刷新页面。WebSocket 断开期间，会每 1 秒读取一次（同时按 1–15 秒退避重连 WebSocket）：
 
 ```text
 GET http://127.0.0.1:5556/api/v1/state

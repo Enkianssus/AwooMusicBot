@@ -89,6 +89,7 @@ body {
 }
 
 .cover-frame img,
+.cover-frame video,
 .cover-fallback {
   width: 100%;
   height: 100%;
@@ -101,6 +102,15 @@ body {
   will-change: transform;
 }
 
+.cover-frame video {
+  position: absolute;
+  inset: 0;
+  object-fit: cover;
+  pointer-events: none;
+  animation: none;
+  transform: none;
+}
+
 html[data-awoo-setting-cover-rotation="true"] .cover-frame img:not([hidden]) {
   animation: awoo-cover-spin var(--cover-spin-duration) linear infinite;
 }
@@ -108,6 +118,12 @@ html[data-awoo-setting-cover-rotation="true"] .cover-frame img:not([hidden]) {
 html[data-awoo-setting-cover-rotation="true"] .cover-frame {
   border-radius: 50%;
   transition: none;
+}
+
+html[data-awoo-setting-cover-rotation="true"] .cover-frame[data-dynamic-cover="true"],
+html[data-awoo-setting-cover-rotation="true"] .cover-frame[data-dynamic-cover="true"] img {
+  animation: none;
+  transform: none;
 }
 
 .cover-frame[data-artwork-kind="requester_avatar"] {
@@ -286,6 +302,10 @@ html[data-awoo-setting-cover-rotation="true"] .cover-frame {
   transition: background-color 220ms ease, box-shadow 220ms ease;
 }
 
+.queue[data-has-notices="true"] {
+  min-height: 190px;
+}
+
 .queue[data-paused="true"] {
   background: linear-gradient(135deg, rgba(109, 25, 42, 0.42), rgba(58, 24, 43, 0.3));
   box-shadow: inset 0 0 0 1px rgba(255, 122, 143, 0.22);
@@ -313,6 +333,61 @@ html[data-awoo-setting-cover-rotation="true"] .cover-frame {
   color: var(--muted);
   font-size: 11px;
   white-space: nowrap;
+}
+
+/* Notices sit in flow above the list, so they never cover queued songs. */
+.queue-notifications {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 9px;
+  pointer-events: none;
+}
+
+.request-notification {
+  --notice-color: var(--accent);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 7px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--notice-color);
+  border-radius: 9px;
+  background: rgba(22, 22, 34, 0.97);
+  box-shadow: 0 5px 16px rgba(5, 3, 15, 0.3);
+}
+
+.request-notification[data-kind="waiting"] { --notice-color: var(--warning); }
+.request-notification[data-kind="success"] { --notice-color: var(--success); }
+.request-notification[data-kind="error"] { --notice-color: var(--danger); }
+
+.request-notification-status {
+  color: var(--notice-color);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.request-notification-title,
+.request-notification-message {
+  overflow: hidden;
+  margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.request-notification-title {
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.request-notification-message {
+  grid-column: 1 / -1;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 9px;
 }
 
 .queue-list {
@@ -425,6 +500,10 @@ html[data-awoo-setting-cover-rotation="true"] .cover-frame {
   .queue-empty {
     margin: 16px 0 3px;
   }
+
+  .queue[data-has-notices="true"] {
+    min-height: 0;
+  }
 }
 
 @media (max-width: 360px) {
@@ -438,8 +517,7 @@ html[data-awoo-setting-cover-rotation="true"] .cover-frame {
     height: 78px;
   }
 
-  .brand > span:last-child,
-  .connection > span:last-child {
+  .brand > span:last-child {
     display: none;
   }
 }

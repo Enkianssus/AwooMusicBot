@@ -1,25 +1,56 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { internalApiUrl } from './internal-api';
 import { AwooMark, UiIcon } from './ui-icons';
+import ReleaseNotes from './components/ReleaseNotes';
 import {
+    DISMISSED_ANNOUNCEMENTS_STORAGE_KEY,
     automaticAnnouncementMode,
+    clampPercent,
+    countPendingAnnouncements,
+    describeConnectorProgress,
+    describeDownloadedBytes,
+    formatUpdateBytes,
+    isCoreProgressVisible,
+    isCoreUpdateActive,
     normalizeAnnouncementSnapshot,
+    parseDismissedAnnouncementKeys,
+    planAnnouncementDismissal,
     selectUpdateActions,
     selectVisibleAnnouncements,
     type AnnouncementSessionState,
+    type ConnectorUpdateProgress,
+    type CoreUpdateConfirmation,
     type UpdateAnnouncement,
     type UpdateAnnouncementSnapshot,
+    type UpdateComponentId,
 } from './update-announcement-policy';
 import './update-announcements.css';
 
-export type { UpdateAnnouncement, UpdateReceipt } from './update-announcement-policy';
+export type { ConnectorUpdateProgress, CoreUpdateConfirmation, UpdateAnnouncement, UpdateReceipt } from './update-announcement-policy';
+
+export interface CoreUpdateProgressState {
+    state: string;
+    progress: number | null;
+    message: string;
+    sizeBytes?: number | null;
+    /** The progress has not changed for about two minutes. */
+    stalled?: boolean;
+}
 
 interface UpdateAnnouncementsProps {
     suspended?: boolean;
     openRequest?: number;
+    /** Keeps the dialog open: a running connector update or the final core restart. */
     busy?: boolean;
-    coreProgress?: { state: string; progress: number | null; message: string } | null;
-    onCoreUpdate: () => Promise<void>;
+    coreProgress?: CoreUpdateProgressState | null;
+    connectorProgress?: Partial<Record<UpdateComponentId, ConnectorUpdateProgress | null>>;
+    /** Set while the core update waits for the user to confirm the restart. */
+    coreConfirmation?: CoreUpdateConfirmation | null;
+    onCoreConfirmation?: (confirmed: boolean) => void;
+    /** Pending updates for the navigation badge. */
+    onSnapshot?: (count: number) => void;
+    onCheckingChange?: (checking: boolean) => void;
+    onCoreUpdate: (item: UpdateAnnouncement) => Promise<void>;
     onConnectorUpdate: (item: UpdateAnnouncement) => Promise<void>;
 }
 
@@ -38,31 +69,103 @@ function readSession(sessionId: string): AnnouncementSessionState {
     return emptySession();
 }
 
+function readDismissedKeys(): string[] {
+    try {
+        return parseDismissedAnnouncementKeys(localStorage.getItem(DISMISSED_ANNOUNCEMENTS_STORAGE_KEY));
+    } catch {
+        return [];
+    }
+}
+
+function saveDismissedKeys(keys: string[]) {
+    try {
+        localStorage.setItem(DISMISSED_ANNOUNCEMENTS_STORAGE_KEY, JSON.stringify(keys));
+    } catch { /* The badge keeps the in-memory list while the window is open. */ }
+}
+
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message.slice(0, 1000) : '操作失败，请重试。';
 }
 
-export default function UpdateAnnouncements({ suspended = false, openRequest = 0, busy = false, coreProgress, onCoreUpdate, onConnectorUpdate }: UpdateAnnouncementsProps) {
+function displayVersion(version: string): string {
+    return `v${version.replace(/^v/i, '')}`;
+}
+
+/** Shows the dialog as a modal unless it already is, and moves focus to its title. */
+function presentDialog(dialog: HTMLDialogElement) {
+    if (!dialog.open) dialog.showModal();
+    dialog.querySelector<HTMLElement>('[data-initial-focus]')?.focus();
+}
+
+/** The core update as the server reports it; shared by the dialog and the 版本升级 page. */
+export function CoreUpdateProgress({ status, className = '' }: { status?: CoreUpdateProgressState | null; className?: string }) {
+    if (!status || !isCoreProgressVisible(status.state)) return null;
+    const failed = status.state === 'error';
+    // The version check reports 0 without measuring anything, so it shows an indeterminate bar.
+    const percent = failed || status.state === 'checking' ? null : clampPercent(status.progress);
+    const bytes = status.state === 'downloading' ? describeDownloadedBytes(percent, status.sizeBytes) : null;
+    const stallHint = status.stalled && !failed
+        ? status.state === 'checking' ? '检查更新似乎停滞，可稍后重试' : '下载似乎停滞，可稍后重试'
+        : '';
+    return (
+        <div className={`update-announcements-progress${failed ? ' is-error' : ''}${stallHint ? ' is-stalled' : ''}${className ? ` ${className}` : ''}`}>
+            <div>
+                <span role="status">{status.message || (failed ? '点歌机更新失败，请稍后重试' : '正在更新点歌机…')}</span>
+                {percent !== null && <strong>{Math.round(percent)}%</strong>}
+            </div>
+            {!failed && <progress max={100} value={percent ?? undefined} aria-label="点歌机更新进度" />}
+            {(bytes || stallHint) && (
+                <p className="update-announcements-progress-detail">
+                    {bytes && <span>{bytes}</span>}
+                    {stallHint && <span role="status" className="update-announcements-stall">{stallHint}</span>}
+                </p>
+            )}
+        </div>
+    );
+}
+
+export default function UpdateAnnouncements({
+    suspended = false,
+    openRequest = 0,
+    busy = false,
+    coreProgress,
+    connectorProgress,
+    coreConfirmation = null,
+    onCoreConfirmation,
+    onSnapshot,
+    onCheckingChange,
+    onCoreUpdate,
+    onConnectorUpdate,
+}: UpdateAnnouncementsProps) {
     const [snapshot, setSnapshot] = useState<UpdateAnnouncementSnapshot | null>(null);
     const [open, setOpen] = useState(false);
     const [mode, setMode] = useState<'updates' | 'success'>('updates');
     const [checking, setChecking] = useState(false);
-    const [loading, setLoading] = useState(false);
     const [requestError, setRequestError] = useState('');
     const [actionError, setActionError] = useState('');
     const [actionId, setActionId] = useState<string | null>(null);
     const [acknowledging, setAcknowledging] = useState(false);
     const [sessionRevision, setSessionRevision] = useState(0);
+    const [dismissedKeys, setDismissedKeys] = useState<string[]>(readDismissedKeys);
     const dialogRef = useRef<HTMLDialogElement>(null);
+    const confirmRef = useRef<HTMLDivElement>(null);
     const snapshotRef = useRef(snapshot);
+    const dismissedKeysRef = useRef(dismissedKeys);
+    const onSnapshotRef = useRef(onSnapshot);
+    const onCheckingChangeRef = useRef(onCheckingChange);
     const mountedRef = useRef(false);
     const requestRef = useRef<AbortController | null>(null);
     const sessionRef = useRef<{ id: string; state: AnnouncementSessionState } | null>(null);
     const actionLockRef = useRef(false);
     const lastOpenRequestRef = useRef(0);
+    const visibleRef = useRef(false);
     const titleId = useId();
     const descriptionId = useId();
+    const confirmTitleId = useId();
     snapshotRef.current = snapshot;
+    dismissedKeysRef.current = dismissedKeys;
+    onSnapshotRef.current = onSnapshot;
+    onCheckingChangeRef.current = onCheckingChange;
 
     const loadSnapshot = useCallback(async (refresh = false) => {
         if (requestRef.current && !refresh) return;
@@ -70,7 +173,7 @@ export default function UpdateAnnouncements({ suspended = false, openRequest = 0
         const controller = new AbortController();
         requestRef.current = controller;
         const timeout = window.setTimeout(() => controller.abort(), 30000);
-        setLoading(true);
+        // Background polls keep the current content; only a manual check shows progress.
         if (refresh) setChecking(true);
         try {
             const response = await fetch(internalApiUrl(`/api/updates/announcements${refresh ? '?refresh=1' : ''}`), { cache: 'no-store', signal: controller.signal });
@@ -88,16 +191,24 @@ export default function UpdateAnnouncements({ suspended = false, openRequest = 0
             window.clearTimeout(timeout);
             if (requestRef.current === controller) {
                 requestRef.current = null;
-                if (mountedRef.current) { setLoading(false); setChecking(false); }
+                if (mountedRef.current) setChecking(false);
             }
         }
     }, []);
+
+    /** A snapshot started before an acknowledgement must not restore the acknowledged receipts. */
+    const reloadAfterAcknowledgement = useCallback(() => {
+        requestRef.current?.abort();
+        requestRef.current = null;
+        setChecking(false);
+        return loadSnapshot();
+    }, [loadSnapshot]);
 
     useEffect(() => {
         mountedRef.current = true;
         void loadSnapshot();
         const poll = window.setInterval(() => { void loadSnapshot(); }, 15000);
-        const changed = () => { void loadSnapshot(); };
+        const changed = (event: Event) => { void loadSnapshot((event as CustomEvent<{ refresh?: boolean } | null>).detail?.refresh === true); };
         window.addEventListener('awoo-updates-changed', changed);
         return () => {
             mountedRef.current = false;
@@ -108,16 +219,29 @@ export default function UpdateAnnouncements({ suspended = false, openRequest = 0
         };
     }, [loadSnapshot]);
 
-    const openManually = useCallback(() => {
+    useEffect(() => {
+        onCheckingChangeRef.current?.(checking);
+    }, [checking]);
+
+    useEffect(() => {
+        if (snapshot) onSnapshotRef.current?.(countPendingAnnouncements(snapshot.items, dismissedKeys));
+    }, [snapshot, dismissedKeys]);
+
+    const openManually = useCallback((refresh = false) => {
         setMode(snapshotRef.current?.receipts.length ? 'success' : 'updates');
         setOpen(true);
         setActionError('');
-        void loadSnapshot();
+        // When the browser closed the dialog by itself, `open` is still true and
+        // setOpen(true) alone would not show it again.
+        const dialog = dialogRef.current;
+        if (visibleRef.current && dialog && !dialog.open) presentDialog(dialog);
+        void loadSnapshot(refresh);
     }, [loadSnapshot]);
 
     useEffect(() => {
-        window.addEventListener('awoo-updates-open', openManually);
-        return () => window.removeEventListener('awoo-updates-open', openManually);
+        const openFromEvent = (event: Event) => openManually((event as CustomEvent<{ refresh?: boolean } | null>).detail?.refresh === true);
+        window.addEventListener('awoo-updates-open', openFromEvent);
+        return () => window.removeEventListener('awoo-updates-open', openFromEvent);
     }, [openManually]);
 
     useEffect(() => {
@@ -145,21 +269,59 @@ export default function UpdateAnnouncements({ suspended = false, openRequest = 0
         setSessionRevision(value => value + 1);
     }, []);
 
+    const postAcknowledgement = useCallback(async (ids: string[]) => {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 15000);
+        try {
+            const response = await fetch(internalApiUrl('/api/updates/ack'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }), signal: controller.signal,
+            });
+            const result = await response.json();
+            if (!response.ok || result.success !== true) throw new Error('未能保存确认状态，请重试。');
+        } catch (error) {
+            throw controller.signal.aborted ? new Error('保存确认状态超时，请点击“知道了”重试。') : error;
+        } finally {
+            window.clearTimeout(timeout);
+        }
+    }, []);
+
+    const items = snapshot ? selectVisibleAnnouncements(snapshot.items) : [];
+    const actionIds = new Set(selectUpdateActions(items).map(item => item.id));
+    const receipts = snapshot?.receipts || [];
+    const success = mode === 'success' && receipts.length > 0;
+    const coreRunning = isCoreUpdateActive(coreProgress?.state);
     const operationBusy = busy || actionId !== null || acknowledging;
-    const dismiss = useCallback(() => {
-        if (operationBusy) return;
-        saveSession(mode === 'success');
+    // A core download continues in the background; starting it (or its confirmation) never keeps the dialog open.
+    const dismissBlocked = busy || acknowledging || (actionId !== null && actionId !== 'core');
+    const visible = open && !suspended;
+    visibleRef.current = visible;
+    const confirmationInCard = Boolean(coreConfirmation) && !success && items.some(item => item.id === 'core');
+
+    const dismiss = () => {
+        if (dismissBlocked) return;
+        if (coreConfirmation) onCoreConfirmation?.(false);
+        const plan = planAnnouncementDismissal(success ? 'success' : 'updates', snapshotRef.current, dismissedKeysRef.current);
+        if (plan.dismissedKeys !== dismissedKeysRef.current) {
+            setDismissedKeys(plan.dismissedKeys);
+            saveDismissedKeys(plan.dismissedKeys);
+        }
+        // Saving the session dismissal first keeps the dialog closed even if the acknowledgement fails.
+        saveSession(plan.acknowledgeIds.length > 0);
         setOpen(false);
         setActionError('');
-    }, [operationBusy, saveSession, mode]);
-    const visible = open && !suspended;
+        if (plan.acknowledgeIds.length > 0) {
+            void postAcknowledgement(plan.acknowledgeIds).then(
+                () => { if (mountedRef.current) void reloadAfterAcknowledgement(); },
+                () => { /* Unacknowledged receipts are shown again on the next launch. */ },
+            );
+        }
+    };
 
     useEffect(() => {
         const dialog = dialogRef.current;
         if (!dialog || !visible) return;
         const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-        if (!dialog.open) dialog.showModal();
-        dialog.querySelector<HTMLElement>('[data-initial-focus]')?.focus();
+        presentDialog(dialog);
         return () => {
             const focusInDialog = !document.activeElement || document.activeElement === document.body || dialog.contains(document.activeElement);
             if (dialog.open) dialog.close();
@@ -167,13 +329,28 @@ export default function UpdateAnnouncements({ suspended = false, openRequest = 0
         };
     }, [visible]);
 
+    useEffect(() => {
+        // A hidden dialog cannot be answered, so the update it was asking about does not start.
+        if (!visible && coreConfirmation) onCoreConfirmation?.(false);
+    }, [visible, coreConfirmation, onCoreConfirmation]);
+
+    useEffect(() => {
+        if (!coreConfirmation) return;
+        confirmRef.current?.focus();
+        const dialog = dialogRef.current;
+        return () => {
+            // The panel is gone; keep focus inside the open dialog.
+            if (dialog?.open && !dialog.contains(document.activeElement)) dialog.querySelector<HTMLElement>('[data-initial-focus]')?.focus();
+        };
+    }, [coreConfirmation]);
+
     const update = async (item: UpdateAnnouncement) => {
-        if (operationBusy || actionLockRef.current || !item.canUpdate) return;
+        if (operationBusy || actionLockRef.current || !item.canUpdate || coreRunning) return;
         actionLockRef.current = true;
         setActionId(item.id);
         setActionError('');
         try {
-            if (item.id === 'core') await onCoreUpdate();
+            if (item.id === 'core') await onCoreUpdate(item);
             else await onConnectorUpdate(item);
         } catch (error) {
             if (mountedRef.current) setActionError(errorMessage(error));
@@ -190,46 +367,64 @@ export default function UpdateAnnouncements({ suspended = false, openRequest = 0
         actionLockRef.current = true;
         setAcknowledging(true);
         setActionError('');
-        const controller = new AbortController();
-        const timeout = window.setTimeout(() => controller.abort(), 15000);
         try {
-            const response = await fetch(internalApiUrl('/api/updates/ack'), {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }), signal: controller.signal,
-            });
-            const result = await response.json();
-            if (!response.ok || result.success !== true) throw new Error('未能保存确认状态，请重试。');
+            await postAcknowledgement(ids);
             if (!mountedRef.current) return;
-            // A snapshot started before acknowledgement must not restore acknowledged receipts.
-            requestRef.current?.abort();
-            requestRef.current = null;
-            setLoading(false);
-            setChecking(false);
             const current = snapshotRef.current || snapshot;
             const remaining = current.receipts.filter(receipt => !ids.includes(receipt.id));
-            const items = selectVisibleAnnouncements(current.items);
-            setSnapshot({ ...current, receipts: remaining, items });
+            const visibleItems = selectVisibleAnnouncements(current.items);
+            setSnapshot({ ...current, receipts: remaining, items: visibleItems });
             if (!remaining.length) {
                 setMode('updates');
-                if (!items.length) { saveSession(false); setOpen(false); }
+                if (!visibleItems.length) { saveSession(false); setOpen(false); }
             }
-            await loadSnapshot();
+            await reloadAfterAcknowledgement();
         } catch (error) {
-            if (mountedRef.current) setActionError(controller.signal.aborted ? '保存确认状态超时，请点击“知道了”重试。' : errorMessage(error));
+            if (mountedRef.current) setActionError(errorMessage(error));
         } finally {
-            window.clearTimeout(timeout);
             actionLockRef.current = false;
             if (mountedRef.current) setAcknowledging(false);
         }
     };
 
-    const items = snapshot ? selectVisibleAnnouncements(snapshot.items) : [];
-    const actionIds = new Set(selectUpdateActions(items).map(item => item.id));
-    const receipts = snapshot?.receipts || [];
-    const success = mode === 'success' && receipts.length > 0;
-    const progressVisible = coreProgress && ['checking', 'downloading', 'applying', 'error'].includes(coreProgress.state);
-    const progress = coreProgress?.progress !== null && Number.isFinite(coreProgress?.progress) ? Math.max(0, Math.min(100, coreProgress!.progress!)) : null;
+    const renderConfirmation = (confirmation: CoreUpdateConfirmation) => (
+        <div className="update-announcements-confirm" ref={confirmRef} tabIndex={-1} role="group" aria-labelledby={confirmTitleId}>
+            <strong id={confirmTitleId}>确认更新并重启点歌机？</strong>
+            <ul>
+                <li>目标版本：{confirmation.version ? displayVersion(confirmation.version) : '最新版本'}{confirmation.sizeBytes ? `，下载约 ${formatUpdateBytes(confirmation.sizeBytes)}` : ''}</li>
+                <li className={confirmation.pendingCount === 0 ? '' : 'is-warning'}>
+                    {confirmation.pendingCount === null
+                        ? '暂时无法读取待播队列；重启后待播歌曲将被清空'
+                        : confirmation.pendingCount > 0
+                            ? `重启后待播的 ${confirmation.pendingCount} 首歌曲将被清空`
+                            : '当前没有待播歌曲'}
+                </li>
+                <li>下载在后台进行，可以关闭此窗口；下载完成后点歌机会自动重启，并重新连接直播间。</li>
+            </ul>
+            <div className="update-announcements-confirm-actions">
+                <button type="button" className="update-announcements-button update-announcements-secondary" onClick={() => onCoreConfirmation?.(false)}>取消</button>
+                <button type="button" className="update-announcements-button update-announcements-primary" onClick={() => onCoreConfirmation?.(true)}>立即更新并重启</button>
+            </div>
+        </div>
+    );
 
-    return <dialog className="update-announcements" ref={dialogRef} aria-labelledby={titleId} aria-describedby={descriptionId} aria-modal="true" onCancel={event => { event.preventDefault(); dismiss(); }} onKeyDown={event => {
+    const initialLoading = snapshot === null && !requestError;
+    const incomplete = Boolean(requestError || snapshot?.errors.length);
+
+    return <dialog className="update-announcements" ref={dialogRef} aria-labelledby={titleId} aria-describedby={descriptionId} aria-modal="true" onCancel={event => {
+        event.preventDefault();
+        // Escape first steps back from the restart confirmation.
+        if (coreConfirmation) onCoreConfirmation?.(false);
+        else dismiss();
+    }} onClose={event => {
+        // Chromium lets onCancel keep the dialog open only once per user interaction;
+        // a repeated Escape closes it while `open` stays true. Reopen it while it
+        // must stay open, otherwise follow the browser so it can be opened again.
+        const dialog = event.currentTarget;
+        if (dialog.open || !visible) return;
+        if (dismissBlocked) presentDialog(dialog);
+        else setOpen(false);
+    }} onKeyDown={event => {
         if (event.key !== 'Tab') return;
         const focusable = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], [tabindex="0"]')].filter(element => element.tabIndex >= 0 && element.getClientRects().length > 0);
         const first = focusable[0];
@@ -245,36 +440,46 @@ export default function UpdateAnnouncements({ suspended = false, openRequest = 0
                     <h2 id={titleId} tabIndex={-1} data-initial-focus>{success ? '更新成功' : '更新与公告'}</h2>
                     <p id={descriptionId}>{success ? '以下版本已安装完成' : items.length ? `发现 ${items.length} 项更新，查看说明后选择更新` : '查看点歌机和连接器的最新版本'}</p>
                 </div>
-                <button type="button" className="update-announcements-close" onClick={dismiss} disabled={operationBusy} aria-label="关闭更新公告"><UiIcon name="close" /></button>
+                <button type="button" className="update-announcements-close" onClick={dismiss} disabled={dismissBlocked} aria-label="关闭更新公告"><UiIcon name="close" /></button>
             </header>
             <div className="update-announcements-body custom-scrollbar">
+                {coreConfirmation && !confirmationInCard && renderConfirmation(coreConfirmation)}
                 {success ? <div className="update-announcements-receipts">
                     {receipts.map(receipt => <article className="update-announcements-receipt" key={receipt.id}>
                         <span className="update-announcements-receipt-icon"><UiIcon name="check" /></span>
-                        <div><h3>{receipt.name}</h3><p>{receipt.previousVersion && <><span>v{receipt.previousVersion.replace(/^v/i, '')}</span><span aria-label="更新到"> → </span></>}<strong>v{receipt.version.replace(/^v/i, '')}</strong></p></div>
+                        <div><h3>{receipt.name}</h3><p>{receipt.previousVersion && <><span>{displayVersion(receipt.previousVersion)}</span><span aria-label="更新到"> → </span></>}<strong>{displayVersion(receipt.version)}</strong></p></div>
                         <span className="update-announcements-badge">已更新</span>
                     </article>)}
                     {items.length > 0 && <p className="update-announcements-next">另有 {items.length} 项更新可用，确认后继续查看。</p>}
                 </div> : <>
-                    {items.map(item => <article className="update-announcements-card" key={item.id}>
-                        <div className="update-announcements-card-heading"><div><h3>{item.name}</h3><p className="update-announcements-version"><span>{item.currentVersion ? `v${item.currentVersion.replace(/^v/i, '')}` : '当前版本未知'}</span><UiIcon name="arrow" /><strong>v{item.version.replace(/^v/i, '')}</strong></p></div><span className="update-announcements-badge">{item.id === 'core' ? '点歌机' : '连接器'}</span></div>
-                        <div className="update-announcements-notes">{item.notes || '此版本暂未提供更新说明。'}</div>
-                        {item.manualUpdate && <p className="update-announcements-compatibility"><UiIcon name="music" /><span>{item.supportedPlayerVersion ? `适配播放器 ${item.supportedPlayerVersion}，请确认本机播放器版本后再更新。` : '此更新涉及播放器版本分支，请确认本机播放器版本后再更新。'}</span></p>}
-                        {!item.canUpdate && <p className="update-announcements-compatibility">{item.blockedReason || '当前环境暂不能直接更新，请到播放器设置查看详情。'}</p>}
-                        <div className="update-announcements-card-actions">
-                            {item.notesUrl && <a href={item.notesUrl} target="_blank" rel="noopener noreferrer" tabIndex={operationBusy ? -1 : 0} aria-disabled={operationBusy} onClick={event => { if (operationBusy) event.preventDefault(); }}>完整更新说明 <UiIcon name="external" /></a>}
-                            {actionIds.has(item.id) && <button type="button" className="update-announcements-button update-announcements-primary" disabled={operationBusy || checking} onClick={() => { void update(item); }}><UiIcon name="update" className={actionId === item.id ? 'update-announcements-spinning' : ''} />{actionId === item.id ? '正在更新…' : item.id === 'core' ? '更新点歌机' : `更新${item.name.replace(/连接器$/, '').trim()}`}</button>}
-                        </div>
-                    </article>)}
-                    {!items.length && <div className="update-announcements-empty"><UiIcon name={loading ? 'update' : requestError || snapshot?.errors.length ? 'radio' : 'check'} className={loading ? 'update-announcements-spinning' : ''} /><strong>{loading ? '正在读取更新信息' : requestError || snapshot?.errors.length ? '暂未获取到完整更新信息' : '当前没有可用更新'}</strong><p>{loading ? '请稍候…' : requestError || snapshot?.errors.length ? '请检查网络后重新检查。' : '点歌机与已安装的连接器均无需更新。'}</p></div>}
+                    {items.map(item => {
+                        const progress = item.id === 'core' ? null : describeConnectorProgress(connectorProgress?.[item.id]);
+                        const updating = actionId === item.id || (item.id === 'core' && coreRunning);
+                        return <article className="update-announcements-card" key={item.id}>
+                            <div className="update-announcements-card-heading"><div><h3>{item.name}</h3><p className="update-announcements-version"><span>{item.currentVersion ? displayVersion(item.currentVersion) : '当前版本未知'}</span><UiIcon name="arrow" /><strong>{displayVersion(item.version)}</strong></p></div><span className="update-announcements-badge">{item.id === 'core' ? '点歌机' : '连接器'}</span></div>
+                            <ReleaseNotes notes={item.notes} fallback="此版本暂未提供更新说明。" className="update-announcements-notes" />
+                            {/* A rolled-back version is a retry, not a player-branch decision; its notes explain it. */}
+                            {item.manualUpdate && !item.quarantined && <p className="update-announcements-compatibility"><UiIcon name="music" /><span>{item.supportedPlayerVersion ? `适配播放器 ${item.supportedPlayerVersion}，请确认本机播放器版本后再更新。` : '此更新涉及播放器版本分支，请确认本机播放器版本后再更新。'}</span></p>}
+                            {!item.canUpdate && <p className="update-announcements-compatibility">{item.blockedReason || '当前环境暂不能直接更新，请到播放器设置查看详情。'}</p>}
+                            {progress && <div className="update-announcements-progress">
+                                <div><span role="status">正在{progress.label}</span>{progress.percent !== null && <strong>{progress.percent}%</strong>}</div>
+                                <progress max={100} value={progress.percent ?? undefined} aria-label={`${item.name}更新进度`} />
+                            </div>}
+                            {item.id === 'core' && coreConfirmation && confirmationInCard ? renderConfirmation(coreConfirmation) : <div className="update-announcements-card-actions">
+                                {item.notesUrl && <a href={item.notesUrl} target="_blank" rel="noopener noreferrer" tabIndex={operationBusy ? -1 : 0} aria-disabled={operationBusy} onClick={event => { if (operationBusy) event.preventDefault(); }}>完整更新说明 <UiIcon name="external" /></a>}
+                                {actionIds.has(item.id) && <button type="button" className="update-announcements-button update-announcements-primary" disabled={operationBusy || checking || coreRunning} onClick={() => { void update(item); }}><UiIcon name="update" className={updating ? 'update-announcements-spinning' : ''} />{updating ? '正在更新…' : item.id === 'core' ? '更新点歌机' : `更新${item.name.replace(/连接器$/, '').trim()}`}</button>}
+                            </div>}
+                        </article>;
+                    })}
+                    {!items.length && !coreConfirmation && <div className="update-announcements-empty"><UiIcon name={initialLoading ? 'update' : incomplete ? 'radio' : 'check'} className={initialLoading ? 'update-announcements-spinning' : ''} /><strong>{initialLoading ? '正在读取更新信息' : incomplete ? '暂未获取到完整更新信息' : '当前没有可用更新'}</strong><p>{initialLoading ? '请稍候…' : incomplete ? '请检查网络后重新检查。' : '点歌机与已安装的连接器均无需更新。'}</p></div>}
                 </>}
-                {progressVisible && <div className={`update-announcements-progress${coreProgress.state === 'error' ? ' is-error' : ''}`} role="status" aria-live="polite"><div><span>{coreProgress.message || '正在更新点歌机…'}</span>{progress !== null && coreProgress.state !== 'error' && <strong>{Math.round(progress)}%</strong>}</div>{coreProgress.state !== 'error' && <progress max={100} value={progress === null ? undefined : progress} aria-label="点歌机更新进度" />}</div>}
-                {(requestError || Boolean(snapshot?.errors.length)) && <div className="update-announcements-error" role="status">{requestError && <p>{requestError}</p>}{snapshot?.errors.map((error, index) => <p key={index}>{error}</p>)}</div>}
+                <CoreUpdateProgress status={coreProgress} />
+                {incomplete && <div className="update-announcements-error" role="status">{requestError && <p>{requestError}</p>}{snapshot?.errors.map((error, index) => <p key={index}>{error}</p>)}</div>}
                 {actionError && <div className="update-announcements-error" role="alert">{actionError}</div>}
             </div>
             <footer className="update-announcements-footer">
                 <button type="button" className="update-announcements-button update-announcements-secondary" disabled={operationBusy || checking} onClick={() => { void loadSnapshot(true); }}><UiIcon name="update" className={checking ? 'update-announcements-spinning' : ''} />{checking ? '正在检查…' : '检查更新'}</button>
-                {success ? <button type="button" className="update-announcements-button update-announcements-primary" disabled={operationBusy} onClick={() => { void acknowledge(); }}>{acknowledging ? '正在确认…' : '知道了'}</button> : <button type="button" className="update-announcements-button update-announcements-secondary" disabled={operationBusy} onClick={dismiss}>{items.length ? '稍后再说' : '关闭'}</button>}
+                {success ? <button type="button" className="update-announcements-button update-announcements-primary" disabled={operationBusy} onClick={() => { void acknowledge(); }}>{acknowledging ? '正在确认…' : '知道了'}</button> : <button type="button" className="update-announcements-button update-announcements-secondary" disabled={dismissBlocked} onClick={dismiss}>{items.length ? '稍后再说' : '关闭'}</button>}
             </footer>
         </div>
     </dialog>;

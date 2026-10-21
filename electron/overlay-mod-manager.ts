@@ -1,6 +1,11 @@
 import { createHash, randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import {
+  renameWithRetry,
+  rmWithRetry,
+  type FsRetryOptions
+} from './fs-retry.ts';
 import { extractZipSafely } from './safe-zip.ts';
 
 export const OVERLAY_PACKAGE_SCHEMA_VERSION = 1;
@@ -13,6 +18,22 @@ const SKIN_MARKETPLACE_DOWNLOAD_TIMEOUT_MS = 60_000;
 export const MAX_OVERLAY_EXTRACTED_BYTES = 64 * 1024 * 1024;
 export const MAX_OVERLAY_FILES = 300;
 export const MAX_OVERLAY_SETTINGS = 32;
+const DOWNLOAD_TIMEOUT_MESSAGE = '下载超时，请重试或改用 ZIP 导入';
+const DESCRIPTOR_READ_TIMEOUTS: DownloadReadTimeouts = { totalTimeoutMs: 15_000 };
+const PACKAGE_READ_TIMEOUTS: DownloadReadTimeouts = {
+  totalTimeoutMs: 120_000,
+  idleTimeoutMs: 20_000
+};
+// Installs finish within seconds, so anything this old was left by a crash.
+const STALE_INSTALL_LEFTOVER_AGE_MS = 60 * 60 * 1000;
+const BACKUP_DIRECTORY_MARKER = '.backup-';
+// Staging directories, version backups and registry temp files are all named
+// with randomUUID(); the leftover sweep removes nothing else.
+const OPERATION_ID_SOURCE = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+const INSTALL_LEFTOVER_PATTERN = new RegExp(
+  `^(?:\\.install-${OPERATION_ID_SOURCE}|registry\\.json\\.${OPERATION_ID_SOURCE}\\.tmp)$`
+);
+const VERSION_BACKUP_PATTERN = new RegExp(`^(.+)\\.backup-${OPERATION_ID_SOURCE}$`);
 
 const OVERLAY_ID_PATTERN = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
 const OVERLAY_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
@@ -228,6 +249,8 @@ export interface OverlayAsset {
   filePath: string;
   contentType: string;
   revision: string;
+  /** Entry HTML of the active overlay, relative to its root. */
+  entry: string;
 }
 
 type FetchLike = (
@@ -235,6 +258,21 @@ type FetchLike = (
   init?: RequestInit,
   timeoutMs?: number
 ) => Promise<Response>;
+
+export interface DownloadReadTimeouts {
+  /** Budget for the whole body, counted from the first read. */
+  totalTimeoutMs: number;
+  /** Longest wait for the next chunk; defaults to the whole budget. */
+  idleTimeoutMs?: number;
+}
+
+export interface OverlayModManagerOptions {
+  descriptorTimeouts?: DownloadReadTimeouts;
+  packageTimeouts?: DownloadReadTimeouts;
+  /** Forwarded to every rename and removal, e.g. to simulate Windows locks. */
+  fsRetry?: FsRetryOptions;
+  now?: () => number;
+}
 
 function cleanText(value: unknown, maximumLength: number): string {
   return typeof value === 'string'
@@ -428,6 +466,23 @@ function isSafeRelativePath(value: string): boolean {
   return parts.every(part => Boolean(part) && part !== '.' && part !== '..');
 }
 
+/**
+ * Mod directories share the root with registry.json, its temp files and the
+ * hidden staging directories, and "builtin" names the bundled UI.
+ */
+function isReservedOverlayId(id: string): boolean {
+  const normalized = id.toLowerCase();
+  return normalized.startsWith('registry.json')
+    || normalized.startsWith('.')
+    || normalized === 'builtin';
+}
+
+/** A version moved aside during a reinstall: <version>.backup-<uuid>. */
+function isVersionBackupName(name: string): boolean {
+  const match = VERSION_BACKUP_PATTERN.exec(name);
+  return match !== null && OVERLAY_VERSION_PATTERN.test(match[1]);
+}
+
 function compareVersions(left: string, right: string): number {
   const parse = (value: string) => value
     .split(/[+-]/, 1)[0]
@@ -461,9 +516,16 @@ export function validateOverlayManifest(
   if (!OVERLAY_ID_PATTERN.test(id)) {
     throw new Error('Mod UI id 只能使用小写字母、数字、点、横线和下划线');
   }
+  if (isReservedOverlayId(id)) {
+    throw new Error('Mod UI 标识与系统保留名称冲突');
+  }
   if (!name) throw new Error('Mod UI 缺少名称');
   if (!OVERLAY_VERSION_PATTERN.test(version)) {
     throw new Error('Mod UI 版本必须使用语义化版本号');
+  }
+  // Reinstalls move the old directory aside as <version>.backup-<uuid>.
+  if (version.toLowerCase().includes(BACKUP_DIRECTORY_MARKER)) {
+    throw new Error('Mod UI 版本号不能包含系统保留的 .backup- 字样');
   }
   if (!OVERLAY_VERSION_PATTERN.test(minAppVersion)) {
     throw new Error('Mod UI 的 minAppVersion 无效');
@@ -590,7 +652,8 @@ function contentTypeFor(filePath: string): string {
 
 async function readLimitedResponse(
   response: Response,
-  maximumBytes: number
+  maximumBytes: number,
+  { totalTimeoutMs, idleTimeoutMs = totalTimeoutMs }: DownloadReadTimeouts
 ): Promise<Buffer> {
   const declaredLength = Number(response.headers.get('content-length'));
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
@@ -598,19 +661,101 @@ async function readLimitedResponse(
   }
   if (!response.body) return Buffer.alloc(0);
   const reader = response.body.getReader();
+  // The fetch timeout ends once headers arrive, so a stalled CDN transfer
+  // needs its own deadline. Cancelling settles the pending read at once.
+  let timedOut = false;
+  const expire = () => {
+    timedOut = true;
+    reader.cancel().catch(() => undefined);
+  };
+  const totalTimer = setTimeout(expire, totalTimeoutMs);
+  let idleTimer = setTimeout(expire, idleTimeoutMs);
   const chunks: Uint8Array[] = [];
   let total = 0;
-  let result = await reader.read();
-  while (!result.done) {
-    total += result.value.byteLength;
-    if (total > maximumBytes) {
-      await reader.cancel();
-      throw new Error(`下载文件超过 ${Math.round(maximumBytes / 1024 / 1024)} MiB 限制`);
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (timedOut) throw new Error(DOWNLOAD_TIMEOUT_MESSAGE);
+      if (result.done) break;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(expire, idleTimeoutMs);
+      total += result.value.byteLength;
+      if (total > maximumBytes) {
+        throw new Error(`下载文件超过 ${Math.round(maximumBytes / 1024 / 1024)} MiB 限制`);
+      }
+      chunks.push(result.value);
     }
-    chunks.push(result.value);
-    result = await reader.read();
+  } catch (error) {
+    reader.cancel().catch(() => undefined);
+    // Some streams reject the pending read on cancel instead of closing it.
+    throw timedOut ? new Error(DOWNLOAD_TIMEOUT_MESSAGE) : error;
+  } finally {
+    clearTimeout(totalTimer);
+    clearTimeout(idleTimer);
   }
   return Buffer.concat(chunks.map(chunk => Buffer.from(chunk)), total);
+}
+
+function emptyRegistry(): OverlayRegistry {
+  return { schemaVersion: 1, activeId: 'builtin', overlays: [], settings: {} };
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+}
+
+/** A damaged registry falls back to the built-in UI; the next save replaces it. */
+function parseOverlayRegistry(content: string): OverlayRegistry {
+  try {
+    const parsed = JSON.parse(content) as Partial<OverlayRegistry>;
+    const overlays = Array.isArray(parsed.overlays)
+      ? parsed.overlays.flatMap(record => {
+          if (
+            !record
+            || !OVERLAY_ID_PATTERN.test(String(record.id || ''))
+            || !OVERLAY_VERSION_PATTERN.test(String(record.version || ''))
+          ) return [];
+          try {
+            return [{
+              ...record,
+              settings: validateOverlaySettingDefinitions(record.settings)
+            } as InstalledOverlayRecord];
+          } catch {
+            return [];
+          }
+        })
+      : [];
+    const activeId = String(parsed.activeId || 'builtin');
+    const storedSettings: Record<string, OverlaySettingValues> = {};
+    if (parsed.settings && typeof parsed.settings === 'object' && !Array.isArray(parsed.settings)) {
+      for (const [overlayId, rawValues] of Object.entries(parsed.settings).slice(0, 100)) {
+        if (
+          overlayId !== 'builtin'
+          && !OVERLAY_ID_PATTERN.test(overlayId)
+        ) continue;
+        if (!rawValues || typeof rawValues !== 'object' || Array.isArray(rawValues)) continue;
+        const safeValues: OverlaySettingValues = {};
+        for (const [key, rawValue] of Object.entries(rawValues).slice(0, MAX_OVERLAY_SETTINGS)) {
+          if (!OVERLAY_SETTING_KEY_PATTERN.test(key)) continue;
+          if (typeof rawValue === 'boolean') safeValues[key] = rawValue;
+          else if (typeof rawValue === 'number' && Number.isFinite(rawValue)) safeValues[key] = rawValue;
+          else if (typeof rawValue === 'string') safeValues[key] = rawValue.slice(0, 200);
+        }
+        storedSettings[overlayId] = safeValues;
+      }
+    }
+    return {
+      schemaVersion: 1,
+      activeId: activeId === 'builtin'
+        || overlays.some(record => record.id === activeId)
+        ? activeId
+        : 'builtin',
+      overlays,
+      settings: storedSettings
+    };
+  } catch {
+    return emptyRegistry();
+  }
 }
 
 export class OverlayModManager {
@@ -619,22 +764,44 @@ export class OverlayModManager {
   private readonly bundledOverlayDirectory: string;
   private readonly currentAppVersion: string;
   private readonly fetcher: FetchLike;
+  private readonly descriptorTimeouts: DownloadReadTimeouts;
+  private readonly packageTimeouts: DownloadReadTimeouts;
+  private readonly fsRetry: FsRetryOptions;
+  private readonly now: () => number;
+  private mutationTail: Promise<void> = Promise.resolve();
+  // Every OBS host polls the state twice per second, so keep the parsed file.
+  private registryCache: {
+    mtimeMs: number;
+    size: number;
+    registry: OverlayRegistry;
+  } | null = null;
+  private registryGeneration = 0;
+  private lastKnownRegistry: OverlayRegistry | null = null;
+  private leftoverSweepScheduled = false;
 
   constructor(
     rootDirectory: string,
     bundledOverlayDirectory: string,
     currentAppVersion: string,
-    fetcher: FetchLike = fetch
+    fetcher: FetchLike = fetch,
+    options: OverlayModManagerOptions = {}
   ) {
     this.rootDirectory = rootDirectory;
     this.bundledOverlayDirectory = bundledOverlayDirectory;
     this.currentAppVersion = currentAppVersion;
     this.fetcher = fetcher;
     this.registryPath = path.join(rootDirectory, 'registry.json');
+    this.descriptorTimeouts = options.descriptorTimeouts || DESCRIPTOR_READ_TIMEOUTS;
+    this.packageTimeouts = options.packageTimeouts || PACKAGE_READ_TIMEOUTS;
+    this.fsRetry = options.fsRetry || {};
+    this.now = options.now || Date.now;
   }
 
   async getPublicState(): Promise<PublicOverlayState> {
-    const registry = await this.readRegistry();
+    return this.buildPublicState(await this.readRegistryForDisplay());
+  }
+
+  private buildPublicState(registry: OverlayRegistry): PublicOverlayState {
     const builtin = this.getBuiltinRecord(
       registry.activeId === 'builtin',
       registry.settings.builtin
@@ -681,7 +848,8 @@ export class OverlayModManager {
     }
     const descriptorBytes = await readLimitedResponse(
       descriptorResponse,
-      256 * 1024
+      256 * 1024,
+      this.descriptorTimeouts
     );
     const descriptor = validateOverlayDescriptor(
       JSON.parse(descriptorBytes.toString('utf8'))
@@ -699,7 +867,8 @@ export class OverlayModManager {
     }
     const archive = await readLimitedResponse(
       packageResponse,
-      MAX_OVERLAY_ARCHIVE_BYTES
+      MAX_OVERLAY_ARCHIVE_BYTES,
+      this.packageTimeouts
     );
     if (archive.length !== descriptor.package.size) {
       throw new Error('Mod UI ZIP 大小与发布清单不一致');
@@ -756,7 +925,8 @@ export class OverlayModManager {
     }
     const archive = await readLimitedResponse(
       packageResponse,
-      MAX_OVERLAY_ARCHIVE_BYTES
+      MAX_OVERLAY_ARCHIVE_BYTES,
+      this.packageTimeouts
     );
     const installed = await this.installArchive(
       archive,
@@ -831,37 +1001,18 @@ export class OverlayModManager {
         throw new Error('Mod UI ZIP 与发布清单的 id 或版本不一致');
       }
       await this.validateExtractedTree(extractedDirectory, manifest.entry);
-      const finalDirectory = this.getInstalledDirectory(
-        manifest.id,
-        manifest.version
-      );
-      const backupDirectory = `${finalDirectory}.backup-${operationId}`;
-      await fs.promises.mkdir(path.dirname(finalDirectory), { recursive: true });
-      if (await this.pathExists(finalDirectory)) {
-        await fs.promises.rename(finalDirectory, backupDirectory);
-      }
-      try {
-        await fs.promises.rename(extractedDirectory, finalDirectory);
-        if (await this.pathExists(backupDirectory)) {
-          await fs.promises.rm(backupDirectory, { recursive: true, force: true });
-        }
-      } catch (error) {
-        if (await this.pathExists(backupDirectory)) {
-          await fs.promises.rename(backupDirectory, finalDirectory);
-        }
-        throw error;
-      }
-
       const record: InstalledOverlayRecord = {
         ...manifest,
         installedAt: new Date().toISOString(),
         source: cleanText(source, 600) || 'local-zip'
       };
-      const registry = await this.readRegistry();
-      registry.overlays = registry.overlays.filter(item => item.id !== record.id);
-      registry.overlays.push(record);
-      registry.activeId = record.id;
-      await this.writeRegistry(registry);
+      // Extraction may run in parallel; moving the files into place and
+      // recording them must not interleave with other registry changes.
+      await this.serialized(() => this.commitInstall(
+        record,
+        extractedDirectory,
+        operationId
+      ));
       return record;
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
@@ -869,79 +1020,86 @@ export class OverlayModManager {
       }
       throw error;
     } finally {
-      await fs.promises.rm(stagingDirectory, { recursive: true, force: true });
+      // A locked leftover is swept on a later start; it must not fail the install.
+      await rmWithRetry(stagingDirectory, this.fsRetry).catch(() => undefined);
     }
   }
 
-  async activate(id: string): Promise<PublicOverlayState> {
-    const normalizedId = cleanText(id, 80).toLowerCase();
-    const registry = await this.readRegistry();
-    if (
-      normalizedId !== 'builtin'
-      && !registry.overlays.some(record => record.id === normalizedId)
-    ) {
-      throw new Error('找不到要启用的 Mod UI');
-    }
-    registry.activeId = normalizedId;
-    await this.writeRegistry(registry);
-    return this.getPublicState();
+  activate(id: string): Promise<PublicOverlayState> {
+    return this.serialized(async () => {
+      const normalizedId = cleanText(id, 80).toLowerCase();
+      const registry = await this.readRegistry();
+      if (
+        normalizedId !== 'builtin'
+        && !registry.overlays.some(record => record.id === normalizedId)
+      ) {
+        throw new Error('找不到要启用的 Mod UI');
+      }
+      registry.activeId = normalizedId;
+      await this.writeRegistry(registry);
+      return this.buildPublicState(registry);
+    });
   }
 
-  async updateSettings(
+  updateSettings(
     id: string,
     values: unknown,
     reset = false
   ): Promise<PublicOverlayState> {
-    const normalizedId = cleanText(id, 80).toLowerCase();
-    const registry = await this.readRegistry();
-    const record = normalizedId === 'builtin'
-      ? this.getBuiltinRecord(registry.activeId === 'builtin', registry.settings.builtin)
-      : registry.overlays.find(item => item.id === normalizedId);
-    if (!record) throw new Error('找不到要设置的 Mod UI');
-    const definitions = Array.isArray(record.settings) ? record.settings : [];
-    if (definitions.length === 0) {
-      throw new Error('这个 Mod UI 没有声明可调参数');
-    }
-    if (reset) {
-      registry.settings[normalizedId] = normalizeOverlaySettingValues(definitions, {});
-    } else {
-      if (!values || typeof values !== 'object' || Array.isArray(values)) {
-        throw new Error('Mod UI 参数必须是 JSON 对象');
+    return this.serialized(async () => {
+      const normalizedId = cleanText(id, 80).toLowerCase();
+      const registry = await this.readRegistry();
+      const record = normalizedId === 'builtin'
+        ? this.getBuiltinRecord(registry.activeId === 'builtin', registry.settings.builtin)
+        : registry.overlays.find(item => item.id === normalizedId);
+      if (!record) throw new Error('找不到要设置的 Mod UI');
+      const definitions = Array.isArray(record.settings) ? record.settings : [];
+      if (definitions.length === 0) {
+        throw new Error('这个 Mod UI 没有声明可调参数');
       }
-      const current = normalizeOverlaySettingValues(
-        definitions,
-        registry.settings[normalizedId]
-      );
-      registry.settings[normalizedId] = normalizeOverlaySettingValues(
-        definitions,
-        { ...current, ...(values as Record<string, unknown>) },
-        true
-      );
-    }
-    await this.writeRegistry(registry);
-    return this.getPublicState();
+      if (reset) {
+        registry.settings[normalizedId] = normalizeOverlaySettingValues(definitions, {});
+      } else {
+        if (!values || typeof values !== 'object' || Array.isArray(values)) {
+          throw new Error('Mod UI 参数必须是 JSON 对象');
+        }
+        const current = normalizeOverlaySettingValues(
+          definitions,
+          registry.settings[normalizedId]
+        );
+        registry.settings[normalizedId] = normalizeOverlaySettingValues(
+          definitions,
+          { ...current, ...(values as Record<string, unknown>) },
+          true
+        );
+      }
+      await this.writeRegistry(registry);
+      return this.buildPublicState(registry);
+    });
   }
 
-  async remove(id: string): Promise<PublicOverlayState> {
-    const normalizedId = cleanText(id, 80).toLowerCase();
-    if (normalizedId === 'builtin') {
-      throw new Error('内置 UI 不能删除');
-    }
-    const registry = await this.readRegistry();
-    const record = registry.overlays.find(item => item.id === normalizedId);
-    if (!record) throw new Error('找不到要删除的 Mod UI');
-    if (registry.activeId === normalizedId) registry.activeId = 'builtin';
-    registry.overlays = registry.overlays.filter(item => item.id !== normalizedId);
-    await this.writeRegistry(registry);
-    const overlayDirectory = path.join(this.rootDirectory, normalizedId);
-    if (this.isInsideRoot(overlayDirectory)) {
-      await fs.promises.rm(overlayDirectory, { recursive: true, force: true });
-    }
-    return this.getPublicState();
+  remove(id: string): Promise<PublicOverlayState> {
+    return this.serialized(async () => {
+      const normalizedId = cleanText(id, 80).toLowerCase();
+      if (normalizedId === 'builtin') {
+        throw new Error('内置 UI 不能删除');
+      }
+      const registry = await this.readRegistry();
+      const record = registry.overlays.find(item => item.id === normalizedId);
+      if (!record) throw new Error('找不到要删除的 Mod UI');
+      if (registry.activeId === normalizedId) registry.activeId = 'builtin';
+      registry.overlays = registry.overlays.filter(item => item.id !== normalizedId);
+      await this.writeRegistry(registry);
+      const overlayDirectory = path.join(this.rootDirectory, normalizedId);
+      if (this.isInsideRoot(overlayDirectory)) {
+        await rmWithRetry(overlayDirectory, this.fsRetry);
+      }
+      return this.buildPublicState(registry);
+    });
   }
 
   async resolveActiveAsset(relativePath: string): Promise<OverlayAsset | null> {
-    const registry = await this.readRegistry();
+    const registry = await this.readRegistryForDisplay();
     const record = registry.overlays.find(item => item.id === registry.activeId);
     const root = record
       ? this.getInstalledDirectory(record.id, record.version)
@@ -964,7 +1122,8 @@ export class OverlayModManager {
     return {
       filePath: resolved,
       contentType: contentTypeFor(resolved),
-      revision
+      revision,
+      entry
     };
   }
 
@@ -1046,69 +1205,185 @@ export class OverlayModManager {
     }
   }
 
-  private async readRegistry(): Promise<OverlayRegistry> {
+  /**
+   * Registry read-modify-write and version directory moves run one at a
+   * time, so overlapping saves, switches and installs cannot drop changes.
+   */
+  private serialized<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.mutationTail.then(operation);
+    this.mutationTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async commitInstall(
+    record: InstalledOverlayRecord,
+    extractedDirectory: string,
+    operationId: string
+  ): Promise<void> {
+    // Read first: an unreadable registry must fail before files are moved.
+    const registry = await this.readRegistry();
+    const finalDirectory = this.getInstalledDirectory(record.id, record.version);
+    const backupDirectory = `${finalDirectory}${BACKUP_DIRECTORY_MARKER}${operationId}`;
+    await fs.promises.mkdir(path.dirname(finalDirectory), { recursive: true });
+    if (await this.pathExists(finalDirectory)) {
+      await renameWithRetry(finalDirectory, backupDirectory, this.fsRetry);
+    }
     try {
-      const parsed = JSON.parse(
-        await fs.promises.readFile(this.registryPath, 'utf8')
-      ) as Partial<OverlayRegistry>;
-      const overlays = Array.isArray(parsed.overlays)
-        ? parsed.overlays.flatMap(record => {
-            if (
-              !record
-              || !OVERLAY_ID_PATTERN.test(String(record.id || ''))
-              || !OVERLAY_VERSION_PATTERN.test(String(record.version || ''))
-            ) return [];
-            try {
-              return [{
-                ...record,
-                settings: validateOverlaySettingDefinitions(record.settings)
-              } as InstalledOverlayRecord];
-            } catch {
-              return [];
-            }
-          })
-        : [];
-      const activeId = String(parsed.activeId || 'builtin');
-      const storedSettings: Record<string, OverlaySettingValues> = {};
-      if (parsed.settings && typeof parsed.settings === 'object' && !Array.isArray(parsed.settings)) {
-        for (const [overlayId, rawValues] of Object.entries(parsed.settings).slice(0, 100)) {
-          if (
-            overlayId !== 'builtin'
-            && !OVERLAY_ID_PATTERN.test(overlayId)
-          ) continue;
-          if (!rawValues || typeof rawValues !== 'object' || Array.isArray(rawValues)) continue;
-          const safeValues: OverlaySettingValues = {};
-          for (const [key, rawValue] of Object.entries(rawValues).slice(0, MAX_OVERLAY_SETTINGS)) {
-            if (!OVERLAY_SETTING_KEY_PATTERN.test(key)) continue;
-            if (typeof rawValue === 'boolean') safeValues[key] = rawValue;
-            else if (typeof rawValue === 'number' && Number.isFinite(rawValue)) safeValues[key] = rawValue;
-            else if (typeof rawValue === 'string') safeValues[key] = rawValue.slice(0, 200);
-          }
-          storedSettings[overlayId] = safeValues;
-        }
+      await renameWithRetry(extractedDirectory, finalDirectory, this.fsRetry);
+    } catch (error) {
+      if (await this.pathExists(backupDirectory)) {
+        await renameWithRetry(backupDirectory, finalDirectory, this.fsRetry);
       }
-      return {
-        schemaVersion: 1,
-        activeId: activeId === 'builtin'
-          || overlays.some(record => record.id === activeId)
-          ? activeId
-          : 'builtin',
-        overlays,
-        settings: storedSettings
-      };
+      throw error;
+    }
+    registry.overlays = registry.overlays.filter(item => item.id !== record.id);
+    registry.overlays.push(record);
+    registry.activeId = record.id;
+    await this.writeRegistry(registry);
+    await this.removeOtherVersions(record.id, record.version);
+  }
+
+  /** Once an install is recorded, older versions and backups are never served. */
+  private async removeOtherVersions(id: string, keptVersion: string): Promise<void> {
+    const overlayDirectory = path.join(this.rootDirectory, id);
+    let names: string[];
+    try {
+      names = await fs.promises.readdir(overlayDirectory);
     } catch {
-      return { schemaVersion: 1, activeId: 'builtin', overlays: [], settings: {} };
+      return;
+    }
+    for (const name of names) {
+      // Windows paths ignore case, so a differently cased name is the same version.
+      if (name.toLowerCase() === keptVersion.toLowerCase()) continue;
+      if (!OVERLAY_VERSION_PATTERN.test(name) && !name.includes(BACKUP_DIRECTORY_MARKER)) {
+        continue;
+      }
+      await rmWithRetry(path.join(overlayDirectory, name), this.fsRetry)
+        .catch(() => undefined);
+    }
+  }
+
+  private ensureLeftoverSweep(): void {
+    if (this.leftoverSweepScheduled) return;
+    this.leftoverSweepScheduled = true;
+    // Queued like a mutation, so it never inspects an install half-way through.
+    void this.serialized(() => this.sweepLeftovers()).catch(() => undefined);
+  }
+
+  /**
+   * A crash can leave staging directories, backups and registry temp files.
+   * Only names in the exact formats this manager creates are removed, and
+   * never the directory of a registered Mod or version.
+   */
+  private async sweepLeftovers(): Promise<void> {
+    // Without the registry an installed version cannot be told from a backup.
+    const registry = await this.readRegistry();
+    const registeredVersions = new Map(registry.overlays.map(record => [
+      record.id,
+      record.version.toLowerCase()
+    ]));
+    const now = this.now();
+    const children = await fs.promises.readdir(this.rootDirectory, {
+      withFileTypes: true
+    }).catch(() => []);
+    for (const child of children) {
+      const registeredVersion = registeredVersions.get(child.name.toLowerCase());
+      if (registeredVersion === undefined && INSTALL_LEFTOVER_PATTERN.test(child.name)) {
+        await this.removeIfStale(path.join(this.rootDirectory, child.name), now);
+        continue;
+      }
+      if (!child.isDirectory() || !OVERLAY_ID_PATTERN.test(child.name)) continue;
+      const overlayDirectory = path.join(this.rootDirectory, child.name);
+      const names = await fs.promises.readdir(overlayDirectory).catch(() => []);
+      for (const name of names) {
+        // Windows paths ignore case, so a differently cased name is the same version.
+        if (!isVersionBackupName(name) || name.toLowerCase() === registeredVersion) continue;
+        await this.removeIfStale(path.join(overlayDirectory, name), now);
+      }
+    }
+  }
+
+  /** Removes a leftover once all of its timestamps are older than the sweep age. */
+  private async removeIfStale(target: string, now: number): Promise<void> {
+    try {
+      const stats = await fs.promises.lstat(target);
+      // A rename keeps a directory's modification time, so a backup that was
+      // just moved aside still looks old by mtime alone.
+      const newest = Math.max(stats.mtimeMs, stats.ctimeMs, stats.birthtimeMs);
+      if (now - newest < STALE_INSTALL_LEFTOVER_AGE_MS) return;
+      // The sweep holds up other changes, so a locked leftover gets a short retry.
+      await rmWithRetry(target, { ...this.fsRetry, attempts: 3 });
+    } catch {
+      // A locked or vanished leftover is left for a later start.
+    }
+  }
+
+  /**
+   * Returns a copy the caller may change. A missing or damaged file reads as
+   * the default registry; other I/O errors are thrown, so a briefly locked
+   * file is never mistaken for an empty registry and written back.
+   */
+  private async readRegistry(): Promise<OverlayRegistry> {
+    this.ensureLeftoverSweep();
+    const generation = this.registryGeneration;
+    let stat: fs.Stats;
+    let content: string;
+    try {
+      stat = await fs.promises.stat(this.registryPath);
+      const cached = this.registryCache;
+      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+        return structuredClone(cached.registry);
+      }
+      content = await fs.promises.readFile(this.registryPath, 'utf8');
+    } catch (error: unknown) {
+      if (isMissingFileError(error)) return emptyRegistry();
+      throw new Error(
+        `读取 Mod UI 配置失败，请稍后重试：${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    const registry = parseOverlayRegistry(content);
+    // A write that overlapped this read may already have replaced the file.
+    if (generation === this.registryGeneration) {
+      this.registryCache = { mtimeMs: stat.mtimeMs, size: stat.size, registry };
+      this.lastKnownRegistry = registry;
+    }
+    return structuredClone(registry);
+  }
+
+  /**
+   * OBS keeps the last known registry through a transient read error instead
+   * of briefly switching to the built-in UI and back.
+   */
+  private async readRegistryForDisplay(): Promise<OverlayRegistry> {
+    try {
+      return await this.readRegistry();
+    } catch {
+      return this.lastKnownRegistry
+        ? structuredClone(this.lastKnownRegistry)
+        : emptyRegistry();
     }
   }
 
   private async writeRegistry(registry: OverlayRegistry): Promise<void> {
-    await fs.promises.mkdir(this.rootDirectory, { recursive: true });
-    const temporaryPath = `${this.registryPath}.${randomUUID()}.tmp`;
-    await fs.promises.writeFile(
-      temporaryPath,
-      JSON.stringify(registry, null, 2),
-      'utf8'
-    );
-    await fs.promises.rename(temporaryPath, this.registryPath);
+    try {
+      await fs.promises.mkdir(this.rootDirectory, { recursive: true });
+      const temporaryPath = `${this.registryPath}.${randomUUID()}.tmp`;
+      await fs.promises.writeFile(
+        temporaryPath,
+        JSON.stringify(registry, null, 2),
+        'utf8'
+      );
+      try {
+        await renameWithRetry(temporaryPath, this.registryPath, this.fsRetry);
+      } catch (error) {
+        await rmWithRetry(temporaryPath, this.fsRetry).catch(() => undefined);
+        throw error;
+      }
+      this.lastKnownRegistry = structuredClone(registry);
+    } finally {
+      // Reads that overlapped the replacement must not cache what they saw.
+      this.registryGeneration += 1;
+      this.registryCache = null;
+    }
   }
 }

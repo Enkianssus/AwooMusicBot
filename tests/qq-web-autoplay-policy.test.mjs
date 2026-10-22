@@ -60,6 +60,7 @@ function fixture({ web = true, dispatch = async () => ({ outcome: 'applied' }) }
     activeManagedPlayerAction: { target: songB },
     registeredNextGuardKey: '', registeredNextGuardSongIdentity: '', registeredNextGuardId: 0,
     queueHeadNeedsGuardOnlyAfterCurrentChange: false, cancelledNativeNextSongs: new Map([['B', songB]]),
+    queueHeadCorrection: null,
     deferredQqInsertIdentity: '', qqDeferredInsertRetryAttempted: false, qqDeferredInsertRetryInFlight: false,
     activePlayerSnapshot: { connected: true, version: '22.61', requiresPlaybackAnchor: false, playbackAnchorReady: true },
     connectorOwnsQqLogicalNext: () => web,

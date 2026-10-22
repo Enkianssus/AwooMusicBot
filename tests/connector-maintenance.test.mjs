@@ -1142,7 +1142,7 @@ test('a newly detected unsupported QQ build schedules recovery from the player s
     getSelectedPlayerKey: () => selected, setGlobalStatus() {}, writeLog() {},
     clearDeferredQqInsert() {}, clearRecentQqGuardedCompletion() {}, clearRegisteredNextGuard() {},
     clearSkipForcePlayOnce() {}, queueHeadNeedsGuardOnlyAfterCurrentChange: false,
-    activeManagedPlayerAction: null, cancelledNativeNextSongs: new Map(),
+    activeManagedPlayerAction: null, cancelledNativeNextSongs: new Map(), queueHeadCorrection: null,
     applicationQuitRequested: false, playerConnectionRecoverySuppressed: 0,
     playerConnectionRecoverySuppressionEpoch: 0, queueMicrotask() {},
     recoverPlayerConnectionAfterFailure: async () => {},

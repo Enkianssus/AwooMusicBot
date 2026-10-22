@@ -7,8 +7,11 @@ import {
   planQqGuardTerminalRecovery,
   planQqGuardedCompletionRecovery,
   planObservedNextAction,
+  planQueueHeadCorrection,
   planQueueHeadMutation,
   QQ_GUARDED_COMPLETION_RECOVERY_WINDOW_MS,
+  QUEUE_HEAD_CORRECTION_MAX_ATTEMPTS,
+  QUEUE_HEAD_CORRECTION_WINDOW_MS,
   ownsQqGuardedCompletion,
   queueSongIdentity,
   shouldRecordQqGuardedCompletion,
@@ -162,6 +165,66 @@ test('different stable IDs stay different even when metadata is identical', () =
     { Id: '111', SongName: 'Same', ArtistName: 'Artist' },
     { id: '222', title: 'Same', artist: 'Artist' }
   ), false);
+});
+
+// FB-20261021-CDCE7CDE: KuGou played the request under another numeric ID.
+const kugouRequest = {
+  Id: '303222240',
+  SongName: '青藏高原',
+  ArtistName: '李娜',
+  PlayerKey: 'kugou'
+};
+
+test('KuGou pairs different numeric IDs by the same title and artist', () => {
+  assert.equal(tracksRepresentSameSong(kugouRequest, {
+    id: '317243695', title: '青藏高原', artist: '李娜'
+  }), true);
+  // The shape main.ts stores for the player's current track.
+  assert.equal(tracksRepresentSameSong(kugouRequest, {
+    Id: '317243695', SongName: '青藏高原 ', ArtistName: ' 李娜'
+  }), true);
+  assert.equal(tracksRepresentSameSong(
+    { ...kugouRequest, ArtistName: '李娜、腾格尔' },
+    { id: '317243695', title: '青藏高原', artist: '李娜 / 腾格尔' }
+  ), true);
+});
+
+test('KuGou keeps different IDs apart without the same title and known artist', () => {
+  for (const observed of [
+    { id: '548045966', title: '夜夜夜夜', artist: '李娜' },
+    { id: '317243695', title: '青藏高原', artist: '韩红' },
+    { id: '317243695', title: '青藏高原 (Live)', artist: '李娜' },
+    { id: '317243695', title: '青藏高原', artist: '' },
+    { Id: '317243695', SongName: '青藏高原', ArtistName: '未知歌手' }
+  ]) {
+    assert.equal(tracksRepresentSameSong(kugouRequest, observed), false, JSON.stringify(observed));
+  }
+  // Two unknown artists are a title-only match, which is not enough.
+  assert.equal(tracksRepresentSameSong(
+    { ...kugouRequest, ArtistName: '未知歌手' },
+    { Id: '317243695', SongName: '青藏高原', ArtistName: '未知歌手' }
+  ), false);
+});
+
+test('other players keep different stable IDs apart despite identical metadata', () => {
+  for (const PlayerKey of ['netease', 'qqmusic', 'folia', undefined]) {
+    assert.equal(tracksRepresentSameSong({ ...kugouRequest, PlayerKey }, {
+      id: '317243695', title: '青藏高原', artist: '李娜'
+    }), false, String(PlayerKey));
+  }
+});
+
+test('a KuGou request under another ID confirms its action and native next', () => {
+  const nowPlaying = { id: '317243695', title: '青藏高原', artist: '李娜' };
+  assert.equal(shouldDeferManagedTrackObservation(kugouRequest, nowPlaying), false);
+  assert.equal(shouldRepairObservedNext(kugouRequest, nowPlaying, 'track'), false);
+  // Track-change detection compares player tracks, which carry no player
+  // key, so a new KuGou ID is still a transition there.
+  assert.equal(tracksRepresentSameSong(
+    { id: '303222240', title: '青藏高原', artist: '李娜' },
+    nowPlaying
+  ), false);
+  assert.equal(tracksHaveDifferentStableIds(kugouRequest, nowPlaying), true);
 });
 
 test('exact platform ID remains authoritative when metadata is incomplete', () => {
@@ -572,4 +635,78 @@ test('QQ interrupt always preserves the displaced current song as guard', () => 
     hadRegisteredGuard: false,
     hasDisplacedCurrentSong: true
   }), false);
+});
+
+const correctionHead = { Id: '303222240', SongName: '青藏高原', PlayerKey: 'kugou' };
+const planCorrection = (state, now, queueHead = correctionHead) =>
+  planQueueHeadCorrection({
+    state,
+    queueHead,
+    queueHeadIdentity: queueSongIdentity(queueHead, 'kugou'),
+    now
+  });
+
+test('a queue head gets two corrections, then one stop and only holds', () => {
+  assert.equal(QUEUE_HEAD_CORRECTION_MAX_ATTEMPTS, 2);
+  const first = planCorrection(null, 1_000);
+  assert.deepEqual(first, {
+    action: 'correct',
+    state: {
+      song: correctionHead,
+      identity: 'kugou|id:303222240',
+      attempts: 1,
+      lastAttemptAt: 1_000,
+      stopped: false
+    }
+  });
+  const second = planCorrection(first.state, 9_500);
+  assert.equal(second.action, 'correct');
+  assert.equal(second.state.attempts, 2);
+  const third = planCorrection(second.state, 18_000);
+  assert.equal(third.action, 'stop');
+  assert.equal(third.state.stopped, true);
+  assert.equal(third.state.attempts, 2);
+  // The hold does not expire on its own; only a cleared state lifts it.
+  for (const now of [26_500, 18_000 + QUEUE_HEAD_CORRECTION_WINDOW_MS, 3_600_000]) {
+    const held = planCorrection(third.state, now);
+    assert.equal(held.action, 'hold');
+    assert.equal(held.state, third.state);
+  }
+});
+
+test('a new head or a new request for the same song starts over', () => {
+  const stopped = planCorrection(
+    planCorrection(planCorrection(null, 1_000).state, 2_000).state,
+    3_000
+  ).state;
+  assert.equal(stopped.stopped, true);
+  const nextHead = { Id: '548045966', SongName: '夜夜夜夜', PlayerKey: 'kugou' };
+  for (const queueHead of [nextHead, { ...correctionHead }]) {
+    const plan = planCorrection(stopped, 4_000, queueHead);
+    assert.equal(plan.action, 'correct');
+    assert.equal(plan.state.song, queueHead);
+    assert.equal(plan.state.attempts, 1);
+    assert.equal(plan.state.stopped, false);
+  }
+  // A changed identity on the same object, e.g. a newly resolved ID, too.
+  assert.equal(planQueueHeadCorrection({
+    state: stopped,
+    queueHead: correctionHead,
+    queueHeadIdentity: 'kugou|id:317243695',
+    now: 4_000
+  }).action, 'correct');
+});
+
+test('a correction continues the row only within the window of the previous one', () => {
+  const second = planCorrection(planCorrection(null, 0).state, 50_000).state;
+  assert.equal(second.attempts, 2);
+  assert.equal(
+    planCorrection(second, 50_000 + QUEUE_HEAD_CORRECTION_WINDOW_MS - 1).action,
+    'stop'
+  );
+  const restarted = planCorrection(second, 50_000 + QUEUE_HEAD_CORRECTION_WINDOW_MS);
+  assert.equal(restarted.action, 'correct');
+  assert.equal(restarted.state.attempts, 1);
+  // A clock that went backwards starts a new row rather than stopping.
+  assert.equal(planCorrection(second, 40_000).state.attempts, 1);
 });

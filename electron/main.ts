@@ -20,6 +20,7 @@ import {
   planQqGuardedCompletionRecovery,
   planQqGuardTerminalRecovery,
   planObservedNextAction,
+  planQueueHeadCorrection,
   planQueueHeadMutation,
   ownsQqGuardedCompletion,
   queueSongIdentity,
@@ -29,7 +30,7 @@ import {
   shouldPreserveGuardAfterImmediate,
   tracksRepresentSameSong
 } from './queue-head-policy';
-import type { NextObservation } from './queue-head-policy';
+import type { NextObservation, QueueHeadCorrectionState } from './queue-head-policy';
 import {
   shouldAllowMultipleInstances,
   shouldRequestAppQuit
@@ -1387,6 +1388,8 @@ let deferredQqInsertIdentity = '';
 let qqDeferredInsertRetryAttempted = false;
 let qqDeferredInsertRetryInFlight = false;
 const cancelledNativeNextSongs = new Map<string, any>();
+/** Host-side immediate-play corrections of the queue head; see claimQueueHeadCorrection. */
+let queueHeadCorrection: QueueHeadCorrectionState | null = null;
 let nextGuardOperationTail: Promise<void> = Promise.resolve();
 let managedPlayerActionSequence = 0;
 let localTestRequestSequence = 0;
@@ -1598,6 +1601,8 @@ const playerManager = new PlayerManager({
       queueHeadNeedsGuardOnlyAfterCurrentChange = false;
       activeManagedPlayerAction = null;
       cancelledNativeNextSongs.clear();
+      // A reconnect (for example after a connector update) may correct again.
+      queueHeadCorrection = null;
     }
     if (
       wasConnected
@@ -3346,6 +3351,11 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
       'DarkGray'
     );
   }
+  // The player reached the corrected request after all; a later mismatch for
+  // it starts a fresh correction budget.
+  if (queueHeadCorrection && isObservedSong(queueHeadCorrection.song)) {
+    queueHeadCorrection = null;
+  }
   let stateChanged = false;
   let recentQqRecoveryHandled = false;
 
@@ -3437,16 +3447,25 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
           stateChanged = true;
           await guardNextSong(targetQueue[0], playbackAnchorReady);
         } else {
-          writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${targetQueue[0]?.SongName}`, 'Magenta');
           const queuedSong = targetQueue[0];
           const deferForMissingAnchor = shouldDeferQqQueueHeadForMissingAnchor(
             playbackAnchorReady
           );
-          const queuedPlaybackConfirmed = deferForMissingAnchor
-            ? await guardNextSong(queuedSong, playbackAnchorReady)
-            : await playSongNow(queuedSong);
-          if (queuedPlaybackConfirmed && !deferForMissingAnchor) {
-            stateChanged = true;
+          if (
+            deferForMissingAnchor
+            || await claimQueueHeadCorrection(queuedSong, playbackAnchorReady)
+          ) {
+            writeLog(`[状态同步] 捕捉到切歌信号！强制拉起待播列表首曲: ${queuedSong?.SongName}`, 'Magenta');
+            const queuedPlaybackConfirmed = deferForMissingAnchor
+              ? await guardNextSong(queuedSong, playbackAnchorReady)
+              : await playSongNow(queuedSong);
+            if (queuedPlaybackConfirmed && !deferForMissingAnchor) {
+              stateChanged = true;
+            }
+          } else {
+            // The previous request no longer plays. Release it so the
+            // player's own track shows while the head waits for its guard.
+            currentPlayingSong = null;
           }
         }
       } else {
@@ -3535,10 +3554,12 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
           // attempt must not be retried by this host-side mismatch fallback.
           await guardNextSong(targetQueue[0], playbackAnchorReady);
         } else {
-          writeLog(`[兜底纠正] 实际切歌与待播队首不符，立即切到: ${targetQueue[0]?.SongName}`, 'Magenta');
           const queuedSong = targetQueue[0];
-          if (await playSongNow(queuedSong)) {
-            stateChanged = true;
+          if (await claimQueueHeadCorrection(queuedSong, playbackAnchorReady)) {
+            writeLog(`[兜底纠正] 实际切歌与待播队首不符，立即切到: ${queuedSong?.SongName}`, 'Magenta');
+            if (await playSongNow(queuedSong)) {
+              stateChanged = true;
+            }
           }
         }
       }
@@ -4718,6 +4739,36 @@ function syncDeferredQqInsertWithQueueHead(): void {
   }
 }
 
+/**
+ * Claims one host-side immediate-play correction of the queue head, bounded
+ * by planQueueHeadCorrection. Past the limit the request stays queued, is
+ * handed once to the ordinary next-song guard, and later mismatches only
+ * repeat the status.
+ */
+async function claimQueueHeadCorrection(
+  queueHead: any,
+  playbackAnchorReady: boolean
+): Promise<boolean> {
+  const plan = planQueueHeadCorrection({
+    state: queueHeadCorrection,
+    queueHead,
+    queueHeadIdentity: getQueueSongIdentity(queueHead),
+    now: Date.now()
+  });
+  queueHeadCorrection = plan.state;
+  if (plan.action === 'correct') return true;
+
+  const notice = '播放器多次没有切到点播歌曲，已停止自动纠正并保留队首: '
+    + `${queueHead?.SongName || '未知歌曲'}；`
+    + '请确认播放器版本受支持，或在播放器设置中更新连接器';
+  setGlobalStatus(notice);
+  if (plan.action === 'stop') {
+    writeLog(`[兜底纠正] ${notice}`, 'Yellow');
+    await guardNextSong(queueHead, playbackAnchorReady);
+  }
+  return false;
+}
+
 async function serializeNextGuardOperation<T>(
   operation: () => Promise<T>
 ): Promise<T> {
@@ -4893,6 +4944,8 @@ async function reconcileQueueHeadAfterMutation(
   clearRecentQqGuardedCompletion();
   const nextHead = targetQueue[0] || null;
   syncDeferredQqInsertWithQueueHead();
+  // The correction budget belongs to one head; a new head starts over.
+  if (queueHeadCorrection?.song !== nextHead) queueHeadCorrection = null;
   const hadRegisteredNext = Boolean(registeredNextGuardKey)
     && registeredNextGuardSongIdentity
       === getQueueSongIdentity(previousHead);

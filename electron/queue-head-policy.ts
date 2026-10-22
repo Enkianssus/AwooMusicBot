@@ -130,6 +130,78 @@ export function planQqGuardedCompletionRecovery(options: {
   return options.rescueAttempted ? 'stop' : 'recover-once';
 }
 
+/**
+ * When the player moves to anything other than the waiting request, the host
+ * plays the queue head immediately. A player that cannot reach that request
+ * answers each correction with another track change, so the request and the
+ * previous song used to alternate every few seconds. One head gets at most
+ * QUEUE_HEAD_CORRECTION_MAX_ATTEMPTS corrections in a row; an attempt
+ * continues the row while it follows the previous one within the window.
+ */
+export const QUEUE_HEAD_CORRECTION_MAX_ATTEMPTS = 2;
+export const QUEUE_HEAD_CORRECTION_WINDOW_MS = 60_000;
+
+export type QueueHeadCorrectionAction = 'correct' | 'stop' | 'hold';
+
+export interface QueueHeadCorrectionState {
+  /** The exact queue request; a new request for the same song starts over. */
+  song: unknown;
+  identity: string;
+  attempts: number;
+  lastAttemptAt: number;
+  stopped: boolean;
+}
+
+/**
+ * Plans one host-side correction of the queue head and returns the state to
+ * keep. 'correct' sends it, 'stop' is the first refusal after the limit and
+ * 'hold' every later one. The caller clears the state when the head changes,
+ * the request is observed playing or the player disconnects.
+ */
+export function planQueueHeadCorrection(options: {
+  state: QueueHeadCorrectionState | null;
+  queueHead: unknown;
+  queueHeadIdentity: string;
+  now: number;
+}): { action: QueueHeadCorrectionAction; state: QueueHeadCorrectionState } {
+  const { state, queueHead, queueHeadIdentity, now } = options;
+  const current = state
+    && state.song === queueHead
+    && state.identity === queueHeadIdentity
+    ? state
+    : null;
+  if (current?.stopped) return { action: 'hold', state: current };
+
+  const sinceLastAttempt = current ? now - current.lastAttemptAt : NaN;
+  if (
+    !current
+    || !(sinceLastAttempt >= 0
+      && sinceLastAttempt < QUEUE_HEAD_CORRECTION_WINDOW_MS)
+  ) {
+    return {
+      action: 'correct',
+      state: {
+        song: queueHead,
+        identity: queueHeadIdentity,
+        attempts: 1,
+        lastAttemptAt: now,
+        stopped: false
+      }
+    };
+  }
+  if (current.attempts < QUEUE_HEAD_CORRECTION_MAX_ATTEMPTS) {
+    return {
+      action: 'correct',
+      state: {
+        ...current,
+        attempts: current.attempts + 1,
+        lastAttemptAt: now
+      }
+    };
+  }
+  return { action: 'stop', state: { ...current, stopped: true } };
+}
+
 export function queueSongIdentity(
   song: QueueSongLike | null | undefined,
   fallbackPlayerKey: string
@@ -195,11 +267,40 @@ function trackTitlesRepresentSameSong(
     && normalizedFirst.base === normalizedSecond.base;
 }
 
+// main.ts stores a missing artist as this placeholder.
+const UNKNOWN_ARTIST = normalizeTrackText('未知歌手');
+
+/**
+ * KuGou reports one recording under different numeric IDs: its search
+ * result, the now-playing track and album versions disagree. There, the same
+ * title and the same known artist identify the song; a title alone does not.
+ */
+function kugouMetadataRepresentsSameSong(
+  expected: QueueSongLike,
+  observed: QueueSongLike
+): boolean {
+  const expectedArtist = normalizeTrackText(
+    readTrackField(expected, 'ArtistName', 'artist')
+  );
+  const observedArtist = normalizeTrackText(
+    readTrackField(observed, 'ArtistName', 'artist')
+  );
+  return Boolean(expectedArtist)
+    && expectedArtist !== UNKNOWN_ARTIST
+    && expectedArtist === observedArtist
+    && trackTitlesRepresentSameSong(
+      readTrackField(expected, 'SongName', 'title'),
+      readTrackField(observed, 'SongName', 'title'),
+      false
+    );
+}
+
 /**
  * Matches a queue item with an observed player track. Some native players
  * temporarily report title/artist-derived IDs while metadata caches catch up,
  * so an ID mismatch must not prevent a song that is already playing from
- * leaving the request queue.
+ * leaving the request queue. Two different stable IDs are different songs,
+ * except on KuGou, where the title and artist decide.
  */
 export function tracksRepresentSameSong(
   expected: QueueSongLike | null | undefined,
@@ -210,17 +311,18 @@ export function tracksRepresentSameSong(
   const expectedId = readTrackField(expected, 'Id', 'id');
   const observedId = readTrackField(observed, 'Id', 'id');
   if (expectedId && observedId && expectedId === observedId) return true;
+  const playerKey = String(
+    expected.PlayerKey || observed.PlayerKey || ''
+  ).toLowerCase();
   if (
     isStableTrackId(expectedId)
     && isStableTrackId(observedId)
     && expectedId !== observedId
   ) {
-    return false;
+    return playerKey === 'kugou'
+      && kugouMetadataRepresentsSameSong(expected, observed);
   }
 
-  const playerKey = String(
-    expected.PlayerKey || observed.PlayerKey || ''
-  ).toLowerCase();
   if (!trackTitlesRepresentSameSong(
     readTrackField(expected, 'SongName', 'title'),
     readTrackField(observed, 'SongName', 'title'),

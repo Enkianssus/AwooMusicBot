@@ -64,9 +64,24 @@ const ALLOWED_FILE_EXTENSIONS = new Set([
 
 export const BUILTIN_OVERLAY_SETTINGS: OverlaySettingDefinition[] = [
   {
+    key: 'theme',
+    label: '颜色主题',
+    description: '选择内置配色。蓝白配色与点歌机控制窗口一致；强调色和主要文字颜色只在“嗷呜紫”主题下生效。',
+    group: '颜色',
+    type: 'select',
+    default: 'classic',
+    cssVariable: '--awoo-theme',
+    cssUnit: '',
+    options: [
+      { label: '嗷呜紫 · 深色（默认）', value: 'classic' },
+      { label: '蓝白 · 浅色', value: 'blue-light' },
+      { label: '蓝白 · 深色', value: 'blue-dark' }
+    ]
+  },
+  {
     key: 'accentColor',
     label: '强调色',
-    description: '标题、标签和高亮元素使用的颜色。',
+    description: '“嗷呜紫”主题下标题、标签和高亮元素使用的颜色；蓝白主题使用固定配色。',
     group: '颜色',
     type: 'color',
     default: '#c6a3ff',
@@ -76,7 +91,7 @@ export const BUILTIN_OVERLAY_SETTINGS: OverlaySettingDefinition[] = [
   {
     key: 'textColor',
     label: '主要文字颜色',
-    description: '歌曲名称等主要文字使用的颜色。',
+    description: '“嗷呜紫”主题下歌曲名称等主要文字使用的颜色；蓝白主题使用固定配色。',
     group: '颜色',
     type: 'color',
     default: '#f8f8ff',

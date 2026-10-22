@@ -5,14 +5,37 @@
   "version": "1.1.1",
   "entry": "index.html",
   "author": "Enkianssus",
-  "description": "透明的当前播放与待播队列组件，暂停区域变红，正常状态保持安静。",
+  "description": "透明的当前播放与待播队列组件，内置嗷呜紫与蓝白浅色、深色配色；暂停区域变红，正常状态保持安静。",
   "homepage": "https://github.com/Enkianssus/AwooMusicBot-Overlay-Default",
   "minAppVersion": "1.1.6",
   "settings": [
     {
+      "key": "theme",
+      "label": "颜色主题",
+      "description": "选择内置配色。蓝白配色与点歌机控制窗口一致；强调色和主要文字颜色只在“嗷呜紫”主题下生效。",
+      "group": "颜色",
+      "type": "select",
+      "default": "classic",
+      "options": [
+        {
+          "label": "嗷呜紫 · 深色（默认）",
+          "value": "classic"
+        },
+        {
+          "label": "蓝白 · 浅色",
+          "value": "blue-light"
+        },
+        {
+          "label": "蓝白 · 深色",
+          "value": "blue-dark"
+        }
+      ],
+      "cssVariable": "--awoo-theme"
+    },
+    {
       "key": "accentColor",
       "label": "强调色",
-      "description": "标题、标签和高亮元素使用的颜色。",
+      "description": "“嗷呜紫”主题下标题、标签和高亮元素使用的颜色；蓝白主题使用固定配色。",
       "group": "颜色",
       "type": "color",
       "default": "#c6a3ff",
@@ -21,7 +44,7 @@
     {
       "key": "textColor",
       "label": "主要文字颜色",
-      "description": "歌曲名称等主要文字使用的颜色。",
+      "description": "“嗷呜紫”主题下歌曲名称等主要文字使用的颜色；蓝白主题使用固定配色。",
       "group": "颜色",
       "type": "color",
       "default": "#f8f8ff",

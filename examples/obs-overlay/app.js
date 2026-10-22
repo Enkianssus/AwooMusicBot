@@ -235,6 +235,31 @@
     if (element.textContent !== value) element.textContent = value;
   }
 
+  function notificationPart(tagName, className) {
+    var element = document.createElement(tagName);
+    element.className = className;
+    return element;
+  }
+
+  // Icon, title with a status pill, detail line and a lifetime bar. Text is
+  // only ever assigned through textContent.
+  function createNotificationCard() {
+    var card = notificationPart('div', 'request-notification');
+    var icon = notificationPart('span', 'request-notification-icon');
+    icon.setAttribute('aria-hidden', 'true');
+    var body = notificationPart('div', 'request-notification-body');
+    var head = notificationPart('div', 'request-notification-head');
+    var title = notificationPart('p', 'request-notification-title');
+    var status = notificationPart('span', 'request-notification-status');
+    var message = notificationPart('p', 'request-notification-message');
+    var timer = notificationPart('span', 'request-notification-timer');
+    timer.setAttribute('aria-hidden', 'true');
+    head.append(title, status);
+    body.append(head, message);
+    card.append(icon, body, timer);
+    return { card: card, status: status, title: title, message: message, timer: timer, timerKind: '' };
+  }
+
   function renderRequestNotifications(state) {
     if (!elements.queueNotifications) return;
     if (notificationTimer !== null) {
@@ -265,16 +290,7 @@
     visible.forEach(function (notice, index) {
       var entry = notificationNodes.get(notice.id);
       if (!entry) {
-        var card = document.createElement('div');
-        card.className = 'request-notification';
-        var status = document.createElement('span');
-        status.className = 'request-notification-status';
-        var title = document.createElement('p');
-        title.className = 'request-notification-title';
-        var message = document.createElement('p');
-        message.className = 'request-notification-message';
-        card.append(status, title, message);
-        entry = { card: card, status: status, title: title, message: message };
+        entry = createNotificationCard();
         notificationNodes.set(notice.id, entry);
       }
       var label = notificationLabel(notice);
@@ -282,6 +298,18 @@
       var requester = notice.action === 'remove' ? '' : notice.requestedBy;
       var detail = [requester, notice.message].filter(Boolean).join(' · ');
       entry.card.dataset.kind = notice.kind;
+      entry.card.dataset.action = notice.action || 'request';
+      if (entry.timerKind !== notice.kind) {
+        // The bar is timed once per state, so repeated broadcasts never restart it.
+        // A brand-new card resumes its remaining life; a waiting card that just got
+        // its result counts down from full.
+        var fresh = entry.timerKind === '';
+        var life = fresh ? notice.expiresAt - notice.createdAt : notice.expiresAt - now;
+        var elapsed = fresh ? Math.max(0, now - notice.createdAt) : 0;
+        entry.timer.style.setProperty('--notice-life', Math.max(1, Math.round(life)) + 'ms');
+        entry.timer.style.setProperty('--notice-delay', '-' + Math.round(elapsed) + 'ms');
+        entry.timerKind = notice.kind;
+      }
       entry.card.title = [label, notice.title, detail].filter(Boolean).join(' · ');
       updateNotificationText(entry.status, label);
       updateNotificationText(entry.title, notice.title);

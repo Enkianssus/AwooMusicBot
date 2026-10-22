@@ -22,6 +22,8 @@ function overlayHarness() {
       this.hidden = false;
       this.parent = null;
       this.inserts = 0;
+      this.className = '';
+      this.style = { values: {}, setProperty(name, value) { this.values[name] = value; } };
     }
     append(...children) { children.forEach(child => this.insertBefore(child, null)); }
     insertBefore(child, reference) {
@@ -105,6 +107,18 @@ function overlayHarness() {
   return { element, advance, snapshot, sockets, get now() { return now; } };
 }
 
+/** Finds a card part by its class, wherever the card layout puts it. */
+function part(node, name) {
+  const className = `request-notification-${name}`;
+  const stack = [...node.children];
+  while (stack.length) {
+    const child = stack.shift();
+    if (String(child.className).split(' ').includes(className)) return child;
+    stack.push(...child.children);
+  }
+  throw new Error(`missing ${className}`);
+}
+
 function notice(overrides = {}) {
   return {
     id: 'request-1', kind: 'waiting', title: '晴天', message: '正在搜索歌曲',
@@ -117,14 +131,14 @@ test('request popups update the same card and expire without another state broad
   const list = ui.element('queue-notifications');
   ui.snapshot([notice()]);
   const card = list.children[0];
-  assert.equal(card.children[0].textContent, '待处理');
-  assert.equal(card.children[1].textContent, '晴天');
-  assert.equal(card.children[2].textContent, '小明 · 正在搜索歌曲');
+  assert.equal(part(card, 'status').textContent, '待处理');
+  assert.equal(part(card, 'title').textContent, '晴天');
+  assert.equal(part(card, 'message').textContent, '小明 · 正在搜索歌曲');
   ui.advance(1_000);
   const result = notice({ kind: 'success', message: '已加入待播队列', expiresAt: ui.now + 6_000 });
   ui.snapshot([result]);
   assert.equal(list.children[0], card);
-  assert.equal(card.children[0].textContent, '点歌成功');
+  assert.equal(part(card, 'status').textContent, '点歌成功');
   ui.advance(2_000);
   ui.snapshot([result], epoch + 1_000);
   assert.equal(list.inserts, 1, 'identical snapshots must not reinsert the card');
@@ -171,7 +185,7 @@ test('a stale HTTP snapshot cannot roll a completed operation back to waiting', 
   ui.advance(1_000);
   ui.snapshot([notice({ kind: 'success', message: '已加入待播队列', expiresAt: epoch + 7_000 })]);
   ui.snapshot([waiting], epoch);
-  assert.equal(ui.element('queue-notifications').children[0].children[0].textContent, '点歌成功');
+  assert.equal(part(ui.element('queue-notifications').children[0], 'status').textContent, '点歌成功');
   ui.advance(6_000);
   assert.equal(ui.element('queue-notifications').children.length, 0);
 });
@@ -185,13 +199,13 @@ test('only two current popups render, expiry reveals remaining notices, and titl
   ]);
   const list = ui.element('queue-notifications');
   assert.equal(list.children.length, 2);
-  assert.equal(list.children[0].children[0].textContent, '点歌失败');
-  assert.equal(list.children[0].children[1].textContent, '<img src=x onerror=alert(1)>');
-  assert.equal(list.children[0].children[1].children.length, 0);
-  assert.equal(list.children[1].children[0].textContent, '撤回失败');
+  assert.equal(part(list.children[0], 'status').textContent, '点歌失败');
+  assert.equal(part(list.children[0], 'title').textContent, '<img src=x onerror=alert(1)>');
+  assert.equal(part(list.children[0], 'title').children.length, 0);
+  assert.equal(part(list.children[1], 'status').textContent, '撤回失败');
   ui.advance(6_000);
   assert.equal(list.children.length, 2);
-  assert.equal(list.children[1].children[0].textContent, '撤回成功');
+  assert.equal(part(list.children[1], 'status').textContent, '撤回成功');
   ui.advance(4_000);
   assert.equal(list.children.length, 0);
 });
@@ -214,7 +228,7 @@ test('labels come from the notice action and only legacy notices sniff the messa
     const ui = overlayHarness();
     ui.snapshot([notice({ expiresAt: epoch + 6_000, ...overrides })]);
     const card = ui.element('queue-notifications').children[0];
-    assert.equal(card.children[0].textContent, label, JSON.stringify(overrides));
+    assert.equal(part(card, 'status').textContent, label, JSON.stringify(overrides));
     assert.equal(card.dataset.kind, overrides.kind);
   }
 });
@@ -226,9 +240,9 @@ test('a streamer removal is not attributed to the viewer', () => {
     message: '主播已将歌曲移出待播队列', expiresAt: epoch + 6_000
   })]);
   const card = ui.element('queue-notifications').children[0];
-  assert.equal(card.children[0].textContent, '主播已移出');
-  assert.equal(card.children[1].textContent, '晴天');
-  assert.equal(card.children[2].textContent, '主播已将歌曲移出待播队列');
+  assert.equal(part(card, 'status').textContent, '主播已移出');
+  assert.equal(part(card, 'title').textContent, '晴天');
+  assert.equal(part(card, 'message').textContent, '主播已将歌曲移出待播队列');
 });
 
 test('only the newest waiting request takes a card and the queue reserves room for notices', () => {
@@ -244,7 +258,7 @@ test('only the newest waiting request takes a card and the queue reserves room f
   ];
   ui.snapshot(waiting);
   assert.equal(list.children.length, 1);
-  assert.equal(list.children[0].children[1].textContent, '第三首');
+  assert.equal(part(list.children[0], 'title').textContent, '第三首');
   assert.equal(list.hidden, false);
   assert.equal(queue.dataset.hasNotices, 'true');
   ui.advance(1_000);
@@ -253,12 +267,50 @@ test('only the newest waiting request takes a card and the queue reserves room f
     createdAt: ui.now, expiresAt: ui.now + 6_000
   });
   ui.snapshot([waiting[0], result, waiting[2]]);
-  assert.deepEqual(list.children.map(card => card.children[1].textContent), ['第二首', '第三首']);
+  assert.deepEqual(list.children.map(card => part(card, 'title').textContent), ['第二首', '第三首']);
   assert.deepEqual(list.children.map(card => card.dataset.kind), ['success', 'waiting']);
   ui.snapshot([]);
   assert.equal(list.children.length, 0);
   assert.equal(list.hidden, true);
   assert.equal(queue.dataset.hasNotices, 'false');
+});
+
+test('cards expose their action and keep decorative parts away from screen readers', () => {
+  const ui = overlayHarness();
+  ui.snapshot([
+    notice({ id: 'removed', kind: 'cancelled', action: 'remove', requestedBy: '主播', expiresAt: epoch + 6_000 }),
+    notice({ id: 'legacy', kind: 'error', createdAt: epoch - 1, expiresAt: epoch + 6_000, message: '点歌失败：没有搜索结果' })
+  ]);
+  const [removed, legacy] = ui.element('queue-notifications').children;
+  assert.equal(removed.dataset.action, 'remove');
+  assert.equal(legacy.dataset.action, 'request', 'hosts before 1.2.6 send no action');
+  assert.equal(part(removed, 'icon').attributes['aria-hidden'], 'true');
+  assert.equal(part(removed, 'timer').attributes['aria-hidden'], 'true');
+});
+
+test('the lifetime bar is timed once per state and resumes a card that was already running', () => {
+  const ui = overlayHarness();
+  ui.advance(1_000);
+  const result = notice({ kind: 'success', message: '已加入待播队列', expiresAt: epoch + 6_000 });
+  ui.snapshot([result]);
+  const card = ui.element('queue-notifications').children[0];
+  const timer = part(card, 'timer').style.values;
+  assert.deepEqual(timer, { '--notice-life': '6000ms', '--notice-delay': '-1000ms' });
+  ui.advance(2_000);
+  ui.snapshot([result]);
+  assert.deepEqual(timer, { '--notice-life': '6000ms', '--notice-delay': '-1000ms' }, 'a repeated broadcast must not restart the bar');
+});
+
+test('a waiting card that gets its result counts down from full', () => {
+  const ui = overlayHarness();
+  ui.snapshot([notice()]);
+  const card = ui.element('queue-notifications').children[0];
+  const timer = part(card, 'timer').style.values;
+  assert.equal(timer['--notice-life'], '120000ms');
+  ui.advance(2_000);
+  ui.snapshot([notice({ kind: 'success', message: '已加入待播队列', expiresAt: epoch + 8_000 })]);
+  assert.equal(ui.element('queue-notifications').children[0], card);
+  assert.deepEqual(timer, { '--notice-life': '6000ms', '--notice-delay': '-0ms' });
 });
 
 test('older hosts and malformed notifications are harmless', () => {

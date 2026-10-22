@@ -85,6 +85,8 @@ app.js
 
 每项参数都会自动写入它的 `cssVariable`；没有填写时会根据 `key` 生成 `--awoo-*` 变量。数值参数可用受限的 `cssUnit`：`px`、`rem`、`em`、`%`、`deg`、`s`、`ms`、`vh` 或 `vw`。同时根元素会得到形如 `data-awoo-setting-cover-rotation="true"` 的属性，纯 CSS Mod 无需编写额外设置代码。
 
+颜色预设也可以只用 CSS 完成。内置 UI 的“颜色主题”是一个 `select` 参数，样式表按 `html[data-awoo-setting-theme="blue-light"] .widget { … }` 重新定义配色变量。颜色参数的变量以内联样式写在 `<html>` 上，所以预设要定义在 `.widget` 这类子元素上才能覆盖它们；未选预设时，`<html>` 上的取色值照常生效。
+
 需要用 JavaScript 响应参数时，可以监听宿主自动注入的事件：
 
 ```js

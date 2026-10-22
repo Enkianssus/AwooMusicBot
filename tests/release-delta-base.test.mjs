@@ -164,4 +164,13 @@ test('the release workflow prepares the delta base before packing and uploads on
   assert.ok(version < fetchBase && fetchBase < pack && pack < prune && prune < upload && upload < prewarm);
   assert.match(workflow, /release-delta-base\.mjs fetch[^\n]*--min-version 1\.1\.0[^\n]*--pack-id awoo-musicbot/);
   assert.doesNotMatch(workflow, /release-delta-base\.mjs fetch[^\n]*--strict/, 'a missing base must fall back to the full package');
+
+  // vpk's zstd.exe reads arguments in the runner's ANSI code page, which cannot hold
+  // 嗷呜点歌机.exe; it gets a UTF-8 code page first, and a failed delta never blocks a release.
+  const packStep = workflow.slice(position('name: Pack with Velopack'), prune);
+  assert.match(packStep, /activeCodePage[^\n]*UTF-8/);
+  assert.match(packStep, /-outputresource:/);
+  assert.ok(packStep.indexOf('activeCodePage') < packStep.indexOf('vpk pack'), 'zstd is fixed before packing');
+  assert.match(packStep, /if \(\$LASTEXITCODE -ne 0\) \{[\s\S]*Remove-Item -Path 'Releases'[\s\S]*vpk pack [^\n]*--delta none/,
+    'a failed delta pack is retried as a full-only pack');
 });

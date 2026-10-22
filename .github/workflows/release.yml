@@ -109,7 +109,37 @@ jobs:
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $notesArgs = @()
           if ($env:RELEASE_NOTES_PATH) { $notesArgs = @('--releaseNotes', $env:RELEASE_NOTES_PATH) }
+
+          # vpk's bundled zstd.exe reads its arguments in the system ANSI code page, which on
+          # this English runner cannot hold 嗷呜点歌机.exe, so creating the delta fails. Merging a
+          # UTF-8 activeCodePage into its manifest lets it read the paths unchanged.
+          $zstd = Get-ChildItem -Path "$env:USERPROFILE\.dotnet\tools\.store\vpk" -Recurse -Filter zstd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $mt = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if ($zstd -and $mt) {
+            $existingManifest = Join-Path $env:RUNNER_TEMP 'zstd-existing.manifest'
+            $utf8Manifest = Join-Path $env:RUNNER_TEMP 'zstd-utf8.manifest'
+            [IO.File]::WriteAllText($utf8Manifest, '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings><activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage></windowsSettings></application></assembly>')
+            & $mt.FullName -nologo "-inputresource:$($zstd.FullName);#1" "-out:$existingManifest" | Out-Null
+            $manifests = if ($LASTEXITCODE -eq 0 -and (Test-Path $existingManifest)) { @($existingManifest, $utf8Manifest) } else { @($utf8Manifest) }
+            & $mt.FullName -nologo -manifest @manifests "-outputresource:$($zstd.FullName);#1"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::Could not give zstd.exe a UTF-8 code page; the delta may fall back to the full package."
+            }
+          } else {
+            Write-Host "::warning::zstd.exe or mt.exe was not found; the delta may fall back to the full package."
+          }
+
           vpk pack -u awoo-musicbot -v $env:VERSION -p dist_electron/win-unpacked -e "嗷呜点歌机.exe" --packTitle "嗷呜点歌机" -i assets/icon.ico @notesArgs
+          if ($LASTEXITCODE -ne 0) {
+            # A delta must never block a release: pack again exactly as before deltas existed.
+            Write-Host "::warning::Packing with a delta failed; packing the full package only."
+            Remove-Item -Path 'Releases' -Recurse -Force -ErrorAction SilentlyContinue
+            vpk pack -u awoo-musicbot -v $env:VERSION -p dist_electron/win-unpacked -e "嗷呜点歌机.exe" --packTitle "嗷呜点歌机" -i assets/icon.ico --delta none @notesArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "vpk pack failed with exit code $LASTEXITCODE"
+            }
+          }
 
       - name: Keep only current-version release assets
         shell: pwsh

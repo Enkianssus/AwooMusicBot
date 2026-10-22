@@ -129,6 +129,11 @@ releases.win.json
 取不到基线时只告警并照常发布完整包，此时 Release 只有六项，日志出现
 “No delta package was produced” 警告，客户端会下载完整包。
 
+GitHub 的 Windows runner 使用英文 ANSI 代码页，vpk 自带的 `zstd.exe` 按该代码页
+读取参数，无法处理 `嗷呜点歌机.exe` 这样的中文文件名。workflow 会在打包前用 `mt.exe`
+为它合并 UTF-8 代码页清单；若带增量打包仍然失败，会清空 `Releases` 并以
+`--delta none` 重新打包，同样只发布完整包并留下告警。
+
 `vpk` 固定为 1.2.161，增量包按此版本验证。升级 `vpk` 前，先在本地用新版本打包，
 并用 `vpk delta patch` 把增量包打到上一版完整包上，确认还原结果的 SHA1 与
 `releases.win.json` 中本版完整包一致。

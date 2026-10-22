@@ -81,7 +81,7 @@ export default function DiagnosticsPanel({ onNavigate }: DiagnosticsPanelProps) 
     const [initializing, setInitializing] = useState(true);
     const [pending, setPending] = useState('');
     const [networkError, setNetworkError] = useState('');
-    const [keyword, setKeyword] = useState('晴天');
+    const [keyword, setKeyword] = useState('Shelter');
     const [songKeyword, setSongKeyword] = useState('晴天');
     const [songMode, setSongMode] = useState<'normal' | 'play_now'>('normal');
     const [songConsent, setSongConsent] = useState(false);

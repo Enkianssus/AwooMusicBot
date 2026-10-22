@@ -6251,7 +6251,7 @@ function restartExternalApiServer(): Promise<void> {
 const diagnosticsState: Omit<DiagnosticsState, 'reception'> = {
   busy: false, phase: '', report: null, repairResults: [], error: ''
 };
-let diagnosticsKeyword = '晴天';
+let diagnosticsKeyword = 'Shelter';
 
 function getDiagnosticsState(): DiagnosticsState {
   return { ...diagnosticsState, reception: danmakuReceptionTracker.getState() };

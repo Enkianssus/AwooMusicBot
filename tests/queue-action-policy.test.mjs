@@ -75,6 +75,26 @@ test('the current song matches by request ID first, then by song ID', () => {
   for (const malformed of [{}, null, 'a']) assert.equal(matchesCurrentSong(current, malformed), false);
 });
 
+test('a viewer\'s waiting requests are counted by OrderedByUid, never the one already playing', () => {
+  const { countQueuedRequestsByViewer } = policy;
+  const queue = [song('r1', 'a', '1'), song('r2', 'b', '2'), song('r3', 'a', '1'), song('', 'c', '1')];
+  assert.equal(countQueuedRequestsByViewer(queue, '1'), 3);
+  assert.equal(countQueuedRequestsByViewer(queue, '2'), 1);
+  assert.equal(countQueuedRequestsByViewer(queue, '3'), 0);
+  assert.equal(countQueuedRequestsByViewer(queue, 2), 1);
+  // A request that started playing can still be the queue head until the player confirms it.
+  assert.equal(countQueuedRequestsByViewer(queue, '1', { ...queue[0] }), 2);
+  // Another request, or one without an ID, is a different request even for the same song.
+  assert.equal(countQueuedRequestsByViewer(queue, '1', song('r9', 'a', '1')), 3);
+  assert.equal(countQueuedRequestsByViewer(queue, '1', song('', 'c', '1')), 3);
+  // Guest connections may report UID 0 for every viewer, so those requests belong to no one viewer.
+  const guests = [song('r1', 'a', '0'), song('r2', 'b', '0'), song('r3', 'c', '')];
+  for (const uid of ['0', 0, '', null, undefined]) {
+    assert.equal(countQueuedRequestsByViewer(guests, uid), 0, String(uid));
+  }
+  assert.equal(countQueuedRequestsByViewer([null, 'x', 7, song('r1', 'a', '1')], '1'), 1);
+});
+
 // The real /api/queue/action implementation, extracted from main.ts and run
 // against an inert queue without Electron, sockets or a player.
 const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8');

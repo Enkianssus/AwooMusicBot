@@ -119,6 +119,7 @@ import {
 } from './request-notifications';
 import { AVATAR_PLACEHOLDER, createAvatarCache } from './bili-avatar-cache';
 import {
+  countQueuedRequestsByViewer,
   isQueueIndex,
   matchesCurrentSong,
   QUEUE_ITEM_MISSING_MESSAGE,
@@ -5292,8 +5293,25 @@ async function tryRequestSong(
   keyword: string,
   mode: LocalSongRequestMode = 'normal',
   // Only danmaku requests publish viewer notices; local tests stay off stream.
-  feedback: RequestFeedbackOperation | null = null
+  feedback: RequestFeedbackOperation | null = null,
+  // Danmaku requests pass MaxQueuedSongsPerUser; 0, as for local tests, is no limit.
+  queuedSongLimit = 0
 ): Promise<SongRequestResult> {
+  // Only normal and top requests wait in the queue; 插队 and 立即点歌 play at once.
+  const queueLimitReason = (): string => {
+    if (!(queuedSongLimit > 0) || (mode !== 'normal' && mode !== 'top')) return '';
+    const queued = countQueuedRequestsByViewer(targetQueue, user.uid, currentPlayingSong);
+    return queued >= queuedSongLimit
+      ? `你已有 ${queued} 首歌在待播队列中，请等前面的歌播放后再点`
+      : '';
+  };
+  const rejectQueueLimit = async (reason: string): Promise<SongRequestResult> => {
+    await addReject(user, reason, feedback);
+    return { success: false, mode, keyword, message: reason };
+  };
+  // A viewer at the limit is refused before the search.
+  const limitBeforeSearch = queueLimitReason();
+  if (limitBeforeSearch) return await rejectQueueLimit(limitBeforeSearch);
   updateRequestFeedback(feedback, 'waiting', '正在搜索歌曲，请稍候');
   const playerKey = getSelectedPlayerKey();
   const epoch = playerSelectionEpoch;
@@ -5338,6 +5356,10 @@ async function tryRequestSong(
       ? await getNcmSongCover(track.id)
       : '');
     if (playerChanged()) return await rejectChangedPlayer();
+    // The queue may have changed during the search. Nothing awaits between
+    // this check and the enqueue below.
+    const limitAfterSearch = queueLimitReason();
+    if (limitAfterSearch) return await rejectQueueLimit(limitAfterSearch);
     newSong = {
       RequestId: randomUUID(),
       Id: String(track.id),
@@ -5623,7 +5645,9 @@ async function handleDanmaku(
       return;
     }
 
-    const result = await tryRequestSong(user, keyword, mode, feedback);
+    // Like cooldowns and gift credits, the queue limit does not apply to super users.
+    const queuedSongLimit = isSuperUser ? 0 : appConfig.sysConfig?.MaxQueuedSongsPerUser;
+    const result = await tryRequestSong(user, keyword, mode, feedback, queuedSongLimit);
     if (result.success) {
       userCooldowns.set(uid, Date.now());
       const remainingCredits = consumeGiftRequestCredit(

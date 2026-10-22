@@ -4,6 +4,8 @@ import vm from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
 import { AVATAR_PLACEHOLDER } from '../electron/bili-avatar-cache.ts';
+import { canRequestWithGiftCredits, consumeGiftRequestCredit } from '../electron/gift-request-credit-policy.ts';
+import { countQueuedRequestsByViewer } from '../electron/queue-action-policy.ts';
 import {
   MAX_REQUEST_NOTIFICATIONS,
   RequestNotificationStore,
@@ -121,7 +123,7 @@ function fixture(overrides = {}) {
     getBiliAvatar: async () => 'avatar', getNcmSongCover: async () => 'cover',
     biliAvatarCache: { peek: () => undefined }, AVATAR_PLACEHOLDER,
     getQueueSongIdentity: song => song.Id, cancelledNativeNextSongs: new Map(),
-    setGlobalStatus() {}, writeLog() {}, recentRejects: [], targetQueue: [],
+    setGlobalStatus() {}, writeLog() {}, recentRejects: [], targetQueue: [], countQueuedRequestsByViewer,
     clearRecentQqGuardedCompletion() {}, waitForManagedPlayerActionSettlement: async () => {},
     currentPlayingSong: null, playSongNow: async () => false,
     reconcileQueueHeadAfterMutation: async () => {}, guardNextSong: async () => true,
@@ -457,4 +459,106 @@ test('an accepted request is never overwritten by a later handler failure', asyn
   await f.context.processDanmakuCommandQueue();
   assert.equal(f.notices()[0].kind, 'success');
   assert.equal(f.context.targetQueue.length, 1);
+});
+
+const queuedBy = (uid, count) => Array.from({ length: count }, (_, index) => ({
+  RequestId: `queued-${uid}-${index}`, Id: `queued-${index}`, SongName: `待播${index}`, ArtistName: '歌手', OrderedByUid: uid
+}));
+const limitReason = count => `你已有 ${count} 首歌在待播队列中，请等前面的歌播放后再点`;
+
+test('normal and top requests stop at the per-viewer queue limit before searching', async () => {
+  for (const [message, queued] of [['点歌 搜索词', 2], ['置顶点歌 搜索词', 2], ['点歌 搜索词', 3]]) {
+    const f = fixture({
+      appConfig: { sysConfig: { MaxQueuedSongsPerUser: 2 } },
+      targetQueue: [...queuedBy('2', 4), ...queuedBy('1', queued)],
+      playerManager: { search() { throw new Error('must not search'); } }
+    });
+    const feedback = await f.handle(message);
+    assert.equal(feedback.completed, true);
+    assert.deepEqual(f.notices().map(item => [item.kind, item.action, item.title, item.message]), [
+      ['error', 'request', '搜索词', `点歌失败：${limitReason(queued)}`]
+    ], message);
+    assert.equal(f.context.recentRejects[0].reason, limitReason(queued));
+    assert.equal(f.context.targetQueue.length, 4 + queued);
+    assert.equal(f.context.userCooldowns.size, 0);
+  }
+});
+
+test('the limit counts only the viewer\'s own waiting songs and also applies to managers and guards', async () => {
+  const playing = queuedBy('1', 2);
+  const f = fixture({
+    appConfig: { sysConfig: { MaxQueuedSongsPerUser: 2 } },
+    // The viewer's song that just started playing can still be the queue head.
+    targetQueue: [playing[0], ...queuedBy('2', 3), playing[1]],
+    currentPlayingSong: { ...playing[0] }
+  });
+  await f.handle('点歌 搜索词');
+  assert.equal(f.notices().at(-1).kind, 'success');
+  for (const sender of [user, { ...user, isManager: true }, { ...user, guardLevel: 1 }]) {
+    await f.handle('点歌 搜索词', sender);
+    assert.equal(f.notices().at(-1).message, `点歌失败：${limitReason(2)}`);
+  }
+  assert.equal(f.context.targetQueue.length, 6);
+});
+
+test('super users, 插队, 立即点歌, local tests and viewers without a UID are not limited', async () => {
+  const atLimit = (uid = '1') => ({
+    appConfig: { sysConfig: { MaxQueuedSongsPerUser: 1 } }, targetQueue: queuedBy(uid, 2)
+  });
+  const superUser = fixture({ ...atLimit(), isConfiguredSuperUser: () => true });
+  await superUser.handle('点歌 搜索词');
+  assert.equal(superUser.notices()[0].kind, 'success');
+
+  // They play at once; an unconfirmed one is kept at the head like before.
+  for (const message of ['插队点歌 搜索词', '立即点歌 搜索词']) {
+    const f = fixture(atLimit());
+    await f.handle(message);
+    assert.equal(f.notices()[0].kind, 'success', message);
+    assert.equal(f.context.targetQueue.length, 3, message);
+  }
+
+  const local = fixture(atLimit());
+  for (const mode of ['normal', 'top']) assert.equal((await local.context.tryRequestSong(user, '搜索词', mode)).success, true);
+
+  const guest = fixture(atLimit('0'));
+  await guest.handle('点歌 搜索词', { ...user, uid: '0' });
+  assert.equal(guest.notices()[0].kind, 'success');
+});
+
+test('a request refused by the queue limit keeps its gift credit and starts no cooldown', async () => {
+  const f = fixture({
+    appConfig: { sysConfig: { MaxQueuedSongsPerUser: 1, Cooldowns: { Normal: 60 } } },
+    targetQueue: queuedBy('1', 1),
+    giftRequestCredits: new Map([['1', 1]]),
+    getGiftRequirementForGuardLevel: () => ({ tier: 'Normal', requirement: { giftName: '小花花', giftId: '' } }),
+    canRequestWithGiftCredits, consumeGiftRequestCredit
+  });
+  await f.handle('点歌 搜索词');
+  assert.equal(f.notices()[0].message, `点歌失败：${limitReason(1)}`);
+  assert.equal(f.context.giftRequestCredits.get('1'), 1);
+  assert.equal(f.context.userCooldowns.has('1'), false);
+
+  // Once the waiting song has played, the kept credit pays for the next request.
+  f.context.targetQueue = [];
+  await f.handle('点歌 搜索词');
+  assert.equal(f.notices().at(-1).kind, 'success');
+  assert.equal(f.context.giftRequestCredits.has('1'), false);
+  assert.equal(f.context.userCooldowns.has('1'), true);
+});
+
+test('the limit is checked again after the search, before the request changes anything', async () => {
+  const searched = deferred();
+  const f = fixture({
+    playerManager: { search: () => searched.promise },
+    cancelledNativeNextSongs: new Map([['song-id', true]])
+  });
+  const result = f.context.tryRequestSong(user, '搜索词', 'normal', f.feedback(), 1);
+  await flush();
+  // The queue changed while the player searched, e.g. 插队 put this viewer's playing song back.
+  f.context.targetQueue.push(...queuedBy('1', 1));
+  searched.resolve([track]);
+  assert.deepEqual({ ...await result }, { success: false, mode: 'normal', keyword: '搜索词', message: limitReason(1) });
+  assert.equal(f.context.targetQueue.length, 1);
+  assert.equal(f.notices()[0].kind, 'error');
+  assert.equal(f.context.cancelledNativeNextSongs.has('song-id'), true);
 });

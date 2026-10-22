@@ -4759,7 +4759,7 @@ const AdminWidget: React.FC = () => {
                                     </div>
 
                                     <div className="bg-white/5 p-6 rounded-xl border border-white/10 space-y-5 mb-6">
-                                        <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3"><UiIcon name="clock" /> 点歌冷却设置（秒）</h3>
+                                        <h3 className="text-sm font-bold text-blue-400 uppercase tracking-widest border-b border-white/10 pb-3"><UiIcon name="clock" /> 点歌冷却（秒）与待播上限</h3>
                                         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                                             <div>
                                                 <label htmlFor="cooldown-normal" className="block text-xs text-gray-400 mb-2">普通用户</label>
@@ -4777,6 +4777,15 @@ const AdminWidget: React.FC = () => {
                                                 <label htmlFor="cooldown-governor" className="block text-xs text-red-400 mb-2 font-bold">总督</label>
                                                 <NumberField id="cooldown-governor" integer min={0} value={finiteNumberOr(config.config.Cooldowns?.Governor, 0)} onCommit={value => updateCooldown('Governor', value)} className="w-full bg-red-900/30 border border-red-500/30 rounded-lg p-2.5 text-sm text-red-200 focus:border-red-500 outline-none" />
                                             </div>
+                                        </div>
+                                        <div className="border-t border-white/10 pt-4">
+                                            <label htmlFor="max-queued-songs-per-user" className="block text-xs text-gray-400 mb-2">每位观众最多待播歌曲数（0 为不限制）</label>
+                                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                                <NumberField id="max-queued-songs-per-user" integer min={0} max={50} value={finiteNumberOr(config.config.MaxQueuedSongsPerUser, 0)} onCommit={value => updateSysConfig(current => ({ ...current, MaxQueuedSongsPerUser: value }))} className="w-full bg-black/30 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 outline-none" />
+                                            </div>
+                                            <p className="text-[10px] text-gray-500 mt-2 leading-relaxed">
+                                                观众用点歌或置顶点歌时，若已有这么多首歌在待播队列中（正在播放的不算），本次点歌失败，不扣礼物点歌次数。插队点歌、立即点歌、超级用户和点歌实测不受限制；游客模式下 B 站可能不提供观众 UID，此时无法按观众限制。
+                                            </p>
                                         </div>
                                     </div>
 

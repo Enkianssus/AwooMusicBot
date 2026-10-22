@@ -6,6 +6,7 @@ import path from 'node:path';
 import { extractFunctions, readSource, sliceBetween } from './helpers/source.mjs';
 import {
   COOLDOWN_TIERS,
+  MAX_QUEUED_SONGS_PER_USER,
   MAX_SUPER_USERS,
   PERMISSION_KEYS,
   createDefaultAppConfig,
@@ -24,6 +25,7 @@ test('defaults are complete, include the dynamic cover switch and are never shar
     PlayerType: 'NCM',
     FoliaToken: '',
     Cooldowns: { Normal: 0, Captain: 0, Admiral: 0, Governor: 0 },
+    MaxQueuedSongsPerUser: 0,
     GiftRequestRequirements: {
       Normal: { giftName: '', giftId: '' },
       Captain: { giftName: '', giftId: '' },
@@ -122,6 +124,24 @@ test('cooldowns become whole seconds that never shorten the wait the raw value i
     );
   }
   assert.deepEqual(COOLDOWN_TIERS, ['Normal', 'Captain', 'Admiral', 'Governor']);
+});
+
+test('the per-viewer queue limit defaults to none, rounds up and stops at the cap', () => {
+  const limit = value => normalizeSysConfig({ MaxQueuedSongsPerUser: value }, ENV).MaxQueuedSongsPerUser;
+  assert.equal(MAX_QUEUED_SONGS_PER_USER, 50);
+  // Older configs and existing users keep requesting without a limit.
+  assert.equal(normalizeSysConfig({ PlayerType: 'QQMusic' }, ENV).MaxQueuedSongsPerUser, 0);
+  // The request check refuses once `queued >= limit`, so 2.1 refuses exactly where 3 does.
+  for (const [value, expected] of [[0, 0], [1, 1], [3, 3], ['5', 5], [' 2 ', 2], [2.1, 3], [0.5, 1],
+    [50, 50], [51, 50], [999, 50], [2 ** 60, 50], [Infinity, 50]]) {
+    assert.equal(limit(value), expected, String(value));
+  }
+  for (const value of [undefined, null, '', ' ', 'abc', '3首', -1, -0.5, Number.NaN, -Infinity, false, {}]) {
+    assert.equal(limit(value), 0, String(value));
+  }
+  // A posted value goes through the same merge and normalization as every other setting.
+  const saved = normalizeSysConfig({ ...createDefaultSysConfig(ENV), MaxQueuedSongsPerUser: 3 }, ENV);
+  assert.equal(normalizeSysConfig({ ...saved, PlayerType: 'Kugou' }, ENV).MaxQueuedSongsPerUser, 3);
 });
 
 test('the old per-minute cooldown migrates once into every tier', () => {
@@ -338,11 +358,13 @@ test('normalizing twice gives the same result, so saving and loading never drift
     PlayerType: 'x', FoliaToken: 42, Cooldowns: { Normal: '5', Captain: -2, Extra: true },
     SuperUsers: [' a ', 'a', 7], OrderPermission: { MinGuardType: '2' }, ForceControlPermission: null,
     CooldownMinutes: 3, ExternalApiPort: '70000', InternalApiPort: '6200', EnableCDP: true,
-    GiftRequestRequirements: { Governor: { GiftName: 'x' } }, Future: { nested: [1] }
+    GiftRequestRequirements: { Governor: { GiftName: 'x' } }, Future: { nested: [1] },
+    MaxQueuedSongsPerUser: '7.5'
   };
   const once = normalizeSysConfig(messy, ENV);
   const twice = normalizeSysConfig(JSON.parse(JSON.stringify(once)), ENV);
   assert.deepEqual(twice, once);
+  assert.equal(once.MaxQueuedSongsPerUser, 8);
   assert.equal(once.FoliaToken, '42');
   assert.equal(once.InternalApiPort, 6200);
   assert.equal(once.ExternalApiPort, 5556);

@@ -54,6 +54,9 @@ export interface PermissionConfig {
 export const MAX_SUPER_USERS = 200;
 export const MAX_SUPER_USER_LENGTH = 32;
 
+/** The highest per-viewer queue limit; 0 means no limit. */
+export const MAX_QUEUED_SONGS_PER_USER = 50;
+
 /** Settings of removed features; they are dropped whenever a config is normalized. */
 export const LEGACY_SYS_CONFIG_KEYS = ['EnableCDP', 'CdpPort', 'NcmExePath'] as const;
 
@@ -64,6 +67,7 @@ export interface SysConfig {
   PlayerType: PlayerType;
   FoliaToken: string;
   Cooldowns: Cooldowns;
+  MaxQueuedSongsPerUser: number;
   GiftRequestRequirements: GiftRequestRequirements;
   IdleWaitNext: boolean;
   ShowPlayerCurrentTrack: boolean;
@@ -136,6 +140,7 @@ export function createDefaultSysConfig(options: SysConfigOptions = {}): SysConfi
     PlayerType: 'NCM',
     FoliaToken: '',
     Cooldowns: createDefaultCooldowns(),
+    MaxQueuedSongsPerUser: 0,
     GiftRequestRequirements: createEmptyGiftRequestRequirements(),
     IdleWaitNext: true,
     ShowPlayerCurrentTrack: true,
@@ -200,6 +205,17 @@ export function normalizeCooldowns(value: unknown): Cooldowns {
     result[tier] = wholeLimit(value[tier]) || defaults[tier];
   }
   return result as Cooldowns;
+}
+
+/**
+ * How many of one viewer's songs may wait in the queue at once; 0 means no
+ * limit. The request check refuses a viewer once their count reaches the
+ * limit, so a fraction rounds up like the other whole limits, and anything
+ * that is not a positive number means none. A limit above the cap becomes
+ * the cap, which only ever makes it stricter.
+ */
+export function normalizeMaxQueuedSongsPerUser(value: unknown): number {
+  return Math.min(MAX_QUEUED_SONGS_PER_USER, wholeLimit(value));
 }
 
 /**
@@ -302,6 +318,7 @@ export function normalizeSysConfig(
     PlayerType: oneOf(source.PlayerType, PLAYER_TYPES, 'NCM'),
     FoliaToken: normalizeFoliaToken(source.FoliaToken),
     Cooldowns: normalizeCooldowns(source.Cooldowns),
+    MaxQueuedSongsPerUser: normalizeMaxQueuedSongsPerUser(source.MaxQueuedSongsPerUser),
     GiftRequestRequirements: normalizeGiftRequestRequirements(source.GiftRequestRequirements),
     // Each boolean keeps the reading the rest of the app applies to it.
     IdleWaitNext: source.IdleWaitNext !== false,

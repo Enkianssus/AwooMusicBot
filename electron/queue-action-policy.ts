@@ -111,3 +111,25 @@ export function matchesCurrentSong(current: unknown, expectedCurrent: unknown): 
   if (song.requestId && wanted.requestId) return song.requestId === wanted.requestId;
   return Boolean(wanted.id) && song.id === wanted.id;
 }
+
+/**
+ * How many of one viewer's requests wait in the queue, matched on
+ * OrderedByUid as 撤回 matches them. `playing`, the request already playing,
+ * is not counted, even while it is still the queue head. An empty or '0' UID
+ * does not identify one viewer (guest connections may report 0 for everyone),
+ * so it counts nothing.
+ */
+export function countQueuedRequestsByViewer(
+  queue: readonly unknown[],
+  uid: unknown,
+  playing?: unknown
+): number {
+  const viewer = text(uid);
+  if (!viewer || viewer === '0') return 0;
+  const playingRequestId = queuedIdentity(playing).requestId;
+  return queue.filter(song => {
+    const request = queuedIdentity(song);
+    return request.orderedByUid === viewer
+      && !(playingRequestId && request.requestId === playingRequestId);
+  }).length;
+}

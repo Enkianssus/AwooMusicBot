@@ -108,16 +108,30 @@ git push origin v1.2.1
 `.github/workflows/release.yml` 监听 `v*`，从 Tag 解析版本并创建 GitHub
 Release。不要同时手工创建另一个同名 Release。
 
-发布完成后，Release 应至少包含以下六项，且文件名中的版本必须一致：
+发布完成后，Release 应包含以下七项，且文件名中的版本必须一致：
 
 ```text
 assets.win.json
+awoo-musicbot-<version>-delta.nupkg
 awoo-musicbot-<version>-full.nupkg
 awoo-musicbot-win-Portable.zip
 awoo-musicbot-win-Setup.exe
 RELEASES
 releases.win.json
 ```
+
+增量包让上一版用户只下载变化部分（1.2.5 → 1.2.6 本地演练：增量约 0.8 MB，
+完整包约 148 MB）。workflow 在打包前运行
+`scripts/release-delta-base.mjs fetch`，取同一通道（不低于 1.1.0，排除 1.0.x
+旧通道）中低于本版本的最新正式 Release 的完整包和 `releases.win.json` 作为
+基线，`vpk pack` 随后自动生成增量包；打包后运行
+`scripts/release-delta-base.mjs prune` 删除基线包，只上传和预热本版本的文件。
+取不到基线时只告警并照常发布完整包，此时 Release 只有六项，日志出现
+“No delta package was produced” 警告，客户端会下载完整包。
+
+`vpk` 固定为 1.2.161，增量包按此版本验证。升级 `vpk` 前，先在本地用新版本打包，
+并用 `vpk delta patch` 把增量包打到上一版完整包上，确认还原结果的 SHA1 与
+`releases.win.json` 中本版完整包一致。
 
 还要验证：
 
@@ -449,8 +463,10 @@ QQ profile 仍按独立规则验收：两个 ZIP、各自的 `.sig` 和 `.sha256
 ### 点歌机
 
 1. `Build and Release Velopack` Action 成功。
-2. 六个主程序 Release 资产齐全。
-3. `RELEASES`、NUPKG、Portable ZIP 和 Setup 版本一致。
+2. 七个主程序 Release 资产齐全（含增量包）；只有六个时，确认 Action 日志中的
+   增量基线告警原因。
+3. `RELEASES`、NUPKG、Portable ZIP 和 Setup 版本一致；`releases.win.json` 含
+   本版的 Full 与 Delta 条目，增量包远小于完整包。
 4. `app.enkianss.us/update/awoo/RELEASES` 指向新版本。
 5. 本站下载和 Range 下载正常。
 6. 从上一个稳定版执行一次真实更新，确认安装、重启和版本显示正确。

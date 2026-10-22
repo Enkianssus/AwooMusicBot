@@ -79,7 +79,19 @@ jobs:
         run: npm run build
 
       - name: Install Velopack CLI
-        run: dotnet tool install -g vpk
+        # Pinned: the delta packages were verified with this version; upgrade deliberately.
+        run: dotnet tool install -g vpk --version 1.2.161
+
+      - name: Fetch previous release for delta packages
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Without a usable previous release this only warns, and vpk packs the full package alone.
+          node scripts/release-delta-base.mjs fetch --repository Enkianssus/AwooMusicBot --current-tag $env:TAG_NAME --tag-prefix v --min-version 1.1.0 --pack-id awoo-musicbot --channel win --output-dir Releases
+          if ($LASTEXITCODE -ne 0) {
+            throw "Delta base preparation failed with exit code $LASTEXITCODE"
+          }
 
       - name: Verify packaged executable
         shell: pwsh
@@ -98,6 +110,16 @@ jobs:
           $notesArgs = @()
           if ($env:RELEASE_NOTES_PATH) { $notesArgs = @('--releaseNotes', $env:RELEASE_NOTES_PATH) }
           vpk pack -u awoo-musicbot -v $env:VERSION -p dist_electron/win-unpacked -e "嗷呜点歌机.exe" --packTitle "嗷呜点歌机" -i assets/icon.ico @notesArgs
+
+      - name: Keep only current-version release assets
+        shell: pwsh
+        run: |
+          # The delta base must not be re-published or prewarmed under this tag.
+          node scripts/release-delta-base.mjs prune --pack-id awoo-musicbot --version $env:VERSION --output-dir Releases
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release asset pruning failed with exit code $LASTEXITCODE"
+          }
+          Get-ChildItem -Path 'Releases' -File | Select-Object Name, Length
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

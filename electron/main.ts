@@ -1692,9 +1692,31 @@ const playerManager = new PlayerManager({
     const managedAction = activeManagedPlayerAction;
     if (managedAction && tracksRepresentSameSong(managedAction.target, track)) {
       managedAction.targetObserved = true;
-      if (queueHeadNeedsGuardOnlyAfterCurrentChange && targetQueue[0]) {
-        queueHeadNeedsGuardOnlyAfterCurrentChange = false;
-        void armNextGuardOnly(targetQueue[0]);
+      const wasWaitingForTarget = queueHeadNeedsGuardOnlyAfterCurrentChange;
+      // Confirmation belongs to the action, not to the queue's current size.
+      // Otherwise an empty queue leaves later requests waiting forever after
+      // this action is released and only same-track heartbeats remain.
+      queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+      const queueHead = targetQueue[0];
+      if (wasWaitingForTarget && queueHead) {
+        if (getSelectedPlayerKey() !== 'netease') {
+          void armNextGuardOnly(queueHead);
+        } else if (isPlaying && !tracksRepresentSameSong(queueHead, track)) {
+          // The previously inserted item may be the song that just started,
+          // not this new head. Only preserve an observed native next item.
+          const nextAction = planObservedNextAction({
+            expected: queueHead,
+            observedNext: observation.nextTrack,
+            nextObservation: observation.nextObservation,
+            preserveInsertedHead: tracksRepresentSameSong(queueHead, observation.nextTrack),
+            expectedAlreadyGuarded:
+              registeredNextGuardSongIdentity === getQueueSongIdentity(queueHead)
+          });
+          if (nextAction === 'arm-only') void armNextGuardOnly(queueHead);
+          else if (nextAction === 'insert') {
+            void guardNextSong(queueHead, observation.playbackAnchorReady === true);
+          }
+        }
       }
       if (!managedAction.inFlight
           && activeManagedPlayerAction?.id === managedAction.id) {
@@ -3347,6 +3369,13 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
       return;
     }
     managedAction.targetObserved = true;
+    if (getSelectedPlayerKey() === 'netease') {
+      // A's old guard does not prove the new queue head B was inserted.
+      // NetEase reports its native next item; preserve it only when it is B.
+      queueHeadNeedsGuardOnlyAfterCurrentChange =
+        queueHeadNeedsGuardOnlyAfterCurrentChange
+        && tracksRepresentSameSong(targetQueue[0], observedNextTrack);
+    }
     writeLog(
       `[动作归因] 点歌机动作 #${managedAction.id} 已确认最终目标: ${currName}`,
       'DarkGray'
@@ -3604,10 +3633,13 @@ async function syncTrackChangeLogic(currId: string, currName: string, nextId: st
   if (
     managedAction
     && managedAction.targetObserved
-    && !managedAction.inFlight
     && activeManagedPlayerAction?.id === managedAction.id
   ) {
-    activeManagedPlayerAction = null;
+    // Keep the native-next preservation decision above, then release the
+    // wait even when the confirmed request was already removed by the API.
+    // An older callback must not release a newer action's wait after an await.
+    queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+    if (!managedAction.inFlight) activeManagedPlayerAction = null;
   }
 }
 
@@ -5125,6 +5157,12 @@ function expireManagedAction(action: ManagedPlayerAction): void {
 
   const targetObserved = action.targetObserved
     || isObservedSong(action.target);
+  if (targetObserved) {
+    // A target snapshot can arrive just after the attribution deadline. It
+    // still confirms the target, so dropping the action must not strand its
+    // insertion wait. No acknowledgement alone reaches this condition.
+    queueHeadNeedsGuardOnlyAfterCurrentChange = false;
+  }
   const targetIdentity = getQueueSongIdentity(action.target);
   const targetStillCurrent = Boolean(currentPlayingSong)
     && getQueueSongIdentity(currentPlayingSong) === targetIdentity;
